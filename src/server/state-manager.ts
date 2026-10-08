@@ -26,6 +26,7 @@ function emptyState(): CursorState {
     composerQueue: { items: [] },
     questionnaire: null,
     slashCommands: [],
+    folders: [],
   };
 }
 
@@ -81,6 +82,12 @@ export class StateManager extends EventEmitter {
     newState.lastExtractionError = null;
     newState.windows = this.currentState.windows;
     newState.activeWindowId = this.currentState.activeWindowId;
+    // The folder tree lives only in the "Cursor Agents" overview window, pulled
+    // in via updateFolders(). The home extractor returns an empty array, so keep
+    // the aggregated folders unless this extraction actually found some.
+    if (!newState.folders || newState.folders.length === 0) {
+      newState.folders = this.currentState.folders;
+    }
 
     const stateForApply = this.applyActivityStaleness(newState);
 
@@ -211,8 +218,7 @@ export class StateManager extends EventEmitter {
   }
 
   /** Push per-window mode/model into global state (e.g. from a cached snapshot on window switch). */
-  updateModeModel(mode: CursorState['mode'], model: CursorState['model']): void {
-    const modeChanged = this.currentState.mode?.current !== mode?.current;
+  updateModeModel(mode: CursorState['mode'], model: CursorState['model']): void {    const modeChanged = this.currentState.mode?.current !== mode?.current;
     const modelChanged = this.currentState.model?.current !== model?.current
       || this.currentState.model?.currentId !== model?.currentId;
     if (!modeChanged && !modelChanged) return;
@@ -221,6 +227,19 @@ export class StateManager extends EventEmitter {
     if (modelChanged) patch.model = model;
     this.currentState = { ...this.currentState, ...patch };
     this.emit('state:patch', patch);
+  }
+
+  /**
+   * Push the workspace folder list into global state. The folder tree only
+   * exists in Cursor's "Cursor Agents" overview window, whereas the relay's
+   * home window may be a plain workspace window that has none — so the window
+   * monitor feeds the folders in from whichever window exposes them.
+   */
+  updateFolders(folders: CursorState['folders']): void {
+    const next = folders ?? [];
+    if (JSON.stringify(this.currentState.folders ?? []) === JSON.stringify(next)) return;
+    this.currentState = { ...this.currentState, folders: next };
+    this.emit('state:patch', { folders: next });
   }
 
   private diff(
@@ -332,6 +351,11 @@ export class StateManager extends EventEmitter {
 
     if (JSON.stringify(prev.slashCommands ?? []) !== JSON.stringify(next.slashCommands ?? [])) {
       patch.slashCommands = next.slashCommands ?? [];
+      hasChange = true;
+    }
+
+    if (JSON.stringify(prev.folders ?? []) !== JSON.stringify(next.folders ?? [])) {
+      patch.folders = next.folders ?? [];
       hasChange = true;
     }
 

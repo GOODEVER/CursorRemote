@@ -6,6 +6,40 @@ export interface CursorWindow {
   wsUrl?: string;
 }
 
+/**
+ * A chat/agent entry listed under a workspace folder.
+ * Mirrors the sidebar rows in Cursor's "Cursor Agents" overview window.
+ */
+export interface FolderAgent {
+  /** Sidebar row label, e.g. "Roblox factory game design". */
+  title: string;
+  /** data-composer-id when Cursor exposes one (used to switch reliably). */
+  composerId: string;
+  /** Stable section group id, e.g. "workspace:<hash>" or "repo:github.com/x/y". */
+  sectionId: string;
+  /** True for the agent currently open in this window. */
+  isActive: boolean;
+  /** DOM selector path for the row, used as a switch fallback. */
+  selectorPath: string;
+}
+
+/**
+ * A workspace folder / repository as listed in Cursor's agent sidebar.
+ * Cursor groups its chats under these; only some folders are currently open.
+ */
+export interface WorkspaceFolder {
+  /** Display name, e.g. "FactoryTycoonGame" or "cursorremote". */
+  name: string;
+  /** Stable section group id ("workspace:…" / "repo:…"), used as a key. */
+  sectionId: string;
+  /** 'workspace' for local folders, 'repo' for git repositories. */
+  kind: 'workspace' | 'repo';
+  /** True when this folder is the one open in the relay's home window. */
+  isCurrent: boolean;
+  /** Agents/chats belonging to this folder. */
+  agents: FolderAgent[];
+}
+
 /** Raw DOM element snapshot — what was actually in the DOM, independent of parsing. */
 export interface RawElement {
   flatIndex: number;
@@ -133,6 +167,13 @@ export interface CursorState {
    * focused Cursor composer. Empty array when the menu is closed.
    */
   slashCommands: SlashCommand[];
+  /**
+   * All workspace folders / repositories listed in Cursor's agent sidebar,
+   * including folders that are not currently open. Each folder carries its
+   * agents/chats. Populated from the "Cursor Agents" overview window when it is
+   * available; empty otherwise.
+   */
+  folders: WorkspaceFolder[];
   _rawSignals?: RawSignals;
 }
 
@@ -346,7 +387,7 @@ export interface SelectorConfig {
 
 export interface CommandPayload {
   commandId: string;
-  type: 'send_message' | 'send_prompt' | 'approve' | 'reject' | 'approve_all' | 'switch_tab' | 'new_chat' | 'set_mode' | 'set_model' | 'click_action' | 'get_plan_full' | 'get_plan_model_options' | 'set_plan_model' | 'get_slash_menu' | 'click_slash_command' | 'cancel_slash_menu' | 'set_answer_text' | 'stop_generation';
+  type: 'send_message' | 'send_prompt' | 'approve' | 'reject' | 'approve_all' | 'switch_tab' | 'open_folder_agent' | 'new_chat' | 'set_mode' | 'set_model' | 'click_action' | 'get_plan_full' | 'get_plan_model_options' | 'set_plan_model' | 'get_slash_menu' | 'click_slash_command' | 'cancel_slash_menu' | 'set_answer_text' | 'stop_generation';
   text?: string;
   approvalId?: string;
   actionType?: string;

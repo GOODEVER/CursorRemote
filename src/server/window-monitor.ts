@@ -18,6 +18,7 @@ import type {
   ServerConfig,
   SelectorConfig,
   SlashCommand,
+  WorkspaceFolder,
 } from './types.js';
 import { applyDerivedActivityToState } from './activity-derive.js';
 
@@ -42,6 +43,8 @@ export interface WindowSnapshot {
   questionnaire: Questionnaire | null;
   /** `/` slash menu options for this window (empty when the menu is closed). */
   slashCommands: SlashCommand[];
+  /** Workspace folders/agents listed in this window's agent sidebar. */
+  folders: WorkspaceFolder[];
   lastUpdated: number;
   /** data-composer-id of the active composer in this window. Same agent shown
    *  via Cursor's global rail in another window will share this id; two
@@ -263,6 +266,7 @@ export class WindowMonitor extends EventEmitter {
       model: state.model,
       questionnaire: state.questionnaire,
       slashCommands: state.slashCommands ?? [],
+      folders: state.folders ?? [],
       lastUpdated: Date.now(),
       activeComposerId: state.activeComposerId ?? '',
     };
@@ -274,6 +278,8 @@ export class WindowMonitor extends EventEmitter {
     const prevApprovalSig = prev ? approvalsFingerprint(prev.pendingApprovals) : '';
     const questionnaireSig = questionnaireFingerprint(snapshot.questionnaire);
     const prevQuestionnaireSig = prev ? questionnaireFingerprint(prev.questionnaire) : '';
+    const foldersSig = JSON.stringify(snapshot.folders);
+    const prevFoldersSig = prev ? JSON.stringify(prev.folders) : '';
     const changed = !prev
       || prev.messages.length !== snapshot.messages.length
       || (prev.messages.length > 0 && prev.messages[prev.messages.length - 1]?.id !== snapshot.messages[snapshot.messages.length - 1]?.id)
@@ -284,6 +290,7 @@ export class WindowMonitor extends EventEmitter {
       || prev.canAbort !== snapshot.canAbort
       || approvalSig !== prevApprovalSig
       || questionnaireSig !== prevQuestionnaireSig
+      || foldersSig !== prevFoldersSig
       || queueSig !== prevQueueSig
       || prev.mode?.current !== snapshot.mode?.current
       || prev.model?.current !== snapshot.model?.current
@@ -387,9 +394,17 @@ export class WindowMonitor extends EventEmitter {
           model: state.model,
           questionnaire: state.questionnaire,
           slashCommands: state.slashCommands ?? [],
+          folders: state.folders ?? [],
           lastUpdated: Date.now(),
           activeComposerId: state.activeComposerId ?? '',
         };
+
+        // The folder tree only appears in the "Cursor Agents" overview window.
+        // Feed it into global state so the remote can list every folder even
+        // when the home window is a plain workspace window.
+        if ((state.folders?.length ?? 0) > 0) {
+          this.stateManager.updateFolders(state.folders);
+        }
 
         const prev = this.snapshots.get(win.id);
         const qSig = JSON.stringify(snapshot.composerQueue);
@@ -398,6 +413,8 @@ export class WindowMonitor extends EventEmitter {
         const paSig = prev ? approvalsFingerprint(prev.pendingApprovals) : '';
         const qnSig = questionnaireFingerprint(snapshot.questionnaire);
         const pqnSig = prev ? questionnaireFingerprint(prev.questionnaire) : '';
+        const foldersSig = JSON.stringify(snapshot.folders);
+        const prevFoldersSig = prev ? JSON.stringify(prev.folders) : '';
         const changed = !prev
           || prev.messages.length !== snapshot.messages.length
           || (prev.messages.length > 0 && prev.messages[prev.messages.length - 1]?.id !== snapshot.messages[snapshot.messages.length - 1]?.id)
@@ -408,6 +425,7 @@ export class WindowMonitor extends EventEmitter {
           || prev.canAbort !== snapshot.canAbort
           || aSig !== paSig
           || qnSig !== pqnSig
+          || foldersSig !== prevFoldersSig
           || qSig !== pqSig
           || prev.mode?.current !== snapshot.mode?.current
           || prev.model?.current !== snapshot.model?.current

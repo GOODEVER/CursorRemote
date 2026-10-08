@@ -237,4 +237,65 @@ describe('action click target resolution', () => {
     assert.deepEqual(clickedSelectors, ['#legacy-button']);
     assert.equal(evaluateCalled, false);
   });
+
+  it('openFolderAgent opens a composer via the workbench command service', async () => {
+    const evaluations: string[] = [];
+    const fakeClient = {
+      isConnected: () => true,
+      evaluate: async (expr: string) => {
+        evaluations.push(expr);
+        return { ok: true };
+      },
+    } as unknown as CdpClient;
+    const executor = new CommandExecutor({} as SelectorConfig);
+    executor.setClient(fakeClient);
+
+    const result = await executor.openFolderAgent('cmd-open', 'composer-xyz', 'My agent');
+
+    assert.equal(result.ok, true);
+    assert.equal(evaluations.length, 1, 'should execute exactly one command-service call');
+    assert.match(evaluations[0], /composer\.openComposer/);
+    assert.match(evaluations[0], /composer-xyz/);
+    assert.match(evaluations[0], /__getCommandService/);
+  });
+
+  it('openFolderAgent falls back to a row click when the command service is unavailable', async () => {
+    const evaluations: string[] = [];
+    const fakeClient = {
+      isConnected: () => true,
+      evaluate: async (expr: string) => {
+        evaluations.push(expr);
+        // First call: command service lookup fails. Second: row click succeeds.
+        if (expr.includes('__getCommandService')) return { ok: false, error: 'command service not found' };
+        return true;
+      },
+    } as unknown as CdpClient;
+    const executor = new CommandExecutor({} as SelectorConfig);
+    executor.setClient(fakeClient);
+
+    const result = await executor.openFolderAgent('cmd-open', 'composer-xyz', 'My agent');
+
+    assert.equal(result.ok, true);
+    assert.equal(evaluations.length, 2, 'command attempt then DOM fallback');
+    assert.match(evaluations[1], /glass-sidebar-agent-list-container/);
+  });
+
+  it('openFolderAgent resolves by title when no composerId is supplied', async () => {
+    const evaluations: string[] = [];
+    const fakeClient = {
+      isConnected: () => true,
+      evaluate: async (expr: string) => {
+        evaluations.push(expr);
+        return true;
+      },
+    } as unknown as CdpClient;
+    const executor = new CommandExecutor({} as SelectorConfig);
+    executor.setClient(fakeClient);
+
+    const result = await executor.openFolderAgent('cmd-open', '', 'My agent', 'li > div');
+
+    assert.equal(result.ok, true);
+    assert.equal(evaluations.length, 1, 'no command call without a composerId');
+    assert.match(evaluations[0], /glass-sidebar-agent-list-container/);
+  });
 });

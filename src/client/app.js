@@ -25,6 +25,8 @@
     activeWindowId: '',
     composerQueue: { items: [] },
     questionnaire: null,
+    slashCommands: [],
+    folders: [],
   };
 
   function getAuthToken() {
@@ -112,6 +114,14 @@
   const FINISH_SETTLE_MS = 5000;
   let activePlanModal = null;
   let activePlanModelContext = null;
+  // Questionnaire routing. `homeQuestionnaire` mirrors the home window's
+  // questionnaire from state:full/state:patch; `remoteQuestionnaires` holds
+  // questionnaires for non-home windows from `window:snapshot`. We render
+  // whichever is present, preferring the home window, and remember the window a
+  // remote question came from so answers target it.
+  let homeQuestionnaire = null;
+  const remoteQuestionnaires = new Map();
+  let questionnaireWindowId = '';
   // Text a slash command left in the host composer; when set, sendMessage()
   // submits in place via send_prompt rather than retyping.
   let composerPrefilledText = '';
@@ -176,6 +186,10 @@
   const $sheetPlanModelList = document.getElementById('sheet-plan-model-list');
   const $sheetSlash = document.getElementById('sheet-slash');
   const $sheetSlashList = document.getElementById('sheet-slash-list');
+  const $sheetFolders = document.getElementById('sheet-folders');
+  const $sheetFoldersList = document.getElementById('sheet-folders-list');
+  const $btnFolders = document.getElementById('btn-folders');
+  const $foldersCount = document.getElementById('folders-count');
   const $planModalOverlay = document.getElementById('plan-modal-overlay');
   const $planModalLabel = document.getElementById('plan-modal-label');
   const $planModalTitle = document.getElementById('plan-modal-title');
@@ -227,11 +241,35 @@
 
   socket.on('state:full', (newState) => {
     state = { ...defaultState, ...newState };
+    homeQuestionnaire = newState.questionnaire || null;
+    recomputeQuestionnaire();
     renderAll();
   });
 
   socket.on('state:patch', (patch) => {
     Object.assign(state, patch);
+    if ('questionnaire' in patch) homeQuestionnaire = patch.questionnaire || null;
+    recomputeQuestionnaire();
+    renderAll();
+  });
+
+  // Per-window snapshots from the relay's window monitor. A question raised in
+  // a window that is NOT the relay's CDP home window would otherwise never
+  // reach the phone (state:patch only ever carries the home window). Surface
+  // the questionnaire/approval here and remember which window it belongs to so
+  // the answer can be routed back to it.
+  socket.on('window:snapshot', (snapshot) => {
+    if (!snapshot || !snapshot.windowId) return;
+    // The home window's questionnaire already arrives via state:full/patch;
+    // only track non-home windows here so the two paths don't fight/duplicate.
+    if (snapshot.windowId === state.activeWindowId) return;
+    const q = snapshot.questionnaire;
+    if (q && q.questions && q.questions.length > 0) {
+      remoteQuestionnaires.set(snapshot.windowId, q);
+    } else {
+      remoteQuestionnaires.delete(snapshot.windowId);
+    }
+    recomputeQuestionnaire();
     renderAll();
   });
 
@@ -325,6 +363,7 @@
       commandId: newCommandId(),
       selectorPath: state.questionnaire.skipSelectorPath,
       actionLabel: 'Skip',
+      ...(questionnaireWindowId ? { windowId: questionnaireWindowId } : {}),
     });
     showToast('Skip sent', 'success');
   });
@@ -335,6 +374,7 @@
       commandId: newCommandId(),
       selectorPath: state.questionnaire.continueSelectorPath,
       actionLabel: 'Continue',
+      ...(questionnaireWindowId ? { windowId: questionnaireWindowId } : {}),
     });
     showToast('Continue sent', 'success');
   });
@@ -346,6 +386,7 @@
 
   $pillMode.addEventListener('click', () => openSheet('mode'));
   $pillModel.addEventListener('click', () => openSheet('model'));
+  $btnFolders.addEventListener('click', () => openSheet('folders'));
   $sheetOverlay.addEventListener('click', closeSheet);
   $planModalClose.addEventListener('click', closePlanModal);
   $planModalOverlay.addEventListener('click', (e) => {
@@ -380,9 +421,10 @@
     renderWindows();
     renderMessages();
     renderApprovals();
-    renderQuestionnaire();
+      renderQuestionnaire();
     renderInputState();
     renderTabs();
+    renderFoldersButton();
     renderModeModel();
     syncPlanModalFromState();
     maybeNotifyTransitions();
@@ -1571,6 +1613,29 @@
     }
   }
 
+  /**
+   * Which questionnaire to render and which window it belongs to. Prefers the
+   * home window's own questionnaire; otherwise surfaces the most recent
+   * non-home window questionnaire so questions raised elsewhere still show up.
+   */
+  function activeQuestionnaire() {
+    if (homeQuestionnaire && homeQuestionnaire.questions && homeQuestionnaire.questions.length > 0) {
+      return { questionnaire: homeQuestionnaire, windowId: '' };
+    }
+    var best = null;
+    remoteQuestionnaires.forEach(function (q, winId) {
+      if (!q.questions || q.questions.length === 0) return;
+      if (!best) best = { questionnaire: q, windowId: winId };
+    });
+    return best;
+  }
+
+  function recomputeQuestionnaire() {
+    var active = activeQuestionnaire();
+    state.questionnaire = active ? active.questionnaire : null;
+    questionnaireWindowId = active ? active.windowId : '';
+  }
+
   function renderQuestionnaire() {
     var q = state.questionnaire;
     if (!q || !q.questions || q.questions.length === 0) {
@@ -1628,6 +1693,7 @@
             commandId: newCommandId(),
             selectorPath: this.dataset.selectorPath,
             actionLabel: this.dataset.label,
+            ...(questionnaireWindowId ? { windowId: questionnaireWindowId } : {}),
           });
           // Freeform ("Other"): reveal a local text box so the user can compose
           // an answer; it is pushed into Cursor on submit.
@@ -1686,6 +1752,7 @@
         type: 'set_answer_text',
         selectorPath: freeformSelector,
         text,
+        ...(questionnaireWindowId ? { windowId: questionnaireWindowId } : {}),
       });
       if (!typeResult.ok) {
         showToast(typeResult.error || 'Could not type answer', 'error');
@@ -1705,6 +1772,7 @@
         commandId: newCommandId(),
         selectorPath: state.questionnaire.continueSelectorPath,
         actionLabel: 'Continue',
+        ...(questionnaireWindowId ? { windowId: questionnaireWindowId } : {}),
       });
     }
     questionnaireSelections[questionNumber] = '';
@@ -1985,6 +2053,9 @@
       renderPlanModelSheet();
     } else if (type === 'slash') {
       $sheetSlash.classList.remove('hidden');
+    } else if (type === 'folders') {
+      $sheetFolders.classList.remove('hidden');
+      renderFoldersSheet();
     }
   }
   function closeSheet(options) {
@@ -1995,6 +2066,7 @@
     $sheetModel.classList.add('hidden');
     $sheetPlanModel.classList.add('hidden');
     $sheetSlash.classList.add('hidden');
+    $sheetFolders.classList.add('hidden');
     activeSheet = null;
     // Leaving the slash sheet without picking a row must also close the host
     // composer's tray (and drop the stray "/") — mirror the app's Escape.
@@ -2178,6 +2250,84 @@
       $sheetSlashList.appendChild(btn);
     });
   }
+
+  // --- Folders drawer ---
+
+  function renderFoldersButton() {
+    const folders = state.folders || [];
+    if (folders.length === 0) {
+      $btnFolders.classList.add('hidden');
+      return;
+    }
+    $btnFolders.classList.remove('hidden');
+    let agentCount = 0;
+    for (const f of folders) agentCount += (f.agents || []).length;
+    $foldersCount.textContent = agentCount > 0 ? `/ ${folders.length}` : `${folders.length}`;
+    if (activeSheet === 'folders') renderFoldersSheet();
+  }
+
+  function renderFoldersSheet() {
+    $sheetFoldersList.innerHTML = '';
+    const folders = state.folders || [];
+    if (folders.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'sheet-empty';
+      empty.textContent = 'No folders found yet.';
+      $sheetFoldersList.appendChild(empty);
+      return;
+    }
+
+    folders.forEach((folder) => {
+      const section = document.createElement('div');
+      section.className = 'folder-section';
+
+      const header = document.createElement('div');
+      header.className = 'folder-header' + (folder.isCurrent ? ' current' : '');
+      const icon = document.createElement('span');
+      icon.className = 'folder-icon';
+      icon.textContent = folder.kind === 'repo' ? '\u{1F4E6}' : '\u{1F4C1}';
+      const name = document.createElement('span');
+      name.className = 'folder-name';
+      name.textContent = folder.name;
+      header.appendChild(icon);
+      header.appendChild(name);
+      if (folder.isCurrent) {
+        const badge = document.createElement('span');
+        badge.className = 'folder-badge';
+        badge.textContent = 'open';
+        header.appendChild(badge);
+      }
+      section.appendChild(header);
+
+      const agents = folder.agents || [];
+      if (agents.length === 0) {
+        const none = document.createElement('div');
+        none.className = 'folder-agent-empty';
+        none.textContent = 'No agents yet';
+        section.appendChild(none);
+      } else {
+        agents.forEach((agent) => {
+          const btn = document.createElement('button');
+          btn.className = 'folder-agent' + (agent.isActive ? ' active' : '');
+          btn.textContent = agent.title || 'Untitled';
+          btn.addEventListener('click', () => {
+            socket.emit('command:open_folder_agent', {
+              commandId: newCommandId(),
+              type: 'open_folder_agent',
+              composerId: agent.composerId,
+              tabTitle: agent.title,
+              selectorPath: agent.selectorPath,
+            });
+            showToast(`Opening ${agent.title}...`, 'success');
+            closeSheet();
+          });
+          section.appendChild(btn);
+        });
+      }
+      $sheetFoldersList.appendChild(section);
+    });
+  }
+
 
   async function chooseSlashCommand(opt) {
     const result = await sendCommandAwaitResult('command:click_slash_command', {

@@ -1887,6 +1887,89 @@ header {
   padding-left: 20px;
 }
 
+/* --- Folders drawer --- */
+
+.header-folders-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  padding: 3px 8px;
+  margin-right: 4px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.header-folders-btn.hidden { display: none; }
+.header-folders-btn:active { background: var(--bg-hover); }
+.header-folders-icon { font-size: 12px; }
+.header-folders-count {
+  font-size: 11px;
+  color: var(--text-tertiary, var(--text-secondary));
+  opacity: 0.8;
+}
+
+.sheet-folders { max-height: 70vh; }
+
+.folders-list { padding: 4px 0 8px; }
+
+.folder-section { border-bottom: 1px solid var(--border-color); }
+.folder-section:last-child { border-bottom: none; }
+
+.folder-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.folder-header.current { color: var(--accent-blue); }
+.folder-icon { font-size: 14px; }
+.folder-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--accent-green);
+  border: 1px solid var(--accent-green);
+  border-radius: 8px;
+  padding: 1px 6px;
+}
+
+.folder-agent {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 8px 16px 8px 34px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-agent:active { background: var(--bg-hover); }
+.folder-agent.active { color: var(--accent-blue); font-weight: 600; }
+
+.folder-agent-empty {
+  padding: 6px 16px 10px 34px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  opacity: 0.7;
+}
+
 /* --- Slash pill + abort button --- */
 
 .pill-slash {

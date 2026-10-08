@@ -199,9 +199,30 @@ export class Relay {
       agentActivityLive: snapshot.agentActivityLive,
       agentActivitySource: snapshot.agentActivitySource,
       activeComposerId: snapshot.activeComposerId,
+      folders: snapshot.folders,
       lastUpdated: snapshot.lastUpdated,
     });
   };
+
+  /**
+   * Ensure the relay's CDP "home" connection points at `windowId` before an
+   * interaction (questionnaire answer, approval, click) is executed against it.
+   * The command executor and DOM extractor only ever act on the home window, so
+   * a question raised in another window must switch home first — otherwise the
+   * answer's selector path (scoped to that window's DOM) would miss. No-op when
+   * the window is already active or `windowId` is unknown.
+   */
+  private async ensureHomeWindow(windowId?: string): Promise<void> {
+    if (!windowId || !this.windowMonitor) return;
+    if (windowId === this.cdpBridge.activeTargetId) return;
+    try {
+      await this.cdpBridge.switchWindow(windowId);
+      this.windowMonitor.setHomeWindow(windowId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[relay] Failed to switch to window ${windowId.substring(0, 8)} for command: ${msg}`);
+    }
+  }
 
   async stop(): Promise<void> {
     this.io.close();
@@ -333,6 +354,7 @@ export class Relay {
         mode: state.mode?.current ?? null,
         model: state.model?.current ?? null,
         chatTabCount: state.chatTabs?.length ?? 0,
+        folderCount: state.folders?.length ?? 0,
         pendingApprovalCount: state.pendingApprovals?.length ?? 0,
         generation: this.stateManager.generation,
       });
@@ -357,6 +379,13 @@ export class Relay {
           composerId: t.composerId.substring(0, 16),
         })),
         windows: state.windows.map((w) => ({ id: w.id.substring(0, 8), title: w.title })),
+        folderCount: state.folders?.length ?? 0,
+        folders: (state.folders ?? []).map((f) => ({
+          name: f.name,
+          kind: f.kind,
+          isCurrent: f.isCurrent,
+          agents: f.agents.map((a) => a.title),
+        })),
         messageCount: state.messages.length,
         lastMessages: state.messages.slice(-3).map((m) => ({
           type: m.type,
@@ -515,6 +544,25 @@ export class Relay {
         socket.emit('command:result', result);
       });
 
+      socket.on('command:open_folder_agent', async (payload: CommandPayload) => {
+        if (!payload.commandId || (!payload.composerId && !payload.tabTitle && !payload.selectorPath)) {
+          socket.emit('command:result', {
+            commandId: payload.commandId ?? 'unknown',
+            ok: false,
+            error: 'Missing commandId and agent target',
+          } satisfies CommandResult);
+          return;
+        }
+        console.log(`[relay] Command: open_folder_agent "${payload.tabTitle ?? payload.composerId}" from ${socket.id}`);
+        const result = await this.commandExecutor.openFolderAgent(
+          payload.commandId,
+          payload.composerId,
+          payload.tabTitle,
+          payload.selectorPath
+        );
+        socket.emit('command:result', result);
+      });
+
       socket.on('command:new_chat', async (payload: CommandPayload) => {
         if (!payload.commandId) {
           socket.emit('command:result', {
@@ -654,6 +702,7 @@ export class Relay {
           return;
         }
         console.log(`[relay] Command: click_action from ${socket.id}`);
+        await this.ensureHomeWindow(payload.windowId);
         const result = await this.commandExecutor.clickAction(
           payload.commandId,
           payload.selectorPath,
@@ -673,6 +722,7 @@ export class Relay {
           return;
         }
         console.log(`[relay] Command: set_answer_text from ${socket.id}`);
+        await this.ensureHomeWindow(payload.windowId);
         const result = await this.commandExecutor.setAnswerText(
           payload.commandId,
           payload.selectorPath,

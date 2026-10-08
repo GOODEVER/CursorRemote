@@ -122,6 +122,12 @@ async function main(): Promise<void> {
   const relay = new Relay(config, stateManager, commandExecutor, cdpBridge);
   await relay.start();
 
+  // Feed per-window snapshots to web clients so questions/approvals raised in a
+  // window that is not the relay's CDP "home" window still reach the phone.
+  // Without this wiring the relay's `window:snapshot` broadcast never fires and
+  // only Telegram ever saw non-home questionnaires (public#questionnaire).
+  relay.setWindowMonitor(windowMonitor);
+
   console.log('[main] Connecting to Cursor IDE...');
   await cdpBridge.connect();
 

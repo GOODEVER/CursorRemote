@@ -5,9 +5,11 @@ import type {
   ChatElement,
   ChatTab,
   DiffLineKind,
+  FolderAgent,
   ModeInfo,
   ModelInfo,
   SelectorConfig,
+  WorkspaceFolder,
 } from './types.js';
 import { applyDerivedActivityToState } from './activity-derive.js';
 
@@ -1586,6 +1588,111 @@ export function extractionFunction(
       }
     } catch { /* skip */ }
 
+    // --- Workspace folders (Cursor agent sidebar) ---
+    // Cursor's "Cursor Agents" overview groups chats under workspace/repo
+    // sections. Extract *all* of them so folders that aren't currently open are
+    // still visible on the remote. Each section:
+    //   section[data-sidebar-workspace-section-root]
+    //     ├─ .ui-sidebar-section-head .ui-sidebar-label-row-title  (folder name)
+    //     └─ .glass-sidebar-agent-list-container li.ui-sidebar-menu-item (agents)
+    const folders: WorkspaceFolder[] = [];
+    // Cursor's overview sidebar rows carry no data-composer-id attribute; the
+    // composer/agent id lives in the React fiber props (`agentId`). Walk up the
+    // fiber from the row element to find it so tapping a row can reliably open
+    // the chat via the workbench `composer.openComposer` command.
+    const composerIdFromRow = (li: Element): string => {
+      const attrId = li.getAttribute('data-composer-id')
+        || li.querySelector('[data-composer-id]')?.getAttribute('data-composer-id')
+        || '';
+      if (attrId) return attrId;
+      try {
+        const fiberKey = Object.keys(li).find((k) => k.startsWith('__reactFiber$'));
+        let fiber = fiberKey ? (li as unknown as Record<string, unknown>)[fiberKey] : null;
+        let depth = 0;
+        while (fiber && depth < 20) {
+          const props = (fiber as { memoizedProps?: Record<string, unknown> }).memoizedProps;
+          const agentId = props?.agentId;
+          if (typeof agentId === 'string' && agentId) return agentId;
+          fiber = (fiber as { return?: unknown }).return ?? null;
+          depth++;
+        }
+      } catch { /* skip */ }
+      return '';
+    };
+    const isActiveFromRow = (li: Element, btn: Element | null): boolean => {
+      if (btn?.getAttribute('data-active') === 'true'
+        || li.getAttribute('data-active') === 'true') return true;
+      try {
+        const fiberKey = Object.keys(li).find((k) => k.startsWith('__reactFiber$'));
+        let fiber = fiberKey ? (li as unknown as Record<string, unknown>)[fiberKey] : null;
+        let depth = 0;
+        while (fiber && depth < 20) {
+          const props = (fiber as { memoizedProps?: Record<string, unknown> }).memoizedProps;
+          if (props && typeof props.isActive === 'boolean') return props.isActive;
+          fiber = (fiber as { return?: unknown }).return ?? null;
+          depth++;
+        }
+      } catch { /* skip */ }
+      return false;
+    };
+    try {
+      const sectionEls = document.querySelectorAll('section[data-sidebar-workspace-section-root]');
+      for (const section of Array.from(sectionEls)) {
+        const head = section.querySelector('.ui-sidebar-section-head');
+        const name = cleanTabTitle(
+          (head?.querySelector('.ui-sidebar-label-row-title')?.textContent || '').trim()
+        );
+        if (!name) continue;
+        const sectionId = section.getAttribute('data-agent-drop-section-id') || `folder:${name}`;
+        const kind: WorkspaceFolder['kind'] = sectionId.startsWith('repo:') ? 'repo' : 'workspace';
+
+        const agents: FolderAgent[] = [];
+        const listContainer = section.querySelector('.glass-sidebar-agent-list-container');
+        const items = listContainer
+          ? Array.from(listContainer.querySelectorAll('li.ui-sidebar-menu-item'))
+          : [];
+        for (const li of items) {
+          const btn = li.querySelector(
+            '[data-sidebar-menu-button], .ui-sidebar-menu-button, [role="button"], button'
+          );
+          const labelEl = li.querySelector(
+            '.ui-sidebar-menu-button-label, .ui-sidebar-label-row-title'
+          );
+          const title = cleanTabTitle(
+            (labelEl?.textContent || li.textContent || '').trim()
+          );
+          if (!title) continue;
+          const composerId =
+            composerIdFromRow(li)
+            || btn?.getAttribute('data-composer-id')
+            || li.getAttribute('data-composer-id')
+            || (btn?.closest('[data-composer-id]')?.getAttribute('data-composer-id'))
+            || '';
+          const isActive = isActiveFromRow(li, btn);
+          agents.push({
+            title,
+            composerId,
+            sectionId,
+            isActive,
+            selectorPath: buildSelectorPath(li),
+          });
+        }
+
+        folders.push({ name, sectionId, kind, isCurrent: false, agents });
+      }
+
+      // Mark the folder that corresponds to the relay's home window as current,
+      // by matching its name against the window title / active agent area.
+      if (folders.length > 0 && windowTitle) {
+        const projectName = projectNameFromTitle(windowTitle).toLowerCase();
+        if (projectName) {
+          for (const f of folders) {
+            if (f.name.toLowerCase() === projectName) { f.isCurrent = true; break; }
+          }
+        }
+      }
+    } catch { /* skip */ }
+
     // --- Mode extraction ---
     const modeEl = findFirst(modeSelectors);
     let currentMode = 'agent';
@@ -1890,6 +1997,7 @@ export function extractionFunction(
       composerQueue: { items: queueItems, ...(queueLabel ? { queueLabel } : {}) },
       questionnaire,
       slashCommands,
+      folders,
       _rawSignals,
     };
   } catch {

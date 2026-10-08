@@ -174,6 +174,53 @@ export const MODEL_MENU_LOOKUP_JS = `
   };
 `;
 
+// Injected into evaluate() to obtain the workbench CommandService in a Cursor
+// renderer. The service is reachable through the React props of a component that
+// renders `uiContextMenuServices` — present in workspace windows (it holds a
+// `commandService` with `executeCommand`). We DFS the React fiber tree from the
+// container roots and cache the hit on `window.__cursorRemoteCommandService` so
+// repeated calls are cheap. Returns the commandService object or null.
+export const COMMAND_SERVICE_LOOKUP_JS = `
+  const __getCommandService = () => {
+    if (window.__cursorRemoteCommandService) return window.__cursorRemoteCommandService;
+    const seen = new Set();
+    const seeds = [];
+    for (const el of document.querySelectorAll('*')) {
+      for (const k of Object.keys(el)) {
+        if (k.startsWith('__reactContainer$') || k.startsWith('__reactFiber$')) seeds.push(el[k]);
+      }
+    }
+    const stack = [...seeds];
+    let n = 0;
+    while (stack.length && n < 100000) {
+      const f = stack.pop();
+      if (!f || typeof f !== 'object' || seen.has(f)) continue;
+      seen.add(f);
+      n++;
+      const mp = f.memoizedProps;
+      if (mp && typeof mp === 'object') {
+        const svcs = mp.uiContextMenuServices;
+        if (svcs && typeof svcs.executeCommand === 'function') {
+          window.__cursorRemoteCommandService = svcs;
+          return svcs;
+        }
+        if (svcs && svcs.commandService && typeof svcs.commandService.executeCommand === 'function') {
+          window.__cursorRemoteCommandService = svcs.commandService;
+          return svcs.commandService;
+        }
+        if (mp.paletteConfig && typeof mp.paletteConfig.executeCommand === 'function') {
+          window.__cursorRemoteCommandService = mp.paletteConfig;
+          return mp.paletteConfig;
+        }
+      }
+      if (f.child) stack.push(f.child);
+      let s = f.sibling, i = 0;
+      while (s && i < 2000) { stack.push(s); s = s.sibling; i++; }
+    }
+    return null;
+  };
+`;
+
 export type ActionClickTargetResult = { element: Element } | { error: string };
 
 const ACTION_BUTTON_SELECTOR = 'button, [role="button"], [class*="ui-button"], [data-click-ready]';
@@ -619,13 +666,16 @@ export class CommandExecutor {
             return { composite: norm(composite), agentOnly: norm(rawAgent) };
           }
           const glassBtns = Array.from(document.querySelectorAll(
-            '.glass-sidebar-agent-list-container li.ui-sidebar-menu-item > div.glass-sidebar-agent-menu-btn'
+            '.glass-sidebar-agent-list-container li.ui-sidebar-menu-item > div.glass-sidebar-agent-menu-btn, ' +
+            '.glass-sidebar-agent-list-container li.ui-sidebar-menu-item .ui-sidebar-menu-button'
           ));
           if (glassBtns.length > 0) {
-            const rows = glassBtns.map((btn) => ({
-              btn,
-              ...glassCompositeForBtn(btn),
-            })).filter((r) => r.composite);
+            const rows = glassBtns.map((btn) => {
+              const el = btn.closest('.ui-sidebar-menu-button, [data-sidebar-menu-button]') || btn;
+              const id = el.getAttribute('data-composer-id')
+                || el.closest('[data-composer-id]')?.getAttribute('data-composer-id') || '';
+              return { btn: el as HTMLElement, id, ...glassCompositeForBtn(el) };
+            }).filter((r) => r.composite);
             const byComp = rows.filter((r) => r.composite === target);
             if (byComp.length === 1) {
               byComp[0].btn.click();
@@ -663,6 +713,91 @@ export class CommandExecutor {
       if (!clicked) throw new Error('Tab not found: ' + tabTitle);
       console.log(`[command-executor] Switched tab: ${tabTitle}`);
     });
+  }
+
+  /**
+   * Open/switch the workspace window to a specific agent chat by its composer
+   * id. Uses the workbench CommandService reachable from the renderer
+   * (`composer.openComposer`, <composerId>), which reliably switches the open
+   * chat even when the target agent belongs to a different workspace/folder.
+   * Falls back to clicking the folder-tree row by title when no composer id is
+   * available or the command fails.
+   */
+  async openFolderAgent(
+    commandId: string,
+    composerId?: string,
+    tabTitle?: string,
+    selectorPath?: string
+  ): Promise<CommandResult> {
+    return this.withRetry(commandId, async (client) => {
+      const target = (composerId ?? '').trim();
+      if (target) {
+        const result = await client.evaluate(`
+          (() => {
+            ${COMMAND_SERVICE_LOOKUP_JS}
+            const svc = __getCommandService();
+            if (!svc) return { ok: false, error: 'command service not found' };
+            try {
+              const ret = svc.executeCommand('composer.openComposer', ${JSON.stringify(target)});
+              if (ret && typeof ret.catch === 'function') {
+                ret.catch(() => {});
+              }
+              return { ok: true };
+            } catch (e) {
+              return { ok: false, error: String(e) };
+            }
+          })()
+        `) as { ok: boolean; error?: string } | null;
+
+        if (result?.ok) {
+          console.log(`[command-executor] Opened composer via command: ${target.substring(0, 8)}`);
+          return;
+        }
+        console.warn(`[command-executor] composer.openComposer failed (${result?.error}); falling back to DOM click`);
+      }
+
+      // Fallback: click the matching row (works when the overview window DOM is
+      // the client target, e.g. no composer id was extracted for the row).
+      const clicked = await this.clickFolderAgentRow(client, tabTitle, selectorPath);
+      if (!clicked) {
+        throw new Error(`Agent not found: ${tabTitle ?? composerId ?? '(unknown)'}`);
+      }
+      console.log(`[command-executor] Opened composer via row click: ${tabTitle ?? composerId}`);
+    });
+  }
+
+  /** Click the agent sidebar row whose title (or selector path) matches. */
+  private async clickFolderAgentRow(
+    client: CdpClient,
+    tabTitle?: string,
+    selectorPath?: string
+  ): Promise<boolean> {
+    return await client.evaluate(`
+      (() => {
+        const title = ${JSON.stringify((tabTitle ?? '').trim())};
+        const selectorPath = ${JSON.stringify(selectorPath ?? '')};
+        if (selectorPath) {
+          try {
+            const el = document.querySelector(selectorPath.split('>')[0].trim());
+            if (el) { el.scrollIntoView({ block: 'center', behavior: 'instant' }); (el.querySelector('[data-sidebar-menu-button], .ui-sidebar-menu-button') || el).click(); return true; }
+          } catch {}
+        }
+        if (!title) return false;
+        const norm = (s) => (s || '').trim().replace(/\\s+/g, ' ').toLowerCase();
+        const want = norm(title);
+        const rows = Array.from(document.querySelectorAll('.glass-sidebar-agent-list-container li.ui-sidebar-menu-item'));
+        for (const li of rows) {
+          const labelEl = li.querySelector('.ui-sidebar-menu-button-label');
+          if (norm(labelEl ? labelEl.textContent : li.textContent) === want) {
+            const btn = li.querySelector('.ui-sidebar-menu-button') || li.querySelector('[data-sidebar-menu-button]') || li;
+            btn.scrollIntoView({ block: 'center', behavior: 'instant' });
+            btn.click();
+            return true;
+          }
+        }
+        return false;
+      })()
+    `) as boolean;
   }
 
   async newChat(commandId: string): Promise<CommandResult> {

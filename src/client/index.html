@@ -13,6 +13,11 @@
   <div id="app">
     <header id="header">
       <div class="header-left">
+        <button id="btn-folders" class="header-folders-btn hidden" aria-label="Folders">
+          <span class="header-folders-icon" aria-hidden="true">&#128193;</span>
+          <span>Folders</span>
+          <span id="folders-count" class="header-folders-count"></span>
+        </button>
         <span id="connection-dot" class="dot reconnecting"></span>
         <span id="connection-text">Connecting...</span>
       </div>
@@ -119,6 +124,10 @@
     <div id="sheet-slash" class="bottom-sheet hidden">
       <div class="sheet-header">Slash Commands</div>
       <div id="sheet-slash-list" class="sheet-list"></div>
+    </div>
+    <div id="sheet-folders" class="bottom-sheet sheet-folders hidden">
+      <div class="sheet-header">Folders</div>
+      <div id="sheet-folders-list" class="sheet-list folders-list"></div>
     </div>
   </div>
 

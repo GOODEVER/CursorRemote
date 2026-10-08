@@ -15,6 +15,7 @@ interface MockSocket {
   on(event: string, fn: EventHandler): void;
   emit(event: string, ...args: unknown[]): void;
   fire(event: string, ...args: unknown[]): void;
+  sent: Array<{ event: string; payload: any }>;
   connected: boolean;
   id: string;
 }
@@ -37,10 +38,13 @@ function createTestEnv() {
         handlers: new Map(),
         connected: true,
         id: 'test-socket-id',
+        sent: [],
         on(event: string, fn: EventHandler) {
           this.handlers.set(event, fn);
         },
-        emit() { /* noop for tests */ },
+        emit(event: string, ...args: unknown[]) {
+          this.sent.push({ event, payload: args[0] });
+        },
         fire(event: string, ...args: unknown[]) {
           const handler = this.handlers.get(event);
           if (handler) handler(...args);
@@ -99,6 +103,10 @@ function fireFullState(mockSocket: MockSocket, state: CursorState) {
 
 function firePatch(mockSocket: MockSocket, patch: Partial<CursorState>) {
   mockSocket.fire('state:patch', patch);
+}
+
+function fireWindowSnapshot(mockSocket: MockSocket, snapshot: Record<string, unknown>) {
+  mockSocket.fire('window:snapshot', snapshot);
 }
 
 // ─── Connection status rendering ───
@@ -339,6 +347,96 @@ describe('web: code block rendering', () => {
   });
 });
 
+// ─── Folders drawer ───
+
+describe('web: folders drawer', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  function stateWithFolders(): CursorState {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    return {
+      ...fixture[0].state!,
+      folders: [
+        {
+          name: 'FactoryTycoonGame',
+          sectionId: 'workspace:abc',
+          kind: 'workspace',
+          isCurrent: true,
+          agents: [
+            { title: 'Roblox factory game design', composerId: '', sectionId: 'workspace:abc', isActive: false, selectorPath: '' },
+          ],
+        },
+        {
+          name: 'beabee',
+          sectionId: 'repo:github.com/juliasabel/beabee',
+          kind: 'repo',
+          isCurrent: false,
+          agents: [
+            { title: 'Game currency and lives', composerId: '', sectionId: 'repo:x', isActive: false, selectorPath: '' },
+          ],
+        },
+      ],
+    };
+  }
+
+  it('shows the Folders header button when folders exist', () => {
+    fireFullState(env.mockSocket, stateWithFolders());
+    const btn = env.document.getElementById('btn-folders')!;
+    assert.ok(!btn.classList.contains('hidden'), 'Folders button should be visible');
+  });
+
+  it('hides the Folders button when there are no folders', () => {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    fireFullState(env.mockSocket, fixture[0].state!);
+    const btn = env.document.getElementById('btn-folders')!;
+    assert.ok(btn.classList.contains('hidden'), 'Folders button should be hidden');
+  });
+
+  it('lists every folder and its agents when opened', () => {
+    fireFullState(env.mockSocket, stateWithFolders());
+    const btn = env.document.getElementById('btn-folders')!;
+    btn.click();
+    const list = env.document.getElementById('sheet-folders-list')!;
+    const sections = list.querySelectorAll('.folder-section');
+    assert.equal(sections.length, 2, 'Should render both folders');
+    assert.match(list.textContent!, /FactoryTycoonGame/);
+    assert.match(list.textContent!, /beabee/);
+    assert.match(list.textContent!, /Roblox factory game design/);
+    const agentBtns = list.querySelectorAll('.folder-agent');
+    assert.equal(agentBtns.length, 2, 'Should render both agents');
+  });
+
+  it('marks the current folder', () => {
+    fireFullState(env.mockSocket, stateWithFolders());
+    env.document.getElementById('btn-folders')!.click();
+    const list = env.document.getElementById('sheet-folders-list')!;
+    const current = list.querySelectorAll('.folder-header.current');
+    assert.equal(current.length, 1, 'Exactly one folder should be marked current');
+    assert.match(current[0].textContent!, /FactoryTycoonGame/);
+  });
+
+  it('emits command:open_folder_agent with composerId when tapping an agent', () => {
+    const state = stateWithFolders();
+    state.folders[0].agents[0].composerId = 'composer-abc-123';
+    fireFullState(env.mockSocket, state);
+    env.document.getElementById('btn-folders')!.click();
+    const list = env.document.getElementById('sheet-folders-list')!;
+    const agentBtn = list.querySelector('.folder-agent') as HTMLButtonElement;
+    assert.ok(agentBtn, 'Agent row should render');
+    agentBtn.click();
+
+    const evt = env.mockSocket.sent.filter(s => s.event === 'command:open_folder_agent').pop();
+    assert.ok(evt, 'command:open_folder_agent should be emitted');
+    assert.equal(evt!.payload.composerId, 'composer-abc-123');
+    assert.equal(evt!.payload.tabTitle, 'Roblox factory game design');
+    assert.equal(evt!.payload.type, 'open_folder_agent');
+  });
+});
+
 // ─── Fetch tool rendering ───
 
 describe('web: fetch tool', () => {
@@ -516,5 +614,121 @@ describe('web: questionnaire widget', () => {
     assert.equal(questions.length, 2);
     assert.ok(!questions[0].classList.contains('questionnaire-question-active'));
     assert.ok(questions[1].classList.contains('questionnaire-question-active'));
+  });
+
+  it('surfaces a non-home window questionnaire delivered via window:snapshot', () => {
+    // Regression: a question raised in a window other than the relay's CDP home
+    // window only reaches the phone through `window:snapshot`. The client used
+    // to have no listener, so the bar stayed hidden and the question was
+    // unanswerable from the web app.
+    fireFullState(env.mockSocket, baseState());
+    const bar = env.document.getElementById('questionnaire-bar')!;
+    assert.ok(bar.classList.contains('hidden'), 'Hidden before any snapshot');
+
+    fireWindowSnapshot(env.mockSocket, {
+      windowId: 'win-other',
+      windowTitle: 'Other Project',
+      questionnaire: {
+        questions: [
+          {
+            number: '1.', text: 'Which DB?', isActive: true,
+            options: [
+              { letter: 'A', label: 'Postgres', isFreeform: false, selectorPath: 'p1' },
+              { letter: 'B', label: 'SQLite', isFreeform: false, selectorPath: 'p2' },
+            ],
+          },
+        ],
+        activeIndex: 0,
+        totalLabel: '1 of 1',
+        skipSelectorPath: 'skip-x',
+        continueSelectorPath: 'cont-x',
+        continueDisabled: false,
+      },
+    });
+
+    assert.ok(!bar.classList.contains('hidden'), 'Visible after window:snapshot');
+    assert.equal(bar.querySelectorAll('.questionnaire-option').length, 2);
+  });
+
+  it('routes a non-home window answer back to that window', () => {
+    fireFullState(env.mockSocket, baseState());
+    fireWindowSnapshot(env.mockSocket, {
+      windowId: 'win-other',
+      windowTitle: 'Other Project',
+      questionnaire: {
+        questions: [
+          {
+            number: '1.', text: 'Which DB?', isActive: true,
+            options: [
+              { letter: 'A', label: 'Postgres', isFreeform: false, selectorPath: 'p1' },
+              { letter: 'B', label: 'SQLite', isFreeform: false, selectorPath: 'p2' },
+            ],
+          },
+        ],
+        activeIndex: 0,
+        totalLabel: '1 of 1',
+        skipSelectorPath: 'skip-x',
+        continueSelectorPath: 'cont-x',
+        continueDisabled: false,
+      },
+    });
+
+    const firstOption = env.document.querySelector('.questionnaire-option')! as HTMLButtonElement;
+    firstOption.click();
+
+    const click = env.mockSocket.sent.filter(s => s.event === 'command:click_action').pop();
+    assert.ok(click, 'click_action should have been emitted');
+    assert.equal(click!.payload.selectorPath, 'p1');
+    assert.equal(click!.payload.actionLabel, 'Postgres');
+    assert.equal(click!.payload.windowId, 'win-other');
+  });
+
+  it('emits Skip/Continue with the windowId of the active questionnaire', () => {
+    fireFullState(env.mockSocket, baseState());
+    fireWindowSnapshot(env.mockSocket, {
+      windowId: 'win-other',
+      windowTitle: 'Other Project',
+      questionnaire: {
+        questions: [{ number: '1.', text: 'Q?', isActive: true, options: [] }],
+        activeIndex: 0, totalLabel: '1 of 1',
+        skipSelectorPath: 'skip-x',
+        continueSelectorPath: 'cont-x',
+        continueDisabled: false,
+      },
+    });
+
+    env.document.getElementById('btn-q-skip')!.click();
+    const skip = env.mockSocket.sent.filter(s => s.event === 'command:click_action').pop();
+    assert.equal(skip!.payload.selectorPath, 'skip-x');
+    assert.equal(skip!.payload.windowId, 'win-other');
+
+    env.document.getElementById('btn-q-continue')!.click();
+    const cont = env.mockSocket.sent.filter(s => s.event === 'command:click_action').pop();
+    assert.equal(cont!.payload.selectorPath, 'cont-x');
+    assert.equal(cont!.payload.actionLabel, 'Continue');
+    assert.equal(cont!.payload.windowId, 'win-other');
+  });
+
+  it('clears the remote questionnaire when a later snapshot has null', () => {
+    fireFullState(env.mockSocket, baseState());
+    const bar = env.document.getElementById('questionnaire-bar')!;
+    fireWindowSnapshot(env.mockSocket, {
+      windowId: 'win-other',
+      windowTitle: 'Other Project',
+      questionnaire: {
+        questions: [{ number: '1.', text: 'Q?', isActive: true, options: [] }],
+        activeIndex: 0, totalLabel: '1 of 1',
+        skipSelectorPath: '', continueSelectorPath: '',
+        continueDisabled: false,
+      },
+    });
+    assert.ok(!bar.classList.contains('hidden'));
+
+    fireWindowSnapshot(env.mockSocket, {
+      windowId: 'win-other',
+      windowTitle: 'Other Project',
+      questionnaire: null,
+    });
+    assert.ok(bar.classList.contains('hidden'), 'Hidden after null snapshot');
   });
 });
