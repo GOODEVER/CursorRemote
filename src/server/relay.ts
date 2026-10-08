@@ -12,6 +12,11 @@ import type { CDPBridge } from './cdp-bridge.js';
 import type { WindowMonitor, WindowSnapshot } from './window-monitor.js';
 import { markdownToWebHtml, readPlanFile } from './plan-files.js';
 import {
+  createWebPushManager,
+  type WebPushManager,
+  type PushSubscriptionRecord,
+} from './web-push.js';
+import {
   WEBAPP_SESSION_COOKIE,
   createWebappSessionStore,
   parseSessionCookie,
@@ -125,6 +130,23 @@ export class Relay {
 
   private sessionStore: WebappSessionStore;
   private loginAttempts = new Map<string, RateLimitEntry>();
+  private webPush: WebPushManager;
+  /** Latest push-relevant signals per window (from window:update snapshots). */
+  private pushWindowSignals = new Map<string, {
+    questionnaire: boolean;
+    approval: boolean;
+    working: boolean;
+    questionText: string;
+    approvalDesc: string;
+    title: string;
+  }>();
+  /** Edge bookkeeping for push transitions (mirrors the client's logic). */
+  private pushHadQuestionnaire = false;
+  private pushHadApproval = false;
+  private pushWasWorking = false;
+  private pushFinishTimer: ReturnType<typeof setTimeout> | null = null;
+  private pushPrimed = false;
+  private static readonly PUSH_FINISH_SETTLE_MS = 5000;
 
   /** Max-Age for session cookie (30 days), aligned with typical “stay signed in” expectation. */
   private static readonly SESSION_COOKIE_MAX_AGE_SEC = 30 * 24 * 60 * 60;
@@ -144,6 +166,11 @@ export class Relay {
     this.commandExecutor = commandExecutor;
     this.cdpBridge = cdpBridge;
     this.sessionStore = createWebappSessionStore(config.dataDir);
+    this.webPush = createWebPushManager(
+      config.dataDir,
+      config.webPush.subject,
+      config.webPush.enabled
+    );
 
     this.app = express();
     this.httpServer = createServer(this.app);
@@ -184,6 +211,26 @@ export class Relay {
   }
 
   private onWindowUpdate = (windowId: string, snapshot: WindowSnapshot): void => {
+    // Record push-relevant signals for every window (home or not) so the
+    // transition evaluator sees questions/approvals raised anywhere.
+    const hasQ = !!(snapshot.questionnaire && snapshot.questionnaire.questions?.length);
+    const hasA = (snapshot.pendingApprovals?.length ?? 0) > 0;
+    const sig = {
+      questionnaire: hasQ,
+      approval: hasA,
+      working: snapshot.canAbort || snapshot.agentActivityLive
+        || (snapshot.agentStatus !== 'idle'
+          && snapshot.agentStatus !== 'waiting_approval'
+          && snapshot.agentStatus !== 'error'),
+      questionText: hasQ
+        ? ((snapshot.questionnaire!.questions[snapshot.questionnaire!.activeIndex]
+            ?? snapshot.questionnaire!.questions[0])?.text || '').slice(0, 160)
+        : '',
+      approvalDesc: hasA ? (snapshot.pendingApprovals[0]?.description || '') : '',
+      title: snapshot.windowTitle,
+    };
+    this.pushWindowSignals.set(windowId, sig);
+
     // Forward non-home window state to web clients so a question/approval
     // raised in a window other than the relay's CDP home window is still
     // surfaced on the phone (previously only Telegram saw these). The payload
@@ -202,6 +249,8 @@ export class Relay {
       folders: snapshot.folders,
       lastUpdated: snapshot.lastUpdated,
     });
+
+    this.evaluatePushTransition();
   };
 
   /**
@@ -419,6 +468,45 @@ export class Relay {
         res.setHeader('Cache-Control', 'no-cache, must-revalidate');
       },
     }));
+
+    // --- Web Push (real notifications: service worker + VAPID) ---
+    // Public key is needed by the client to subscribe; it's not a secret.
+    this.app.get('/api/push/public-key', (_req, res) => {
+      res.json({ enabled: this.webPush.enabled, publicKey: this.webPush.getPublicKey() });
+    });
+
+    this.app.post('/api/push/subscribe', (req, res) => {
+      if (!this.webPush.enabled) {
+        return res.status(503).json({ error: 'Push not enabled' });
+      }
+      const body = req.body as Partial<PushSubscriptionRecord> | undefined;
+      const endpoint = body?.endpoint;
+      const p256dh = body?.keys?.p256dh;
+      const auth = body?.keys?.auth;
+      if (typeof endpoint !== 'string' || !endpoint
+        || typeof p256dh !== 'string' || typeof auth !== 'string') {
+        return res.status(400).json({ error: 'Invalid subscription' });
+      }
+      const label = typeof req.headers['user-agent'] === 'string'
+        ? req.headers['user-agent'].slice(0, 200)
+        : undefined;
+      this.webPush.addSubscription({
+        endpoint,
+        keys: { p256dh, auth },
+        label,
+        createdAt: Date.now(),
+      });
+      res.json({ ok: true, count: this.webPush.getSubscriptionCount() });
+    });
+
+    this.app.post('/api/push/unsubscribe', (req, res) => {
+      const endpoint = (req.body as { endpoint?: unknown } | undefined)?.endpoint;
+      if (typeof endpoint !== 'string' || !endpoint) {
+        return res.status(400).json({ error: 'Missing endpoint' });
+      }
+      this.webPush.removeSubscription(endpoint);
+      res.json({ ok: true, count: this.webPush.getSubscriptionCount() });
+    });
 
     const authMiddleware: express.RequestHandler = (req, res, next) => {
       if (!this.authEnabled) return next();
@@ -820,10 +908,121 @@ export class Relay {
   private setupStateForwarding(): void {
     this.stateManager.on('state:patch', (patch: Partial<CursorState>) => {
       this.io.emit('state:patch', patch);
+      this.evaluatePushTransition();
     });
 
     this.stateManager.on('connection:changed', (connected: boolean) => {
       this.io.emit('connection:status', { connected });
     });
+  }
+
+  private isWorkingState(s: CursorState): boolean {
+    if (!s.connected) return false;
+    if (s.canAbort || s.agentActivityLive) return true;
+    return s.agentStatus !== 'idle'
+      && s.agentStatus !== 'waiting_approval'
+      && s.agentStatus !== 'error';
+  }
+
+  private questionText(q: CursorState['questionnaire']): string {
+    if (!q || !q.questions || q.questions.length === 0) return '';
+    const active = q.questions[q.activeIndex] ?? q.questions[0];
+    return (active?.text || '').slice(0, 160);
+  }
+
+  /** Merge the home window's live state with other windows' latest signals. */
+  private aggregatePushSignals(): {
+    hasQ: boolean; hasA: boolean; working: boolean;
+    questionText: string; approvalDesc: string;
+  } {
+    const state = this.stateManager.getCurrentState();
+    const homeId = this.windowMonitor?.getHomeWindowId() ?? state.activeWindowId;
+    const homeQ = !!(state.questionnaire && state.questionnaire.questions?.length);
+    const homeA = (state.pendingApprovals?.length ?? 0) > 0;
+    let hasQ = homeQ;
+    let hasA = homeA;
+    let working = this.isWorkingState(state);
+    let questionText = homeQ ? this.questionText(state.questionnaire) : '';
+    let approvalDesc = homeA ? (state.pendingApprovals[0]?.description || '') : '';
+    for (const [wid, sig] of this.pushWindowSignals) {
+      if (wid === homeId) continue;
+      hasQ = hasQ || sig.questionnaire;
+      hasA = hasA || sig.approval;
+      working = working || sig.working;
+      if (!questionText && sig.questionnaire) questionText = sig.questionText;
+      if (!approvalDesc && sig.approval) approvalDesc = sig.approvalDesc;
+    }
+    return { hasQ, hasA, working, questionText, approvalDesc };
+  }
+
+  /**
+   * Edge-triggered web push. Mirrors the client's notification logic: push only
+   * when the agent NEWLY asks a question / needs approval, or when it has
+   * genuinely finished (working -> idle, debounced so mid-run gaps don't fire).
+   */
+  private evaluatePushTransition(): void {
+    if (!this.webPush.enabled) return;
+    const { hasQ, hasA, working, questionText, approvalDesc } = this.aggregatePushSignals();
+
+    if (!this.pushPrimed) {
+      this.pushPrimed = true;
+      this.pushHadQuestionnaire = hasQ;
+      this.pushHadApproval = hasA;
+      this.pushWasWorking = working;
+      return;
+    }
+
+    if (hasQ && !this.pushHadQuestionnaire) {
+      void this.push(
+        'Agent has a question',
+        questionText || 'The agent is asking you something.',
+        'cursor-questionnaire'
+      );
+    } else if (hasA && !this.pushHadApproval) {
+      void this.push(
+        'Agent needs approval',
+        approvalDesc || 'The agent is waiting for your approval.',
+        'cursor-approval'
+      );
+    }
+
+    if (working) {
+      this.pushWasWorking = true;
+      if (this.pushFinishTimer) {
+        clearTimeout(this.pushFinishTimer);
+        this.pushFinishTimer = null;
+      }
+    } else if (this.pushWasWorking) {
+      this.scheduleFinishCheck();
+    }
+
+    this.pushHadQuestionnaire = hasQ;
+    this.pushHadApproval = hasA;
+  }
+
+  private scheduleFinishCheck(): void {
+    if (this.pushFinishTimer) return;
+    this.pushFinishTimer = setTimeout(() => {
+      this.pushFinishTimer = null;
+      const { hasQ, hasA, working } = this.aggregatePushSignals();
+      if (working) {
+        this.pushWasWorking = true;
+        return;
+      }
+      // Blocked on a question/approval is not a "finished" state.
+      if (hasQ || hasA) {
+        this.pushWasWorking = false;
+        return;
+      }
+      this.pushWasWorking = false;
+      void this.push('Agent finished', 'The agent has finished working.', 'cursor-finished');
+    }, Relay.PUSH_FINISH_SETTLE_MS);
+  }
+
+  private async push(title: string, body: string, tag?: string): Promise<void> {
+    const delivered = await this.webPush.send({ title, body, tag });
+    if (delivered > 0) {
+      console.log(`[web-push] Sent "${title}" to ${delivered} subscription(s)`);
+    }
   }
 }

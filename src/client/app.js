@@ -190,6 +190,12 @@
   const $sheetFoldersList = document.getElementById('sheet-folders-list');
   const $btnFolders = document.getElementById('btn-folders');
   const $foldersCount = document.getElementById('folders-count');
+  const $btnNotify = document.getElementById('btn-notify');
+  const $notifyIcon = document.getElementById('notify-icon');
+  const $sheetNotify = document.getElementById('sheet-notify');
+  const $notifyStatus = document.getElementById('notify-status');
+  const $btnNotifyToggle = document.getElementById('btn-notify-toggle');
+  const $notifyHint = document.getElementById('notify-hint');
   const $planModalOverlay = document.getElementById('plan-modal-overlay');
   const $planModalLabel = document.getElementById('plan-modal-label');
   const $planModalTitle = document.getElementById('plan-modal-title');
@@ -2056,6 +2062,9 @@
     } else if (type === 'folders') {
       $sheetFolders.classList.remove('hidden');
       renderFoldersSheet();
+    } else if (type === 'notify') {
+      $sheetNotify.classList.remove('hidden');
+      renderNotifySheet();
     }
   }
   function closeSheet(options) {
@@ -2067,6 +2076,7 @@
     $sheetPlanModel.classList.add('hidden');
     $sheetSlash.classList.add('hidden');
     $sheetFolders.classList.add('hidden');
+    $sheetNotify.classList.add('hidden');
     activeSheet = null;
     // Leaving the slash sheet without picking a row must also close the host
     // composer's tray (and drop the stray "/") — mirror the app's Escape.
@@ -2385,6 +2395,169 @@
   ['pointerdown', 'keydown'].forEach(function (evt) {
     window.addEventListener(evt, primeNotificationPermission, { once: true });
   });
+
+  // --- Web Push (real notifications via service worker + VAPID) ---
+  // Needed so notifications arrive when the page is backgrounded/closed,
+  // which the in-page Notification API cannot do on mobile.
+  let pushReady = false;
+  let pushSubscribed = false;
+  let pushPublicKey = '';
+
+  function urlBase64ToUint8Array(base64String) {
+    var padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+    var base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+    var raw = window.atob(base64);
+    var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+
+  function pushSupported() {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)
+      || typeof window.PushManager === 'undefined') {
+      return false;
+    }
+    // Service workers + Push require a secure context. localhost counts as
+    // secure; a plain-http LAN IP (e.g. http://192.168.x.x) does not.
+    return window.isSecureContext !== false;
+  }
+
+  function insecureContext() {
+    return typeof window.isSecureContext !== 'undefined' && !window.isSecureContext;
+  }
+
+  async function initPush() {
+    if (!pushSupported()) return;
+    try {
+      var reg = await navigator.serviceWorker.register('sw.js');
+      pushReady = true;
+      var res = await fetch('/api/push/public-key');
+      if (!res.ok) return;
+      var data = await res.json();
+      pushPublicKey = (data && data.publicKey) || '';
+      if (!pushPublicKey) return;
+      // Reflect an existing subscription (no prompt).
+      var existing = await reg.pushManager.getSubscription();
+      pushSubscribed = !!existing;
+      if (existing) await syncPushSubscription(existing);
+    } catch (e) {
+      // Push is optional; ignore failures (e.g. insecure origin).
+    }
+  }
+
+  async function syncPushSubscription(sub) {
+    try {
+      var json = sub.toJSON();
+      await fetch('/api/push/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint: json.endpoint, keys: json.keys }),
+      });
+    } catch (_) { /* ignore */ }
+  }
+
+  async function enablePush() {
+    if (!pushSupported()) {
+      showToast('Push not supported in this browser', 'error');
+      return;
+    }
+    try {
+      var perm = await Notification.requestPermission();
+      notificationPermission = perm;
+      if (perm !== 'granted') {
+        showToast('Notifications blocked — allow them in browser settings', 'error');
+        return;
+      }
+      var reg = await navigator.serviceWorker.ready;
+      if (!pushPublicKey) {
+        var res = await fetch('/api/push/public-key');
+        var data = await res.json();
+        pushPublicKey = (data && data.publicKey) || '';
+      }
+      if (!pushPublicKey) {
+        showToast('Push is not enabled on the server', 'error');
+        return;
+      }
+      var sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(pushPublicKey),
+      });
+      await syncPushSubscription(sub);
+      pushSubscribed = true;
+      showToast('Push notifications enabled', 'success');
+      renderNotifySheet();
+    } catch (e) {
+      showToast('Could not enable push: ' + (e && e.message ? e.message : e), 'error');
+    }
+  }
+
+  async function disablePush() {
+    if (!pushSupported()) return;
+    try {
+      var reg = await navigator.serviceWorker.ready;
+      var sub = await reg.pushManager.getSubscription();
+      if (sub) {
+        var endpoint = sub.endpoint;
+        await sub.unsubscribe();
+        await fetch('/api/push/unsubscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ endpoint: endpoint }),
+        });
+      }
+      pushSubscribed = false;
+      showToast('Push notifications disabled', 'success');
+      renderNotifySheet();
+    } catch (e) {
+      showToast('Could not disable push', 'error');
+    }
+  }
+
+  function renderNotifySheet() {
+    if (!$notifyStatus || !$btnNotifyToggle) return;
+    var pwa = typeof window.matchMedia === 'function'
+      && window.matchMedia('(display-mode: standalone)').matches;
+    var statusText;
+    if (insecureContext()) {
+      $notifyStatus.textContent =
+        'Notifications need a secure (HTTPS) connection. Open this app over HTTPS ' +
+        '(e.g. a tunnel or reverse proxy with a certificate), or use localhost on this device.';
+      $btnNotifyToggle.disabled = true;
+      $btnNotifyToggle.textContent = 'HTTPS required';
+      return;
+    }
+    if (!pushSupported()) {
+      statusText = 'Push is not supported in this browser.';
+      $btnNotifyToggle.disabled = true;
+      $btnNotifyToggle.textContent = 'Unavailable';
+    } else if (pushSubscribed) {
+      statusText = 'Push notifications are ON for this device.';
+      $btnNotifyToggle.disabled = false;
+      $btnNotifyToggle.textContent = 'Turn off';
+      $btnNotifyToggle.classList.add('notify-toggle-off');
+    } else {
+      statusText = 'Push notifications are OFF for this device.';
+      $btnNotifyToggle.disabled = false;
+      $btnNotifyToggle.textContent = 'Enable notifications';
+      $btnNotifyToggle.classList.remove('notify-toggle-off');
+    }
+    $notifyStatus.textContent = statusText;
+    $notifyHint.textContent = pwa
+      ? 'You will be notified when the agent asks a question, needs approval, or finishes.'
+      : 'Tip: add this app to your Home Screen for reliable notifications. ' +
+        'You will be notified when the agent asks a question, needs approval, or finishes.';
+  }
+
+  if ($btnNotify) {
+    $btnNotify.addEventListener('click', () => openSheet('notify'));
+  }
+  if ($btnNotifyToggle) {
+    $btnNotifyToggle.addEventListener('click', () => {
+      if (pushSubscribed) void disablePush();
+      else void enablePush();
+    });
+  }
+  void initPush();
 
   } // end bootstrap
 

@@ -23,6 +23,10 @@ export function loadConfig(): ServerConfig {
     webappPassword: process.env.WEBAPP_PASSWORD ?? '',
     windowTitleQualifier: process.env.WINDOW_TITLE_QUALIFIER !== 'false',
     dataDir,
+    webPush: {
+      enabled: process.env.WEBPUSH_ENABLED !== 'false',
+      subject: process.env.WEBPUSH_SUBJECT ?? 'mailto:cursorremote@localhost',
+    },
     telegram: {
       enabled: process.env.TELEGRAM_ENABLED === 'true',
       botToken: process.env.TELEGRAM_BOT_TOKEN ?? '',

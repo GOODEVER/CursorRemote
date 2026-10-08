@@ -7,6 +7,7 @@
   <title>CursorRemote</title>
   <link rel="icon" type="image/png" href="favicon.png">
   <link rel="apple-touch-icon" href="favicon.png">
+  <link rel="manifest" href="manifest.json">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -22,6 +23,9 @@
         <span id="connection-text">Connecting...</span>
       </div>
       <div class="header-right">
+        <button id="btn-notify" class="header-notify-btn" aria-label="Notifications" title="Notifications">
+          <span id="notify-icon" aria-hidden="true">&#128276;</span>
+        </button>
         <span id="agent-status-icon"></span>
         <span id="agent-status-text">Idle</span>
       </div>
@@ -128,6 +132,14 @@
     <div id="sheet-folders" class="bottom-sheet sheet-folders hidden">
       <div class="sheet-header">Folders</div>
       <div id="sheet-folders-list" class="sheet-list folders-list"></div>
+    </div>
+    <div id="sheet-notify" class="bottom-sheet sheet-notify hidden">
+      <div class="sheet-header">Notifications</div>
+      <div class="sheet-list">
+        <div id="notify-status" class="notify-status"></div>
+        <button id="btn-notify-toggle" class="btn notify-toggle"></button>
+        <p class="notify-hint" id="notify-hint"></p>
+      </div>
     </div>
   </div>
 

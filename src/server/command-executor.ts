@@ -899,11 +899,21 @@ export class CommandExecutor {
     const result = await this.withRetryValue(commandId, async (client) => {
       await this.focusComposer(client);
 
-      const alreadyOpen = await client.evaluate(`
+      const menuAlreadyOpen = await client.evaluate(`
         (() => document.querySelector('div[role="listbox"][aria-label="Slash commands"]') !== null)()
       `) as boolean;
 
-      if (!alreadyOpen) {
+      if (!menuAlreadyOpen) {
+        // Cursor pivots the tray on the composer's leading character: a "/" is
+        // required to open it, but if the composer already holds something
+        // (e.g. a stray "/" left from a previous open), typing another "/"
+        // produces "//" and the tray stays shut (or shows nothing). Normalize
+        // to a single leading "/" first.
+        const current = await this.readComposerText(client);
+        if (current.length > 0) {
+          await this.clearComposer(client);
+          await this.focusComposer(client);
+        }
         await client.typeText('/');
         await sleep(450);
       }
@@ -956,6 +966,13 @@ export class CommandExecutor {
         (() => document.querySelector('div[role="listbox"][aria-label="Slash commands"]') !== null)()
       `) as boolean;
       if (!menuOpen) {
+        // Mirror getSlashMenu: clear any stray text so "/" reliably reopens
+        // the tray rather than turning into "//" (which keeps it closed).
+        const current = await this.readComposerText(client);
+        if (current.length > 0) {
+          await this.clearComposer(client);
+          await this.focusComposer(client);
+        }
         await client.typeText('/');
         await sleep(450);
       }
@@ -1083,6 +1100,41 @@ export class CommandExecutor {
       if (!stopped) throw new Error('Stop control not found (agent may already be idle)');
       console.log('[command-executor] Stop generation clicked');
     });
+  }
+
+  /** Read the current composer text (works for textarea and contenteditable). */
+  private async readComposerText(client: CdpClient): Promise<string> {
+    const strategies = this.selectors.chatInput.strategies;
+    const text = await client.evaluate(`
+      (() => {
+        const strategies = ${JSON.stringify(strategies)};
+        let input = null;
+        for (const sel of strategies) {
+          try { input = document.querySelector(sel); if (input) break; } catch {}
+        }
+        if (!input) return '';
+        const valueText = typeof input.value === 'string' ? input.value : '';
+        const contentText = input.textContent ?? input.innerText ?? '';
+        return (input.isContentEditable ? contentText : (valueText || contentText)).trim();
+      })()
+    `);
+    return typeof text === 'string' ? text : '';
+  }
+
+  /**
+   * Clear the composer (select all + Backspace) so `/` opens a fresh menu.
+   * Without this, a stray "/" already sitting in the composer turns the
+   * handler's own "/" into "//", which closes Cursor's slash tray instead of
+   * opening it.
+   */
+  private async clearComposer(client: CdpClient): Promise<void> {
+    const isMac = process.platform === 'darwin';
+    await client.pressKey('Escape', 'Escape', 27);
+    await sleep(60);
+    await client.pressKey('a', 'KeyA', 65, isMac ? 4 : 2);
+    await sleep(40);
+    await client.pressKey('Backspace', 'Backspace', 8);
+    await sleep(80);
   }
 
   private async focusComposer(client: CdpClient): Promise<void> {

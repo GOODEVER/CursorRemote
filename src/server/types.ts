@@ -424,7 +424,14 @@ export interface ServerConfig {
   webappPassword: string;
   windowTitleQualifier: boolean;
   dataDir: string;
+  webPush: WebPushConfig;
   telegram: TelegramConfig;
+}
+
+export interface WebPushConfig {
+  enabled: boolean;
+  /** VAPID contact (mailto: or https: URL) required by push services. */
+  subject: string;
 }
 
 export interface TelegramConfig {

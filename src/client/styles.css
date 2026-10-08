@@ -1907,6 +1907,48 @@ header {
 .header-folders-btn.hidden { display: none; }
 .header-folders-btn:active { background: var(--bg-hover); }
 .header-folders-icon { font-size: 12px; }
+
+/* --- Notifications (web push) --- */
+
+.header-notify-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 6px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.header-notify-btn:active { background: var(--bg-hover); border-radius: 10px; }
+
+.sheet-notify { max-height: 60vh; }
+
+.notify-status {
+  padding: 12px 16px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.notify-toggle {
+  margin: 4px 16px 0;
+  width: calc(100% - 32px);
+}
+
+.notify-toggle.notify-toggle-off {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.notify-hint {
+  padding: 10px 16px 16px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
 .header-folders-count {
   font-size: 11px;
   color: var(--text-tertiary, var(--text-secondary));

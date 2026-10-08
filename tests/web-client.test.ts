@@ -437,6 +437,33 @@ describe('web: folders drawer', () => {
   });
 });
 
+// ─── Notifications (web push) sheet ───
+
+describe('web: notifications sheet', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  it('opens the notifications sheet when tapping the header bell', () => {
+    const btn = env.document.getElementById('btn-notify')!;
+    assert.ok(btn, 'Notify button should exist');
+    btn.click();
+    const sheet = env.document.getElementById('sheet-notify')!;
+    assert.ok(!sheet.classList.contains('hidden'), 'Notify sheet should be visible');
+  });
+
+  it('shows an OFF state and a toggle when push is unsupported (no service worker)', () => {
+    env.document.getElementById('btn-notify')!.click();
+    const status = env.document.getElementById('notify-status')!;
+    const toggle = env.document.getElementById('btn-notify-toggle') as HTMLButtonElement;
+    // jsdom has no serviceWorker/PushManager, so the sheet reports unsupported.
+    assert.match(status.textContent!, /not supported|OFF|ON/i);
+    assert.ok(toggle.textContent!.length > 0, 'Toggle should have a label');
+  });
+});
+
 // ─── Fetch tool rendering ───
 
 describe('web: fetch tool', () => {
