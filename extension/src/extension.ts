@@ -133,11 +133,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const config = vscode.workspace.getConfiguration('cursorRemote');
   if (config.get<boolean>('autoStart', true)) {
-    licenseManager.checkLicense().then(valid => {
-      if (valid) {
-        serverManager!.start();
-      }
-    });
+    const licenseBypassed = config.get<boolean>('disableLicense', true);
+    if (licenseBypassed) {
+      serverManager!.start();
+    } else {
+      licenseManager.checkLicense().then(valid => {
+        if (valid) {
+          serverManager!.start();
+        }
+      });
+    }
   }
 }
 

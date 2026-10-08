@@ -435,6 +435,46 @@ export class CommandExecutor {
     });
   }
 
+  /**
+   * Submit whatever is currently in the composer (e.g. after a slash command
+   * inserted text, or a freeform answer was typed) without clearing/resetting it.
+   * `expectText` is used only to detect whether the composer still holds the text.
+   */
+  async submitComposer(commandId: string, expectText?: string): Promise<CommandResult> {
+    return this.withRetry(commandId, async (client) => {
+      const strategies = this.selectors.chatInput.strategies;
+
+      await client.pressKey('Enter', 'Enter', 13);
+      console.log('[command-executor] submitComposer: Enter pressed');
+
+      const probe = (expectText ?? '').trim();
+      if (probe.length === 0) return;
+
+      await sleep(300);
+      const stillContainsTypedText = await client.evaluate(`
+        (() => {
+          const strategies = ${JSON.stringify(strategies)};
+          const typedText = ${JSON.stringify(probe)};
+          let input = null;
+          for (const sel of strategies) {
+            try { input = document.querySelector(sel); if (input) break; } catch {}
+          }
+          if (!input) return false;
+          const valueText = typeof input.value === 'string' ? input.value : '';
+          const contentText = input.textContent ?? input.innerText ?? '';
+          const currentText = (input.isContentEditable ? contentText : (valueText || contentText)).trim();
+          return currentText.length > 0 && currentText.includes(typedText);
+        })()
+      `) as boolean;
+
+      if (stillContainsTypedText) {
+        const isMac = process.platform === 'darwin';
+        await client.pressKey('Enter', 'Enter', 13, isMac ? 4 : 2);
+        console.log('[command-executor] submitComposer: Cmd/Ctrl+Enter retry fired');
+      }
+    });
+  }
+
   async clickApproval(
     commandId: string,
     selectorPath: string
@@ -456,9 +496,47 @@ export class CommandExecutor {
 
   async reject(
     commandId: string,
-    selectorPath: string
+    selectorPath?: string
   ): Promise<CommandResult> {
-    return this.clickApproval(commandId, selectorPath);
+    // Preferred: click the exact rejection control the extractor found.
+    if (selectorPath) {
+      const direct = await this.clickApproval(commandId, selectorPath);
+      if (direct.ok) return direct;
+      console.warn(`[command-executor] Reject via selector failed (${direct.error}); falling back`);
+    }
+    return this.withRetry(commandId, async (client) => {
+      // Fallback: find a visible Skip/Reject/Deny/Cancel control in the chat area
+      // and click it. Scoped to avoid menu triggers and the composer's send area.
+      const clicked = await client.evaluate(`
+        (() => {
+          const wanted = /^(skip|reject|deny|cancel|no|decline)\\b/i;
+          const isMenuTrigger = (b) => {
+            const p = b.getAttribute('aria-haspopup');
+            return p === 'menu' || p === 'true' || p === 'listbox';
+          };
+          const btns = Array.from(document.querySelectorAll('button, [role="button"], [data-click-ready]'));
+          for (const b of btns) {
+            if (isMenuTrigger(b)) continue;
+            const label = ((b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).trim();
+            if (wanted.test(label)) {
+              const r = b.getBoundingClientRect();
+              if (r.width === 0 || r.height === 0) continue;
+              b.scrollIntoView({ block: 'center', behavior: 'instant' });
+              b.click();
+              return { ok: true, label };
+            }
+          }
+          return { ok: false };
+        })()
+      `) as { ok: boolean; label?: string } | null;
+      if (clicked?.ok) {
+        console.log(`[command-executor] Reject via fallback control: ${clicked.label}`);
+        return;
+      }
+      // Last resort: Escape cancels a pending approval prompt in Cursor.
+      await client.pressKey('Escape', 'Escape', 27);
+      console.log('[command-executor] Reject via Escape (no explicit control found)');
+    });
   }
 
   async scrollChatUp(commandId: string, times: number = 5): Promise<CommandResult> {
@@ -674,6 +752,217 @@ export class CommandExecutor {
       }
       console.log(`[command-executor] Clicked action: ${selectorPath.substring(0, 60)} (${expectedLabel})`);
     });
+  }
+
+  /**
+   * Focus the composer and open the `/` slash-command tray, then read its rows.
+   * Used to mirror Cursor's slash menu on the phone. The menu stays open in the
+   * host composer; the client either picks a row (clickSlashCommand) or cancels
+   * (cancelSlashMenu).
+   */
+  async getSlashMenu(commandId: string): Promise<CommandResult> {
+    const result = await this.withRetryValue(commandId, async (client) => {
+      await this.focusComposer(client);
+
+      const alreadyOpen = await client.evaluate(`
+        (() => document.querySelector('div[role="listbox"][aria-label="Slash commands"]') !== null)()
+      `) as boolean;
+
+      if (!alreadyOpen) {
+        await client.typeText('/');
+        await sleep(450);
+      }
+
+      return await client.evaluate(`
+        (() => {
+          const list = document.querySelector('div[role="listbox"][aria-label="Slash commands"]');
+          if (!list) return { open: false, options: [] };
+          const rows = Array.from(list.querySelectorAll('button[role="option"]'));
+          const options = rows.map((el, i) => {
+            const textSpan = el.children.length >= 2 ? el.children[1] : el;
+            const parts = [];
+            for (const node of Array.from(textSpan.querySelectorAll('span, div'))) {
+              const t = (node.textContent || '').trim();
+              if (t && parts[parts.length - 1] !== t) parts.push(t);
+            }
+            const directText = Array.from(textSpan.childNodes)
+              .filter((n) => n.nodeType === Node.TEXT_NODE)
+              .map((n) => (n.textContent || '').trim())
+              .filter(Boolean)
+              .join(' ');
+            const label = (directText || parts[0] || (el.textContent || '').trim()).slice(0, 80);
+            const description = (parts[parts.length - 1] || '').slice(0, 160);
+            return {
+              id: label ? label.toLowerCase().replace(/\\s+/g, '-') : ('slash-' + i),
+              label,
+              description: description === label ? '' : description,
+              selected: el.getAttribute('aria-selected') === 'true',
+              index: i + 1,
+            };
+          });
+          return { open: true, options };
+        })()
+      `);
+    });
+    if (!result.ok) return result;
+    return { commandId, ok: true, data: result.data };
+  }
+
+  /**
+   * Click a row in the open `/` slash tray. `slashId` matches the synthesized id
+   * (lowercased label); `slashIndex` is a 1-based fallback. If the tray is not
+   * open (e.g. a poll cleared it), it is reopened first.
+   */
+  async clickSlashCommand(commandId: string, slashId?: string, slashIndex?: number): Promise<CommandResult> {
+    const result = await this.withRetryValue(commandId, async (client) => {
+      await this.focusComposer(client);
+
+      const menuOpen = await client.evaluate(`
+        (() => document.querySelector('div[role="listbox"][aria-label="Slash commands"]') !== null)()
+      `) as boolean;
+      if (!menuOpen) {
+        await client.typeText('/');
+        await sleep(450);
+      }
+
+      const clicked = await client.evaluate(`
+        (() => {
+          const list = document.querySelector('div[role="listbox"][aria-label="Slash commands"]');
+          if (!list) return { ok: false, error: 'slash menu not open' };
+          const rows = Array.from(list.querySelectorAll('button[role="option"]'));
+          if (rows.length === 0) return { ok: false, error: 'slash menu empty' };
+
+          const wantId = ${JSON.stringify(slashId ?? '')};
+          const wantIndex = ${JSON.stringify(typeof slashIndex === 'number' ? slashIndex : null)};
+
+          const labelOf = (el) => {
+            const textSpan = el.children.length >= 2 ? el.children[1] : el;
+            const parts = [];
+            for (const node of Array.from(textSpan.querySelectorAll('span, div'))) {
+              const t = (node.textContent || '').trim();
+              if (t && parts[parts.length - 1] !== t) parts.push(t);
+            }
+            const directText = Array.from(textSpan.childNodes)
+              .filter((n) => n.nodeType === Node.TEXT_NODE)
+              .map((n) => (n.textContent || '').trim())
+              .filter(Boolean)
+              .join(' ');
+            return (directText || parts[0] || (el.textContent || '').trim()).slice(0, 80);
+          };
+
+          let target = null;
+          if (wantId) {
+            for (const el of rows) {
+              const id = labelOf(el).toLowerCase().replace(/\\s+/g, '-');
+              if (id === wantId) { target = el; break; }
+            }
+          }
+          if (!target && wantIndex && wantIndex >= 1 && wantIndex <= rows.length) {
+            target = rows[wantIndex - 1];
+          }
+          if (!target) return { ok: false, error: 'slash command not found' };
+
+          target.scrollIntoView({ block: 'center', behavior: 'instant' });
+          target.click();
+          return { ok: true, label: labelOf(target) };
+        })()
+      `) as { ok: boolean; error?: string; label?: string } | null;
+
+      if (!clicked?.ok) throw new Error(clicked?.error ?? 'slash command click failed');
+      console.log(`[command-executor] Slash command clicked: ${clicked?.label ?? slashId ?? slashIndex}`);
+
+      // Give Cursor a beat to apply the command (mode change or token insert),
+      // then read back whatever now sits in the composer.
+      await sleep(300);
+      const composerText = await client.evaluate(`
+        (() => {
+          const strategies = ${JSON.stringify(this.selectors.chatInput.strategies)};
+          let input = null;
+          for (const sel of strategies) {
+            try { input = document.querySelector(sel); if (input) break; } catch {}
+          }
+          if (!input) return '';
+          const valueText = typeof input.value === 'string' ? input.value : '';
+          const contentText = input.textContent ?? input.innerText ?? '';
+          return (input.isContentEditable ? contentText : (valueText || contentText)).trim();
+        })()
+      `) as string;
+
+      return { composerText, label: clicked?.label ?? '' };
+    });
+    if (!result.ok) return result;
+    return { commandId, ok: true, data: result.data };
+  }
+
+  /** Close the `/` tray and clear the stray "/" so nothing is left in the composer. */
+  async cancelSlashMenu(commandId: string): Promise<CommandResult> {
+    return this.withRetry(commandId, async (client) => {
+      await client.pressKey('Escape', 'Escape', 27);
+      await sleep(80);
+      await client.pressKey('a', 'KeyA', 65, 2);
+      await sleep(50);
+      await client.pressKey('Backspace', 'Backspace', 8);
+      console.log('[command-executor] Slash menu cancelled');
+    });
+  }
+
+  /** Fill a text field (e.g. a questionnaire freeform "Other" answer) without sending. */
+  async setAnswerText(commandId: string, selectorPath: string, text: string): Promise<CommandResult> {
+    return this.withRetry(commandId, async (client) => {
+      const found = await client.evaluate(`
+        (() => {
+          const el = document.querySelector(${JSON.stringify(selectorPath)});
+          if (!el) return false;
+          el.scrollIntoView({ block: 'center', behavior: 'instant' });
+          el.focus();
+          el.click();
+          return true;
+        })()
+      `) as boolean;
+      if (!found) throw new Error('answer input not found');
+      await sleep(80);
+      await client.typeText(text);
+      console.log(`[command-executor] Answer text inserted (${text.length} chars)`);
+    });
+  }
+
+  /** Press the composer's stop control to abort the current generation/turn. */
+  async stopGeneration(commandId: string): Promise<CommandResult> {
+    return this.withRetry(commandId, async (client) => {
+      const stopped = await client.evaluate(`
+        (() => {
+          const byAria = document.querySelector('button[aria-label="Stop generation"]');
+          if (byAria) { byAria.scrollIntoView({ block: 'center', behavior: 'instant' }); byAria.click(); return true; }
+          // Fallbacks across Cursor builds.
+          for (const sel of ['.ui-prompt-input-submit-button[aria-label*="Stop"]', 'button[aria-label*="Stop"]', '[data-command-id*="stop"]', '[data-testid*="stop"]']) {
+            const el = document.querySelector(sel);
+            if (el) { el.click(); return true; }
+          }
+          return false;
+        })()
+      `) as boolean;
+      if (!stopped) throw new Error('Stop control not found (agent may already be idle)');
+      console.log('[command-executor] Stop generation clicked');
+    });
+  }
+
+  private async focusComposer(client: CdpClient): Promise<void> {
+    const strategies = this.selectors.chatInput.strategies;
+    const focused = await client.evaluate(`
+      (() => {
+        const strategies = ${JSON.stringify(strategies)};
+        let input = null;
+        for (const sel of strategies) {
+          try { input = document.querySelector(sel); if (input) break; } catch {}
+        }
+        if (!input) return false;
+        input.scrollIntoView({ block: 'center', behavior: 'instant' });
+        input.focus();
+        input.click();
+        return true;
+      })()
+    `) as boolean;
+    if (!focused) throw new Error('Composer input not found');
   }
 
   async extractToolContent(toolCallId: string): Promise<{ code: string; language?: string; filename?: string } | null> {

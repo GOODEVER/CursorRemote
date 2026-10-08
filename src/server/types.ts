@@ -48,6 +48,8 @@ export interface QuestionnaireOption {
   label: string;
   isFreeform: boolean;
   selectorPath: string;
+  /** For freeform ("Other") rows: the text field revealed after selecting. */
+  freeformInputSelectorPath?: string;
 }
 
 export interface QuestionnaireQuestion {
@@ -64,6 +66,23 @@ export interface Questionnaire {
   skipSelectorPath: string;
   continueSelectorPath: string;
   continueDisabled: boolean;
+}
+
+/**
+ * A `/`-triggered slash command row from Cursor's composer tray
+ * (`div[role="listbox"][aria-label="Slash commands"] button[role="option"]`).
+ */
+export interface SlashCommand {
+  /** Slash token (without the leading `/`), e.g. "code-review". */
+  id: string;
+  /** Human label, e.g. "Code Review". */
+  label: string;
+  /** Supporting description, e.g. "Review code instead of editing it". */
+  description: string;
+  /** True when this row is the keyboard-highlighted option. */
+  selected: boolean;
+  /** 1-based position, used to click by index since React ids are unstable. */
+  index: number;
 }
 
 export interface CursorState {
@@ -99,6 +118,11 @@ export interface CursorState {
   composerQueue: ComposerQueueState;
   /** Agent questionnaire widget (multiple-choice questions). */
   questionnaire: Questionnaire | null;
+  /**
+   * `/` slash-command menu options, populated only while the menu is open in the
+   * focused Cursor composer. Empty array when the menu is closed.
+   */
+  slashCommands: SlashCommand[];
   _rawSignals?: RawSignals;
 }
 
@@ -146,7 +170,6 @@ export type ChatElement =
   | TodoListBlock
   | RunCommand
   | LoadingIndicator;
-
 export interface HumanMessage {
   type: 'human';
   id: string;
@@ -313,7 +336,7 @@ export interface SelectorConfig {
 
 export interface CommandPayload {
   commandId: string;
-  type: 'send_message' | 'approve' | 'reject' | 'approve_all' | 'switch_tab' | 'new_chat' | 'set_mode' | 'set_model' | 'click_action' | 'get_plan_full' | 'get_plan_model_options' | 'set_plan_model';
+  type: 'send_message' | 'send_prompt' | 'approve' | 'reject' | 'approve_all' | 'switch_tab' | 'new_chat' | 'set_mode' | 'set_model' | 'click_action' | 'get_plan_full' | 'get_plan_model_options' | 'set_plan_model' | 'get_slash_menu' | 'click_slash_command' | 'cancel_slash_menu' | 'set_answer_text' | 'stop_generation';
   text?: string;
   approvalId?: string;
   actionType?: string;
@@ -326,6 +349,10 @@ export interface CommandPayload {
   planModelId?: string;
   tabTitle?: string;
   windowId?: string;
+  /** Slash token (without leading "/") targeted by click_slash_command. */
+  slashId?: string;
+  /** 1-based index of the slash row, fallback when slashId is ambiguous. */
+  slashIndex?: number;
 }
 
 export interface CommandResult {

@@ -4,7 +4,12 @@ import { JSDOM } from 'jsdom';
 import { extractionFunction } from '../src/server/dom-extractor.js';
 import type { CursorState } from '../src/server/types.js';
 
-function withDom(html: string): CursorState {
+function withDom(html: string, opts: {
+  approveSelectors?: string[];
+  approveTextMatch?: string[];
+  rejectSelectors?: string[];
+  rejectTextMatch?: string[];
+} = {}): CursorState {
   const dom = new JSDOM(html);
   const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document');
   const nodeDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'Node');
@@ -19,10 +24,10 @@ function withDom(html: string): CursorState {
   try {
     const state = extractionFunction(
       ['#root'],
-      [],
-      [],
-      [],
-      [],
+      opts.approveSelectors ?? [],
+      opts.approveTextMatch ?? [],
+      opts.rejectSelectors ?? [],
+      opts.rejectTextMatch ?? [],
       [],
       [],
       [],
@@ -162,5 +167,55 @@ describe('extractionFunction', () => {
       'div#composer-toolbar-section > div > section > div:nth-of-type(2)'
     );
     assert.equal(state.questionnaire.continueDisabled, false);
+  });
+
+  it('does not treat a collapsible tool header ("Running …") as a pending approval', () => {
+    const state = withDom(`
+      <main id="root">
+        <article data-flat-index="0" data-react-transcript-row-kind="activity" data-message-id="m-tool">
+          <div data-tool-call-id="call-1" data-tool-status="completed">
+            <div class="ui-shell-tool-call">
+              <button class="ui-collapsible-header">Running npm run build Ctrl+⏎</button>
+            </div>
+          </div>
+        </article>
+      </main>
+    `, {
+      approveSelectors: ['button.ui-shell-tool-call__run-btn'],
+      approveTextMatch: ['Accept', 'Approve', 'Run', 'Allow'],
+      rejectSelectors: ['button.ui-shell-tool-call__skip-btn'],
+      rejectTextMatch: ['Reject', 'Deny', 'Cancel', 'Skip'],
+    });
+
+    // The header's text contains "Run" but it is a disclosure control, not an
+    // approval action — the bar must stay hidden and status must not be
+    // forced to waiting_approval.
+    assert.equal(state.pendingApprovals.length, 0);
+    assert.notEqual(state.agentStatus, 'waiting_approval');
+  });
+
+  it('still surfaces a genuine per-card shell approval', () => {
+    const state = withDom(`
+      <main id="root">
+        <div class="ui-tool-call-card" data-tool-call-id="call-2">
+          <div class="ui-shell-tool-call__description">Delete build artifacts</div>
+          <div class="ui-shell-tool-call__command">rm -rf dist</div>
+          <div class="ui-shell-tool-call__approval-row">
+            <button class="ui-shell-tool-call__run-btn">Run</button>
+            <button class="ui-shell-tool-call__skip-btn">Skip</button>
+          </div>
+        </div>
+      </main>
+    `, {
+      approveSelectors: ['button.ui-shell-tool-call__run-btn'],
+      approveTextMatch: ['Accept', 'Approve', 'Run', 'Allow'],
+      rejectSelectors: ['button.ui-shell-tool-call__skip-btn'],
+      rejectTextMatch: ['Reject', 'Deny', 'Cancel', 'Skip'],
+    });
+
+    assert.equal(state.pendingApprovals.length, 1);
+    const types = state.pendingApprovals[0].actions.map((a) => a.type).sort();
+    assert.deepEqual(types, ['approve', 'reject']);
+    assert.equal(state.agentStatus, 'waiting_approval');
   });
 });

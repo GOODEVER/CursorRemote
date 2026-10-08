@@ -22,6 +22,7 @@ export async function buildEnvFromConfig(
     TELEGRAM_ALLOWED_USERS: config.get<string>('telegram.allowedUsers', ''),
     TELEGRAM_IMPL: config.get<string>('telegram.impl', 'grammy'),
     LICENSE_KEY: licenseKey ?? '',
+    CURSOR_REMOTE_LICENSE_BYPASS: config.get<boolean>('disableLicense', true) ? '1' : '0',
     DATA_DIR: context.globalStorageUri.fsPath,
     LOG_FORMAT: 'json',
   };

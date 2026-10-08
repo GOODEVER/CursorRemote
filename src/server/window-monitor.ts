@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { CdpClient } from './cdp-client.js';
-import { extractWorkspaceName } from './cdp-bridge.js';
+import { extractWorkspaceIdentity } from './cdp-bridge.js';
 import type { CDPBridge } from './cdp-bridge.js';
 import type { StateManager } from './state-manager.js';
 import type { DOMExtractor } from './dom-extractor.js';
@@ -17,6 +17,7 @@ import type {
   Questionnaire,
   ServerConfig,
   SelectorConfig,
+  SlashCommand,
 } from './types.js';
 import { applyDerivedActivityToState } from './activity-derive.js';
 
@@ -37,6 +38,8 @@ export interface WindowSnapshot {
    *  Extracted per window so its card can be routed to the correct topic even
    *  when the window is not the active CDP home window. Null when absent. */
   questionnaire: Questionnaire | null;
+  /** `/` slash menu options for this window (empty when the menu is closed). */
+  slashCommands: SlashCommand[];
   lastUpdated: number;
   /** data-composer-id of the active composer in this window. Same agent shown
    *  via Cursor's global rail in another window will share this id; two
@@ -256,6 +259,7 @@ export class WindowMonitor extends EventEmitter {
       mode: state.mode,
       model: state.model,
       questionnaire: state.questionnaire,
+      slashCommands: state.slashCommands ?? [],
       lastUpdated: Date.now(),
       activeComposerId: state.activeComposerId ?? '',
     };
@@ -352,10 +356,10 @@ export class WindowMonitor extends EventEmitter {
     try {
       await client.connect(win.wsUrl);
 
-      const workspaceName = await extractWorkspaceName(client, this.config.windowTitleQualifier);
-      const windowTitle = workspaceName ?? win.title;
-      if (workspaceName && workspaceName !== win.title) {
-        win.title = workspaceName;
+      const identity = await extractWorkspaceIdentity(client, this.config.windowTitleQualifier);
+      const windowTitle = identity.name ?? win.title;
+      if (identity.name && identity.name !== win.title) {
+        win.title = identity.name;
       }
 
       const state = await this.extractFromClient(client, windowTitle);
@@ -377,6 +381,7 @@ export class WindowMonitor extends EventEmitter {
           mode: state.mode,
           model: state.model,
           questionnaire: state.questionnaire,
+          slashCommands: state.slashCommands ?? [],
           lastUpdated: Date.now(),
           activeComposerId: state.activeComposerId ?? '',
         };

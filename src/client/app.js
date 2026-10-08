@@ -99,9 +99,17 @@
   let userScrolledUp = false;
   let autoScrollJob = 0;
   let notificationPermission = 'default';
-  const notifiedMessageIds = new Set();
+  // Edge-triggered notification bookkeeping. We notify only when the agent
+  // newly asks a question / needs approval, or when it transitions to idle.
+  let prevAgentStatus = null;
+  let hadQuestionnaire = false;
+  let hadApproval = false;
+  let notificationsPrimed = false;
   let activePlanModal = null;
   let activePlanModelContext = null;
+  // Text a slash command left in the host composer; when set, sendMessage()
+  // submits in place via send_prompt rather than retyping.
+  let composerPrefilledText = '';
   const pendingCommandResults = new Map();
 
   function isNearMessagesBottom() {
@@ -139,6 +147,8 @@
   const $btnQContinue = document.getElementById('btn-q-continue');
   const $input = document.getElementById('message-input');
   const $btnSend = document.getElementById('btn-send');
+  const $btnAbort = document.getElementById('btn-abort');
+  const $btnSlash = document.getElementById('btn-slash');
   const $toastContainer = document.getElementById('toast-container');
 
   const $windowBar = document.getElementById('window-bar');
@@ -159,6 +169,8 @@
   const $sheetPlanModel = document.getElementById('sheet-plan-model');
   const $sheetPlanModelHeader = document.getElementById('sheet-plan-model-header');
   const $sheetPlanModelList = document.getElementById('sheet-plan-model-list');
+  const $sheetSlash = document.getElementById('sheet-slash');
+  const $sheetSlashList = document.getElementById('sheet-slash-list');
   const $planModalOverlay = document.getElementById('plan-modal-overlay');
   const $planModalLabel = document.getElementById('plan-modal-label');
   const $planModalTitle = document.getElementById('plan-modal-title');
@@ -268,6 +280,13 @@
 
   $btnSend.addEventListener('click', sendMessage);
 
+  $btnAbort.addEventListener('click', () => {
+    socket.emit('command:stop_generation', { commandId: newCommandId(), type: 'stop_generation' });
+    showToast('Stopping…', 'success');
+  });
+
+  $btnSlash.addEventListener('click', () => { void openSlashMenu(); });
+
   $btnApprove.addEventListener('click', () => {
     const approval = state.pendingApprovals[0];
     if (!approval) return;
@@ -285,11 +304,12 @@
     const approval = state.pendingApprovals[0];
     if (!approval) return;
     const action = approval.actions.find(a => a.type === 'reject');
-    if (!action) return;
     socket.emit('command:reject', {
       commandId: newCommandId(),
       approvalId: approval.id,
-      selectorPath: action.selectorPath,
+      // Omit selectorPath when Cursor exposed no explicit reject control; the
+      // server falls back to a Skip/Reject/Cancel search and finally Escape.
+      ...(action ? { selectorPath: action.selectorPath } : {}),
     });
     showToast('Reject sent', 'success');
   });
@@ -330,7 +350,18 @@
   function sendMessage() {
     const text = $input.value.trim();
     if (!text) return;
-    socket.emit('command:send_message', { commandId: newCommandId(), text });
+    // If a slash command pre-filled the host composer, submit in place instead
+    // of retyping (which would clobber the command's effect).
+    if (composerPrefilledText) {
+      socket.emit('command:send_prompt', {
+        commandId: newCommandId(),
+        type: 'send_prompt',
+        text,
+      });
+    } else {
+      socket.emit('command:send_message', { commandId: newCommandId(), text });
+    }
+    composerPrefilledText = '';
     $input.value = '';
     $input.style.height = 'auto';
     $btnSend.disabled = true;
@@ -349,6 +380,7 @@
     renderTabs();
     renderModeModel();
     syncPlanModalFromState();
+    maybeNotifyTransitions();
   }
 
   function renderConnectionStatus() {
@@ -526,7 +558,6 @@
     });
 
     if (!userScrolledUp) scheduleMessagesAutoScroll();
-    checkMessagesForNotifications();
   }
 
   function createElement(msg) {
@@ -1516,11 +1547,12 @@
       const rejectAction = approval.actions.find(a => a.type === 'reject');
 
       $btnApprove.disabled = !approveAction;
-      $btnReject.disabled = !rejectAction;
+      // Reject stays clickable even without an explicit control — the server
+      // falls back to a Skip/Reject/Cancel search, then Escape.
+      $btnReject.disabled = false;
       if (approveAction) $btnApprove.textContent = approveAction.label || 'Accept';
       if (rejectAction) $btnReject.textContent = rejectAction.label || 'Reject';
-
-      fireNotification(approval.description || 'Agent needs approval', 'cursor-approval');
+      else $btnReject.textContent = 'Reject';
     } else {
       $approvalBar.classList.add('hidden');
     }
@@ -1572,6 +1604,8 @@
         optBtn.dataset.questionNumber = question.number;
         optBtn.dataset.letter = opt.letter;
         optBtn.dataset.label = opt.label;
+        optBtn.dataset.freeform = opt.isFreeform ? '1' : '';
+        optBtn.dataset.freeformSelector = opt.freeformInputSelectorPath || '';
         optBtn.addEventListener('click', function() {
           questionnaireSelections[this.dataset.questionNumber] = this.dataset.letter;
           var siblings = this.parentNode.querySelectorAll('.questionnaire-option');
@@ -1582,20 +1616,132 @@
             selectorPath: this.dataset.selectorPath,
             actionLabel: this.dataset.label,
           });
-          showToast('Answer sent', 'success');
+          // Freeform ("Other"): reveal a local text box so the user can compose
+          // an answer; it is pushed into Cursor on submit.
+          var ffHost = this.parentNode.querySelector('.questionnaire-freeform');
+          if (this.dataset.freeform === '1') {
+            if (!ffHost) {
+              ffHost = buildFreeformAnswer(this.dataset.questionNumber, this.dataset.freeformSelector);
+              this.parentNode.appendChild(ffHost);
+            }
+            var ta = ffHost.querySelector('.questionnaire-freeform-input');
+            if (ta) ta.focus();
+          } else {
+            if (ffHost) ffHost.remove();
+            showToast('Answer sent', 'success');
+          }
         });
         optionsDiv.appendChild(optBtn);
       }
       qDiv.appendChild(optionsDiv);
       $questionnaireQuestions.appendChild(qDiv);
     }
+  }
 
-    fireNotification('Agent has questions for you', 'cursor-questionnaire');
+  /** Inline "Other" answer box for a freeform questionnaire option. */
+  function buildFreeformAnswer(questionNumber, freeformSelector) {
+    var wrap = document.createElement('div');
+    wrap.className = 'questionnaire-freeform';
+    var ta = document.createElement('textarea');
+    ta.className = 'questionnaire-freeform-input';
+    ta.rows = 1;
+    ta.placeholder = 'Type your answer…';
+    var send = document.createElement('button');
+    send.type = 'button';
+    send.className = 'questionnaire-freeform-send';
+    send.textContent = 'Send answer';
+    send.disabled = true;
+    ta.addEventListener('input', function() {
+      ta.style.height = 'auto';
+      ta.style.height = Math.min(ta.scrollHeight, 100) + 'px';
+      send.disabled = !ta.value.trim();
+    });
+    send.addEventListener('click', function() {
+      var text = ta.value.trim();
+      if (!text) return;
+      void submitFreeformAnswer(questionNumber, freeformSelector, text);
+    });
+    wrap.appendChild(ta);
+    wrap.appendChild(send);
+    return wrap;
+  }
+
+  async function submitFreeformAnswer(questionNumber, freeformSelector, text) {
+    if (freeformSelector) {
+      const typeResult = await sendCommandAwaitResult('command:set_answer_text', {
+        commandId: newCommandId(),
+        type: 'set_answer_text',
+        selectorPath: freeformSelector,
+        text,
+      });
+      if (!typeResult.ok) {
+        showToast(typeResult.error || 'Could not type answer', 'error');
+        return;
+      }
+    } else {
+      // No known input selector: submit the raw text via the composer instead.
+      socket.emit('command:send_message', { commandId: newCommandId(), text });
+      showToast('Answer sent', 'success');
+      questionnaireSelections[questionNumber] = '';
+      renderQuestionnaire();
+      return;
+    }
+    // Advance the questionnaire.
+    if (state.questionnaire && state.questionnaire.continueSelectorPath) {
+      await sendCommandAwaitResult('command:click_action', {
+        commandId: newCommandId(),
+        selectorPath: state.questionnaire.continueSelectorPath,
+        actionLabel: 'Continue',
+      });
+    }
+    questionnaireSelections[questionNumber] = '';
+    showToast('Answer sent', 'success');
+    renderQuestionnaire();
   }
 
   function renderInputState() {
     $input.disabled = !state.inputAvailable && !state.connected;
     $btnSend.disabled = !$input.value.trim() || $input.disabled;
+
+    // Show Stop while the agent is actively working; it drives Cursor's own
+    // "Stop generation" control so the phone can abort a run.
+    const working = !!state.connected && state.agentStatus !== 'idle'
+      && state.agentStatus !== 'waiting_approval' && state.agentStatus !== 'error';
+    $btnAbort.classList.toggle('hidden', !working);
+  }
+
+  /**
+   * Edge-triggered notifications. Fires only when the agent NEWLY asks a
+   * question / needs approval, or when it transitions from working to idle.
+   * Regular messages never trigger a notification (the old behaviour fired
+   * one for every tool/command message, which bombarded the user).
+   */
+  function maybeNotifyTransitions() {
+    const hasQuestionnaire = !!(state.questionnaire && state.questionnaire.questions
+      && state.questionnaire.questions.length > 0);
+    const hasApproval = (state.pendingApprovals || []).length > 0;
+
+    // First render after load: adopt the current state without notifying.
+    if (!notificationsPrimed) {
+      notificationsPrimed = true;
+      prevAgentStatus = state.agentStatus;
+      hadQuestionnaire = hasQuestionnaire;
+      hadApproval = hasApproval;
+      return;
+    }
+
+    if (hasQuestionnaire && !hadQuestionnaire) {
+      fireNotification('Agent has a question for you', 'cursor-questionnaire');
+    } else if (hasApproval && !hadApproval) {
+      const approval = state.pendingApprovals[0];
+      fireNotification((approval && approval.description) || 'Agent needs approval', 'cursor-approval');
+    } else if (state.agentStatus === 'idle' && prevAgentStatus && prevAgentStatus !== 'idle') {
+      fireNotification('Agent finished', 'cursor-finished');
+    }
+
+    hadQuestionnaire = hasQuestionnaire;
+    hadApproval = hasApproval;
+    prevAgentStatus = state.agentStatus;
   }
 
   function fireNotification(text, tag) {
@@ -1610,26 +1756,6 @@
     } else if (notificationPermission === 'granted') {
       new Notification('CursorRemote', { body: text, tag: ntag });
     }
-  }
-
-  function checkMessagesForNotifications() {
-    if (document.hasFocus()) return;
-    state.messages.forEach(function (msg) {
-      if (notifiedMessageIds.has(msg.id)) return;
-      var text = null;
-
-      if (msg.type === 'run_command' && msg.actions && msg.actions.length > 0) {
-        text = (msg.description || 'Run command') + ': ' + (msg.command || '').substring(0, 80);
-      } else if (msg.type === 'tool' && msg.actions && msg.actions.length > 0) {
-        var detail = msg.details || msg.filename || '';
-        text = (msg.action || 'Tool') + (detail ? ' ' + detail : '') + ' needs approval';
-      }
-
-      if (text) {
-        notifiedMessageIds.add(msg.id);
-        fireNotification(text, 'cursor-action-' + msg.id);
-      }
-    });
   }
 
   // --- Window rendering ---
@@ -1776,15 +1902,24 @@
     } else if (type === 'plan-model') {
       $sheetPlanModel.classList.remove('hidden');
       renderPlanModelSheet();
+    } else if (type === 'slash') {
+      $sheetSlash.classList.remove('hidden');
     }
   }
-
-  function closeSheet() {
+  function closeSheet(options) {
+    const skipSlashCancel = !!(options && options.keepSlashMenu);
+    const wasSlash = activeSheet === 'slash';
     $sheetOverlay.classList.add('hidden');
     $sheetMode.classList.add('hidden');
     $sheetModel.classList.add('hidden');
     $sheetPlanModel.classList.add('hidden');
+    $sheetSlash.classList.add('hidden');
     activeSheet = null;
+    // Leaving the slash sheet without picking a row must also close the host
+    // composer's tray (and drop the stray "/") — mirror the app's Escape.
+    if (wasSlash && !skipSlashCancel) {
+      socket.emit('command:cancel_slash_menu', { commandId: newCommandId(), type: 'cancel_slash_menu' });
+    }
   }
 
   function renderModeSheet() {
@@ -1899,6 +2034,94 @@
       });
       $sheetPlanModelList.appendChild(btn);
     });
+  }
+
+  // --- Slash command menu (mirrors Cursor's `/` tray) ---
+
+  async function openSlashMenu() {
+    openSheet('slash');
+    renderSlashSheetLoading();
+    const result = await sendCommandAwaitResult('command:get_slash_menu', {
+      commandId: newCommandId(),
+      type: 'get_slash_menu',
+    });
+    if (activeSheet !== 'slash') return;
+    if (result.ok && result.data && result.data.open) {
+      renderSlashSheet(result.data.options || []);
+    } else {
+      renderSlashSheet([]);
+      if (!result.ok) {
+        showToast(result.error || 'Could not open slash menu', 'error');
+      }
+    }
+  }
+
+  function renderSlashSheetLoading() {
+    $sheetSlashList.innerHTML = '';
+    const loading = document.createElement('div');
+    loading.className = 'sheet-loading';
+    loading.textContent = 'Opening commands…';
+    $sheetSlashList.appendChild(loading);
+  }
+
+  function renderSlashSheet(options) {
+    $sheetSlashList.innerHTML = '';
+    if (!options || options.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'sheet-empty';
+      empty.textContent = 'No slash commands available';
+      $sheetSlashList.appendChild(empty);
+      return;
+    }
+    options.forEach((opt) => {
+      const btn = document.createElement('button');
+      btn.className = 'sheet-item sheet-item-slash' + (opt.selected ? ' selected' : '');
+      const main = document.createElement('div');
+      main.className = 'slash-row-main';
+      const token = document.createElement('span');
+      token.className = 'slash-token';
+      token.textContent = '/' + (opt.id || opt.label);
+      const label = document.createElement('span');
+      label.className = 'sheet-item-label';
+      label.textContent = opt.label || '';
+      main.appendChild(token);
+      main.appendChild(label);
+      btn.appendChild(main);
+      if (opt.description) {
+        const desc = document.createElement('div');
+        desc.className = 'slash-desc';
+        desc.textContent = opt.description;
+        btn.appendChild(desc);
+      }
+      btn.addEventListener('click', () => { void chooseSlashCommand(opt); });
+      $sheetSlashList.appendChild(btn);
+    });
+  }
+
+  async function chooseSlashCommand(opt) {
+    const result = await sendCommandAwaitResult('command:click_slash_command', {
+      commandId: newCommandId(),
+      type: 'click_slash_command',
+      slashId: opt.id,
+      slashIndex: opt.index,
+    });
+    if (!result.ok) {
+      showToast(result.error || 'Could not run command', 'error');
+      return;
+    }
+    closeSheet({ keepSlashMenu: true });
+    const composerText = (result.data && result.data.composerText) || '';
+    // Mirror the host composer: prefill what the slash command left behind so
+    // the user can append a prompt (or just hit Send for command-only actions).
+    $input.value = composerText;
+    $input.dispatchEvent(new Event('input'));
+    composerPrefilledText = (composerText && composerText.trim()) ? composerText : '';
+    if (composerText) {
+      showToast(`/${opt.label || opt.id} — add your prompt`, 'success');
+      $input.focus();
+    } else {
+      showToast(`/${opt.label || opt.id} applied`, 'success');
+    }
   }
 
   function showToast(message, type) {

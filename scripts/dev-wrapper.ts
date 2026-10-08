@@ -11,6 +11,11 @@ const LICENSE_PATH = resolve(process.cwd(), 'data', 'license.key');
 const STORE_URL = 'https://cursor-remote.com/buy?utm_source=server&utm_medium=dev_cli&utm_campaign=license';
 const KEY_FORMAT = /^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/;
 
+function bypassEnabled(): boolean {
+  const v = process.env.CURSOR_REMOTE_LICENSE_BYPASS?.trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
 function validateKey(key: string): boolean {
   const trimmed = key.trim().toUpperCase();
   if (!KEY_FORMAT.test(trimmed)) return false;
@@ -52,6 +57,10 @@ function promptKey(): Promise<string> {
 }
 
 async function ensureLicense(): Promise<void> {
+  if (bypassEnabled()) {
+    console.log('[license] License check disabled (self-hosted mode).');
+    return;
+  }
   const stored = readStoredKey();
   if (stored && validateKey(stored)) {
     console.log('[license] Thank you for supporting the project.');

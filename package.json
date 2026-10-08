@@ -71,6 +71,11 @@
           "default": true,
           "markdownDescription": "Automatically start the relay server when Cursor launches."
         },
+        "cursorRemote.disableLicense": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Disable license key enforcement. Enabled by default for fully self-hosted / personal local use. Set to `false` to require a license key."
+        },
         "cursorRemote.cdpUrl": {
           "type": "string",
           "default": "http://127.0.0.1:9222",

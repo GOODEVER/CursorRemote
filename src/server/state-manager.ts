@@ -24,6 +24,7 @@ function emptyState(): CursorState {
     activeWindowId: '',
     composerQueue: { items: [] },
     questionnaire: null,
+    slashCommands: [],
   };
 }
 
@@ -320,6 +321,11 @@ export class StateManager extends EventEmitter {
 
     if (JSON.stringify(prev.questionnaire) !== JSON.stringify(next.questionnaire)) {
       patch.questionnaire = next.questionnaire;
+      hasChange = true;
+    }
+
+    if (JSON.stringify(prev.slashCommands ?? []) !== JSON.stringify(next.slashCommands ?? [])) {
+      patch.slashCommands = next.slashCommands ?? [];
       hasChange = true;
     }
 

@@ -1860,6 +1860,95 @@ header {
   opacity: 0.7;
 }
 
+/* --- Slash command sheet rows --- */
+
+.sheet-item-slash {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+}
+
+.sheet-item-slash .slash-row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sheet-item-slash .slash-token {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+.sheet-item-slash .slash-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding-left: 20px;
+}
+
+/* --- Slash pill + abort button --- */
+
+.pill-slash {
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+.btn-abort {
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-red);
+  color: #fff;
+  border-radius: 50%;
+  padding: 0;
+}
+
+.btn-abort.hidden { display: none; }
+
+/* --- Questionnaire freeform answer --- */
+
+.questionnaire-freeform {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+  padding-left: 4px;
+}
+
+.questionnaire-freeform-input {
+  width: 100%;
+  resize: none;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 8px 10px;
+  outline: none;
+  max-height: 100px;
+}
+
+.questionnaire-freeform-input:focus { border-color: var(--accent-blue); }
+
+.questionnaire-freeform-send {
+  align-self: flex-end;
+  padding: 6px 14px;
+  font-size: 12px;
+  background: var(--accent-blue);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.questionnaire-freeform-send:disabled { opacity: 0.4; cursor: not-allowed; }
+
 .sheet-divider {
   height: 1px;
   background: var(--border-color);

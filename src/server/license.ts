@@ -32,10 +32,25 @@ function readStoredKey(): string | null {
 }
 
 /**
+ * Returns true when license enforcement is explicitly disabled. Intended for
+ * fully self-hosted / personal local use. Enabled by setting
+ * CURSOR_REMOTE_LICENSE_BYPASS=1 (the VS Code extension sets this when the
+ * `cursorRemote.disableLicense` setting is on).
+ */
+export function isLicenseBypassed(): boolean {
+  const v = process.env.CURSOR_REMOTE_LICENSE_BYPASS?.trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+/**
  * Validates the stored license key. No prompting - use scripts/dev-wrapper.ts
  * for interactive dev (prompts before starting tsx watch).
  */
 export function checkLicense(): void {
+  if (isLicenseBypassed()) {
+    console.log('[license] License check disabled (self-hosted mode).');
+    return;
+  }
   const stored = readStoredKey();
   if (stored && validateKey(stored)) {
     console.log('[license] Thank you for supporting the project.');

@@ -443,11 +443,11 @@ export class Relay {
       });
 
       socket.on('command:reject', async (payload: CommandPayload) => {
-        if (!payload.commandId || !payload.selectorPath) {
+        if (!payload.commandId) {
           socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
+            commandId: 'unknown',
             ok: false,
-            error: 'Missing commandId or selectorPath',
+            error: 'Missing commandId',
           } satisfies CommandResult);
           return;
         }
@@ -621,6 +621,86 @@ export class Relay {
           payload.selectorPath,
           payload.actionLabel
         );
+        socket.emit('command:result', result);
+      });
+
+      // --- Text entry without sending (freeform questionnaire answers) ---
+      socket.on('command:set_answer_text', async (payload: CommandPayload) => {
+        if (!payload.commandId || !payload.selectorPath || typeof payload.text !== 'string') {
+          socket.emit('command:result', {
+            commandId: payload.commandId ?? 'unknown',
+            ok: false,
+            error: 'Missing commandId, selectorPath, or text',
+          } satisfies CommandResult);
+          return;
+        }
+        console.log(`[relay] Command: set_answer_text from ${socket.id}`);
+        const result = await this.commandExecutor.setAnswerText(
+          payload.commandId,
+          payload.selectorPath,
+          payload.text
+        );
+        socket.emit('command:result', result);
+      });
+
+      // --- Send the current composer contents as a prompt (after slash/text edits) ---
+      socket.on('command:send_prompt', async (payload: CommandPayload) => {
+        if (!payload.commandId) {
+          socket.emit('command:result', { commandId: 'unknown', ok: false, error: 'Missing commandId' } satisfies CommandResult);
+          return;
+        }
+        console.log(`[relay] Command: send_prompt from ${socket.id}`);
+        const result = await this.commandExecutor.submitComposer(payload.commandId, payload.text);
+        socket.emit('command:result', result);
+      });
+
+      // --- Slash command tray (`/`) ---
+      socket.on('command:get_slash_menu', async (payload: CommandPayload) => {
+        if (!payload.commandId) {
+          socket.emit('command:result', { commandId: 'unknown', ok: false, error: 'Missing commandId' } satisfies CommandResult);
+          return;
+        }
+        console.log(`[relay] Command: get_slash_menu from ${socket.id}`);
+        const result = await this.commandExecutor.getSlashMenu(payload.commandId);
+        socket.emit('command:result', result);
+      });
+
+      socket.on('command:click_slash_command', async (payload: CommandPayload) => {
+        if (!payload.commandId || (!payload.slashId && payload.slashIndex == null)) {
+          socket.emit('command:result', {
+            commandId: payload.commandId ?? 'unknown',
+            ok: false,
+            error: 'Missing commandId and slash target',
+          } satisfies CommandResult);
+          return;
+        }
+        console.log(`[relay] Command: click_slash_command (${payload.slashId ?? payload.slashIndex}) from ${socket.id}`);
+        const result = await this.commandExecutor.clickSlashCommand(
+          payload.commandId,
+          payload.slashId,
+          payload.slashIndex
+        );
+        socket.emit('command:result', result);
+      });
+
+      socket.on('command:cancel_slash_menu', async (payload: CommandPayload) => {
+        if (!payload.commandId) {
+          socket.emit('command:result', { commandId: 'unknown', ok: false, error: 'Missing commandId' } satisfies CommandResult);
+          return;
+        }
+        console.log(`[relay] Command: cancel_slash_menu from ${socket.id}`);
+        const result = await this.commandExecutor.cancelSlashMenu(payload.commandId);
+        socket.emit('command:result', result);
+      });
+
+      // --- Abort the current generation/turn ---
+      socket.on('command:stop_generation', async (payload: CommandPayload) => {
+        if (!payload.commandId) {
+          socket.emit('command:result', { commandId: 'unknown', ok: false, error: 'Missing commandId' } satisfies CommandResult);
+          return;
+        }
+        console.log(`[relay] Command: stop_generation from ${socket.id}`);
+        const result = await this.commandExecutor.stopGeneration(payload.commandId);
         socket.emit('command:result', result);
       });
 

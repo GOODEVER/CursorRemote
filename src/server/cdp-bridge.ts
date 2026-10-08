@@ -11,32 +11,76 @@ interface CDPTarget {
 }
 
 /**
+ * Cursor's global "Cursor Agents" window hosts the cross-project agent rail.
+ * Its `document.title` / `workbench.title` is exactly "Cursor Agents" and it
+ * carries no workspace of its own, but Cursor leaves a stale shadow-workspace
+ * pointer on it so `vscode.context.configuration().workspace` still reports a
+ * folder that the window does not actually show. Detecting it lets the relay
+ * label the window accurately instead of showing that misleading folder name.
+ */
+export function isCursorAgentsWindowTitle(raw: string | null | undefined): boolean {
+  if (!raw) return false;
+  const trimmed = raw.replace(/\s*-\s*Cursor\s*$/i, '').trim().toLowerCase();
+  return trimmed === 'cursor agents';
+}
+
+export interface WorkspaceIdentity {
+  /** Workspace folder basename (with remote qualifier when applicable), or
+   *  "Cursor Agents" for the global agents window. Null if undeterminable. */
+  name: string | null;
+  /** True when the page is Cursor's global agents window rather than a
+   *  workspace window. Its reported workspace path is a stale shadow pointer. */
+  agentsWindow: boolean;
+}
+
+/**
  * Extract the workspace folder name from a connected Cursor renderer page.
  * Uses vscode.context.configuration().workspace.uri which is available in every
  * Cursor/VS Code Electron renderer — stable across platforms and not affected
  * by the volatile document.title / CDP target title.
+ *
+ * The global "Cursor Agents" window is special-cased: it reports a stale
+ * workspace path and must not be labeled as that folder.
  */
-export async function extractWorkspaceName(client: CdpClient, includeQualifier = true): Promise<string | null> {
+export async function extractWorkspaceIdentity(client: CdpClient, includeQualifier = true): Promise<WorkspaceIdentity> {
   try {
     const raw = await client.evaluate(`
       (() => {
         try {
           const ws = vscode.context.configuration().workspace;
-          if (!ws || !ws.uri) return null;
-          return JSON.stringify({ path: ws.uri.path, authority: ws.uri.authority || '' });
+          return JSON.stringify({
+            path: ws && ws.uri ? ws.uri.path : null,
+            authority: (ws && ws.uri && ws.uri.authority) || '',
+            docTitle: document.title || '',
+          });
         } catch { return null; }
       })()
     `, 3000);
-    if (!raw || typeof raw !== 'string') return null;
-    const { path, authority } = JSON.parse(raw) as { path: string; authority: string };
-    if (!path) return null;
+    if (!raw || typeof raw !== 'string') return { name: null, agentsWindow: false };
+    const { path, authority, docTitle } = JSON.parse(raw) as { path: string | null; authority: string; docTitle: string };
+
+    if (isCursorAgentsWindowTitle(docTitle)) {
+      return { name: 'Cursor Agents', agentsWindow: true };
+    }
+
+    if (!path) return { name: null, agentsWindow: false };
     const basename = path.split('/').filter(Boolean).pop() || path;
-    if (!includeQualifier) return basename;
+    if (!includeQualifier) return { name: basename, agentsWindow: false };
     const qualifier = authorityToQualifier(authority);
-    return qualifier ? `${basename} ${qualifier}` : basename;
+    return { name: qualifier ? `${basename} ${qualifier}` : basename, agentsWindow: false };
   } catch {
-    return null;
+    return { name: null, agentsWindow: false };
   }
+}
+
+/**
+ * Back-compat thin wrapper returning just the display name.
+ * Prefer `extractWorkspaceIdentity` when the caller also needs to know whether
+ * the window is the global agents window.
+ */
+export async function extractWorkspaceName(client: CdpClient, includeQualifier = true): Promise<string | null> {
+  const identity = await extractWorkspaceIdentity(client, includeQualifier);
+  return identity.name;
 }
 
 /** Fallback title parsing for non-connected windows (before Runtime.evaluate is available). */
@@ -121,7 +165,7 @@ export class CDPBridge extends EventEmitter {
       await this.client.connect(target.webSocketDebuggerUrl);
       this._activeTargetId = target.id;
 
-      this._activeWorkspaceName = await extractWorkspaceName(this.client, this.config.windowTitleQualifier);
+      this._activeWorkspaceName = (await extractWorkspaceIdentity(this.client, this.config.windowTitleQualifier)).name;
       if (this._activeWorkspaceName) {
         const win = this._windows.find(w => w.id === target!.id);
         if (win) win.title = this._activeWorkspaceName;

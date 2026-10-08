@@ -1246,6 +1246,21 @@ export function extractionFunction(
       const popup = btn.getAttribute('aria-haspopup');
       return popup === 'menu' || popup === 'true' || popup === 'listbox';
     };
+    // Excludes controls that are NOT approval actions from the loose
+    // text-match fallback below:
+    //  - tool/step-group collapsible headers (their text starts with verbs like
+    //    "Running …"/"Ran …" that spuriously contain "Run"),
+    //  - the composer's own Run/Stop controls (nearest ancestor is the prompt
+    //    input rather than a tool card).
+    // The primary per-card path above is unaffected — it uses the real
+    // `.ui-shell-tool-call__approval-row` wrapper. Legacy `.composer-run-button`
+    // / `.composer-skip-button` approvals are intentionally NOT excluded, since
+    // in older builds those ARE the approval controls.
+    const isToolHeaderOrComposerControl = (btn: Element): boolean => {
+      if (btn.closest('.ui-collapsible-header')) return true;
+      if (btn.closest('[class*="prompt-input"]')) return true;
+      return false;
+    };
     const cleanBtnLabel = (raw: string): string =>
       raw.replace(/\s*(Shift\+)?⏎\s*/g, '').replace(/\s+/g, ' ').trim();
 
@@ -1328,7 +1343,7 @@ export function extractionFunction(
       }
       if (approveButtons.length === 0 && approveTextMatch.length > 0) {
         for (const btn of Array.from(container.querySelectorAll('button'))) {
-          if (seenApproveBtns.has(btn) || isMenuTrigger(btn)) continue;
+          if (seenApproveBtns.has(btn) || isMenuTrigger(btn) || isToolHeaderOrComposerControl(btn)) continue;
           const text = `${btn.textContent?.trim() || ''} ${btn.getAttribute('aria-label') || ''}`.toLowerCase();
           for (const pat of approveTextMatch) {
             if (text.includes(pat.toLowerCase())) {
@@ -1355,7 +1370,7 @@ export function extractionFunction(
       }
       if (rejectButtons.length === 0 && rejectTextMatch.length > 0) {
         for (const btn of Array.from(container.querySelectorAll('button'))) {
-          if (seenRejectBtns.has(btn) || isMenuTrigger(btn)) continue;
+          if (seenRejectBtns.has(btn) || isMenuTrigger(btn) || isToolHeaderOrComposerControl(btn)) continue;
           const text = `${btn.textContent?.trim() || ''} ${btn.getAttribute('aria-label') || ''}`.toLowerCase();
           for (const pat of rejectTextMatch) {
             if (text.includes(pat.toLowerCase())) {
@@ -1690,7 +1705,7 @@ export function extractionFunction(
     }
 
     // --- Questionnaire widget ---
-    type QOption = { letter: string; label: string; isFreeform: boolean; selectorPath: string };
+    type QOption = { letter: string; label: string; isFreeform: boolean; selectorPath: string; freeformInputSelectorPath?: string };
     type QQuestion = { number: string; text: string; options: QOption[]; isActive: boolean };
     let questionnaire: {
       questions: QQuestion[];
@@ -1734,7 +1749,12 @@ export function extractionFunction(
           const selectorPath =
             `.composer-questionnaire-toolbar-question:nth-of-type(${nthOfType(qEl)})` +
             ` .composer-questionnaire-toolbar-option:nth-of-type(${nthOfType(optEl)})`;
-          options.push({ letter, label, isFreeform, selectorPath });
+          let freeformInputSelectorPath: string | undefined;
+          if (isFreeform) {
+            const inputEl = optEl.querySelector('textarea, input, [contenteditable="true"], [role="textbox"]');
+            if (inputEl) freeformInputSelectorPath = buildSelectorPath(inputEl);
+          }
+          options.push({ letter, label, isFreeform, selectorPath, ...(freeformInputSelectorPath ? { freeformInputSelectorPath } : {}) });
         }
         questions.push({ number: num, text, options, isActive });
       }
@@ -1783,6 +1803,45 @@ export function extractionFunction(
       };
     }
 
+    // --- Slash command menu (`/` in the composer) ---
+    // Cursor renders the tray as `div[role="listbox"][aria-label="Slash commands"]`
+    // with `button[role="option"][data-composer-tray-row]` rows. Only present while
+    // the menu is open, so an empty array means "menu closed" (never stale).
+    const slashCommands: { id: string; label: string; description: string; selected: boolean; index: number }[] = [];
+    const slashList = document.querySelector('div[role="listbox"][aria-label="Slash commands"]');
+    if (slashList) {
+      const optionEls = Array.from(slashList.querySelectorAll('button[role="option"]'));
+      for (let si = 0; si < optionEls.length; si++) {
+        const optEl = optionEls[si];
+        // The row's two direct children: an icon span and a text span. The text
+        // span's first meaningful child is the label (e.g. "Ask"), the next is the
+        // description ("Answer questions without making edits"). Using the second
+        // child avoids "Ask" bleeding into "Answer…" via textContent concatenation.
+        const textSpan = optEl.children.length >= 2 ? optEl.children[1] : optEl;
+        const textParts: string[] = [];
+        for (const node of Array.from(textSpan.querySelectorAll('span, div'))) {
+          const t = (node.textContent || '').trim();
+          if (t && textParts[textParts.length - 1] !== t) textParts.push(t);
+        }
+        const directText = Array.from(textSpan.childNodes)
+          .filter((n) => n.nodeType === Node.TEXT_NODE)
+          .map((n) => (n.textContent || '').trim())
+          .filter(Boolean)
+          .join(' ');
+        const label = (directText || textParts[0] || (optEl.textContent || '').trim()).slice(0, 80);
+        const description = (textParts[textParts.length - 1] || '').slice(0, 160);
+        // The slash token is Cursor's internal command id; the row's DOM id
+        // (`_r_xxx_-N`) is a React useId and never stable, so key by position/label.
+        slashCommands.push({
+          id: label ? label.toLowerCase().replace(/\s+/g, '-') : `slash-${si}`,
+          label,
+          description: description === label ? '' : description,
+          selected: optEl.getAttribute('aria-selected') === 'true',
+          index: si + 1,
+        });
+      }
+    }
+
     return {
       connected: true,
       extractorStatus: 'ok',
@@ -1804,6 +1863,7 @@ export function extractionFunction(
       activeWindowId: '',
       composerQueue: { items: queueItems, ...(queueLabel ? { queueLabel } : {}) },
       questionnaire,
+      slashCommands,
       _rawSignals,
     };
   } catch {
