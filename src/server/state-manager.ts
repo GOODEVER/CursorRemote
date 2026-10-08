@@ -13,6 +13,7 @@ function emptyState(): CursorState {
     agentActivityText: null,
     agentActivityLive: false,
     agentActivitySource: 'none',
+    canAbort: false,
     messages: [],
     pendingApprovals: [],
     inputAvailable: false,
@@ -271,6 +272,11 @@ export class StateManager extends EventEmitter {
 
     if (prev.agentActivitySource !== next.agentActivitySource) {
       patch.agentActivitySource = next.agentActivitySource;
+      hasChange = true;
+    }
+
+    if (prev.canAbort !== next.canAbort) {
+      patch.canAbort = next.canAbort;
       hasChange = true;
     }
 

@@ -66,6 +66,18 @@ function createTestEnv() {
         setTimeout(cb, 0);
         return 0;
       };
+
+      // Notification stub so notification behavior can be asserted.
+      const notifications: Array<{ title: string; body?: string; tag?: string }> = [];
+      const NotifStub: any = function (title: string, opts?: any) {
+        notifications.push({ title, body: opts && opts.body, tag: opts && opts.tag });
+      };
+      NotifStub.permission = 'granted';
+      NotifStub.requestPermission = () => Promise.resolve('granted');
+      (window as any).Notification = NotifStub;
+      (window as any).__notifications = notifications;
+      // fireNotification() bails when the document is focused; tests are headless.
+      window.document.hasFocus = () => false;
     },
   });
 
@@ -147,6 +159,38 @@ describe('web: agent status', () => {
     fireFullState(env.mockSocket, fixture[4].state!);
     const text = env.document.getElementById('agent-status-text')!;
     assert.match(text.textContent!, /Idle/i);
+  });
+});
+
+// ─── Finished notifications ───
+
+describe('web: finished notification', () => {
+  let env: ReturnType<typeof createTestEnv>;
+  const notifications = () => (env.window as any).__notifications as Array<{ body?: string; tag?: string }>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  it('notifies once the agent genuinely finishes after working', async () => {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    // Working (shimmer) then idle — our ground-truth signal, so no flapping.
+    fireFullState(env.mockSocket, { ...fixture[1].state!, canAbort: true });
+    assert.equal(notifications().length, 0, 'no notification while working');
+    firePatch(env.mockSocket, { agentStatus: 'idle', canAbort: false, agentActivityLive: false, agentActivityText: null });
+    // Debounced: nothing until the settle window elapses.
+    assert.equal(notifications().length, 0, 'no premature notification on idle');
+    await new Promise((r) => setTimeout(r, 5200));
+    const finished = notifications().filter((n) => n.tag === 'cursor-finished');
+    assert.equal(finished.length, 1, 'exactly one finished notification');
+  });
+
+  it('does not notify a finish while waiting for approval', async () => {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    fireFullState(env.mockSocket, { ...fixture[1].state!, canAbort: true });
+    firePatch(env.mockSocket, { agentStatus: 'waiting_approval', canAbort: false, agentActivityLive: false });
+    await new Promise((r) => setTimeout(r, 5200));
+    assert.equal(notifications().filter((n) => n.tag === 'cursor-finished').length, 0);
   });
 });
 

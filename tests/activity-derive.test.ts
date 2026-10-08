@@ -222,6 +222,7 @@ describe('applyDerivedActivityToState', () => {
       agentActivityText: null,
       agentActivityLive: false,
       agentActivitySource: 'none',
+      canAbort: false,
       messages: [],
       pendingApprovals: [],
       inputAvailable: true,
@@ -234,6 +235,24 @@ describe('applyDerivedActivityToState', () => {
     };
     const result = applyDerivedActivityToState(state);
     assert.deepEqual(result, state);
+  });
+
+  it('keeps canAbort true even when derived activity is idle (transient gap)', () => {
+    // Ground-truth: Cursor still shows its stop control, but the shimmer
+    // signals momentarily read idle between poll cycles.
+    const state = loadFixture('activity-shimmer-lifecycle.jsonl')[4].state!;
+    const withGroundTruth: CursorState = { ...state, canAbort: true };
+    const result = applyDerivedActivityToState(withGroundTruth);
+    assert.equal(result.agentStatus, 'idle');
+    assert.equal(result.canAbort, true);
+  });
+
+  it('promotes canAbort from live derived activity (stop control not captured)', () => {
+    const state = loadFixture('activity-shimmer-lifecycle.jsonl')[1].state!;
+    const withoutGroundTruth: CursorState = { ...state, canAbort: false };
+    const result = applyDerivedActivityToState(withoutGroundTruth);
+    assert.equal(result.agentActivityLive, true);
+    assert.equal(result.canAbort, true);
   });
 });
 

@@ -926,14 +926,18 @@ export class CommandExecutor {
     });
   }
 
-  /** Press the composer's stop control to abort the current generation/turn. */
+  /** Press the composer's stop control (or a running tool's Stop) to abort the current turn. */
   async stopGeneration(commandId: string): Promise<CommandResult> {
     return this.withRetry(commandId, async (client) => {
       const stopped = await client.evaluate(`
         (() => {
+          // 1) Composer send↔stop toggle / dedicated Stop generation control.
           const byAria = document.querySelector('button[aria-label="Stop generation"]');
           if (byAria) { byAria.scrollIntoView({ block: 'center', behavior: 'instant' }); byAria.click(); return true; }
-          // Fallbacks across Cursor builds.
+          // 2) Cursor's live tool "Stop command" control — present for the whole turn.
+          const toolStop = document.querySelector('.ui-shell-tool-call__glass-stop');
+          if (toolStop) { toolStop.scrollIntoView({ block: 'center', behavior: 'instant' }); toolStop.click(); return true; }
+          // 3) Fallbacks across Cursor builds.
           for (const sel of ['.ui-prompt-input-submit-button[aria-label*="Stop"]', 'button[aria-label*="Stop"]', '[data-command-id*="stop"]', '[data-testid*="stop"]']) {
             const el = document.querySelector(sel);
             if (el) { el.click(); return true; }

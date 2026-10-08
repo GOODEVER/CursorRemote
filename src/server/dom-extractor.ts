@@ -1641,6 +1641,31 @@ export function extractionFunction(
     const _shimmer: Array<{ text: string; inToolCall: boolean; inHeader: boolean }> = [];
     const hasLoadingIndicator = container.querySelector('.loading-indicator-v3') !== null;
     const hasLoadingTool = container.querySelector('[data-tool-status="loading"]') !== null;
+
+    // --- Ground-truth "working" signal for the abort control ---
+    // Cursor renders a stop control for the entire turn: a running tool's
+    // "Stop command" button (`.ui-shell-tool-call__glass-stop`) and/or the
+    // composer's send↔stop toggle ("Stop generation"). Presence of any of
+    // these means the agent is actively producing something right now. We
+    // scope the selectors tightly (exact aria / known classes) so unrelated
+    // "Stop" controls elsewhere in the workbench (e.g. the debug toolbar)
+    // don't keep the abort button visible when the agent is truly idle, and
+    // require the element to be visible — Cursor sometimes leaves completed
+    // tool controls in the DOM hidden rather than removing them.
+    const isVisible = (el: Element | null): boolean => {
+      if (!el) return false;
+      const h = el as HTMLElement;
+      if (h.offsetParent === null && getComputedStyle(h).position !== 'fixed') return false;
+      const rects = h.getClientRects();
+      return rects.length > 0;
+    };
+    const canAbort =
+      isVisible(container.querySelector('.ui-shell-tool-call__glass-stop')) ||
+      isVisible(document.querySelector('.ui-shell-tool-call__glass-stop')) ||
+      isVisible(document.querySelector('button[aria-label="Stop generation"]')) ||
+      isVisible(document.querySelector('.ui-prompt-input-submit-button[aria-label*="Stop" i]')) ||
+      isVisible(document.querySelector('.ui-prompt-input-submit-button[aria-label*="Cancel" i]')) ||
+      !!hasLoadingIndicator;
     const shineEls = container.querySelectorAll('.make-shine');
     for (const sh of Array.from(shineEls).reverse()) {
       const inToolCall = !!sh.closest('[data-tool-call-id]') || !!sh.closest('.composer-terminal-tool');
@@ -1852,6 +1877,7 @@ export function extractionFunction(
       agentActivityText: null,
       agentActivityLive: false,
       agentActivitySource: 'none',
+      canAbort,
       messages: elements,
       pendingApprovals,
       inputAvailable: inputEl !== null,

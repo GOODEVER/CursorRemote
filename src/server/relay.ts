@@ -9,6 +9,7 @@ import type { ServerConfig, CursorState, CommandPayload, CommandResult } from '.
 import type { StateManager } from './state-manager.js';
 import type { CommandExecutor } from './command-executor.js';
 import type { CDPBridge } from './cdp-bridge.js';
+import type { WindowMonitor, WindowSnapshot } from './window-monitor.js';
 import { markdownToWebHtml, readPlanFile } from './plan-files.js';
 import {
   WEBAPP_SESSION_COOKIE,
@@ -115,6 +116,12 @@ export class Relay {
   private stateManager: StateManager;
   private commandExecutor: CommandExecutor;
   private cdpBridge: CDPBridge;
+  /** Per-window snapshots (set by WindowMonitor via `setWindowMonitor`).
+   *  Used to feed the web client the state of the window it is *viewing* —
+   *  in particular questions/approvals raised in a window that is not the
+   *  relay's CDP "home" window. Without this the phone only ever saw the home
+   *  window's questionnaire and appeared to miss questions entirely. */
+  private windowMonitor: WindowMonitor | null = null;
 
   private sessionStore: WebappSessionStore;
   private loginAttempts = new Map<string, RateLimitEntry>();
@@ -168,6 +175,33 @@ export class Relay {
       });
     });
   }
+
+  /** Wire the window monitor so the web client can be fed the state of the
+   *  window it is viewing, not just the relay's CDP home window. */
+  setWindowMonitor(windowMonitor: WindowMonitor): void {
+    this.windowMonitor = windowMonitor;
+    windowMonitor.on('window:update', this.onWindowUpdate);
+  }
+
+  private onWindowUpdate = (windowId: string, snapshot: WindowSnapshot): void => {
+    // Forward non-home window state to web clients so a question/approval
+    // raised in a window other than the relay's CDP home window is still
+    // surfaced on the phone (previously only Telegram saw these). The payload
+    // is intentionally lean — the client uses it to surface + route the
+    // interaction, not to render another window's transcript.
+    this.io.emit('window:snapshot', {
+      windowId,
+      windowTitle: snapshot.windowTitle,
+      questionnaire: snapshot.questionnaire,
+      pendingApprovals: snapshot.pendingApprovals,
+      agentStatus: snapshot.agentStatus,
+      agentActivityText: snapshot.agentActivityText,
+      agentActivityLive: snapshot.agentActivityLive,
+      agentActivitySource: snapshot.agentActivitySource,
+      activeComposerId: snapshot.activeComposerId,
+      lastUpdated: snapshot.lastUpdated,
+    });
+  };
 
   async stop(): Promise<void> {
     this.io.close();
@@ -289,6 +323,9 @@ export class Relay {
         consecutiveExtractionFailures: state.consecutiveExtractionFailures,
         lastExtractionError: state.lastExtractionError,
         agentStatus: state.agentStatus,
+        canAbort: state.canAbort,
+        agentActivityText: state.agentActivityText,
+        agentActivityLive: state.agentActivityLive,
         clients: this.io.engine.clientsCount,
         uptime: process.uptime(),
         windows: state.windows,
@@ -310,6 +347,7 @@ export class Relay {
       res.json({
         activeWindowId: state.activeWindowId,
         agentStatus: state.agentStatus,
+        canAbort: state.canAbort,
         agentActivityText: state.agentActivityText,
         agentActivityLive: state.agentActivityLive,
         pendingApprovals: state.pendingApprovals,

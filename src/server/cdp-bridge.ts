@@ -150,7 +150,12 @@ export class CDPBridge extends EventEmitter {
         target = targets.find(t => t.id === targetId);
       }
       if (!target) {
-        target = targets.find(t => t.type === 'page' && t.url.includes('workbench'));
+        const workbench = targets.filter(t => t.type === 'page' && t.url.includes('workbench'));
+        // Prefer a real workspace window over the global "Cursor Agents"
+        // overview window: the overview reports no live tool/stop controls, so
+        // monitoring it would hide the agent's working state (and abort control).
+        target = workbench.find(t => !isCursorAgentsWindowTitle(t.title))
+          ?? workbench[0];
       }
       if (!target) {
         target = targets.find(t => t.type === 'page');

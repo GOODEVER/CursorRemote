@@ -31,6 +31,8 @@ export interface WindowSnapshot {
   agentActivityText: string | null;
   agentActivityLive: boolean;
   agentActivitySource: CursorState['agentActivitySource'];
+  /** Ground-truth "agent is working and can be stopped" flag (see CursorState). */
+  canAbort: boolean;
   composerQueue: ComposerQueueState;
   mode: ModeInfo;
   model: ModelInfo;
@@ -255,6 +257,7 @@ export class WindowMonitor extends EventEmitter {
       agentActivityText: state.agentActivityText,
       agentActivityLive: state.agentActivityLive,
       agentActivitySource: state.agentActivitySource,
+      canAbort: !!state.canAbort,
       composerQueue: state.composerQueue,
       mode: state.mode,
       model: state.model,
@@ -278,6 +281,7 @@ export class WindowMonitor extends EventEmitter {
       || prev.agentActivityText !== snapshot.agentActivityText
       || prev.agentActivityLive !== snapshot.agentActivityLive
       || prev.agentActivitySource !== snapshot.agentActivitySource
+      || prev.canAbort !== snapshot.canAbort
       || approvalSig !== prevApprovalSig
       || questionnaireSig !== prevQuestionnaireSig
       || queueSig !== prevQueueSig
@@ -377,6 +381,7 @@ export class WindowMonitor extends EventEmitter {
           agentActivityText: state.agentActivityText,
           agentActivityLive: state.agentActivityLive,
           agentActivitySource: state.agentActivitySource,
+          canAbort: !!state.canAbort,
           composerQueue: state.composerQueue,
           mode: state.mode,
           model: state.model,
@@ -400,6 +405,7 @@ export class WindowMonitor extends EventEmitter {
           || prev.agentActivityText !== snapshot.agentActivityText
           || prev.agentActivityLive !== snapshot.agentActivityLive
           || prev.agentActivitySource !== snapshot.agentActivitySource
+          || prev.canAbort !== snapshot.canAbort
           || aSig !== paSig
           || qnSig !== pqnSig
           || qSig !== pqSig

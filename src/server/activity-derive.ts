@@ -181,5 +181,8 @@ export function applyDerivedActivityToState(state: CursorState): CursorState {
     agentActivityText: derived.activityText,
     agentActivityLive: derived.isLive,
     agentActivitySource: derived.source,
+    // Ground truth wins: a live legend (shimmer/loading tool) also means the
+    // turn is abortable even when the DOM stop control wasn't captured.
+    canAbort: !!state.canAbort || derived.isLive,
   };
 }

@@ -14,6 +14,7 @@
     agentActivityText: null,
     agentActivityLive: false,
     agentActivitySource: 'none',
+    canAbort: false,
     messages: [],
     pendingApprovals: [],
     inputAvailable: false,
@@ -100,11 +101,15 @@
   let autoScrollJob = 0;
   let notificationPermission = 'default';
   // Edge-triggered notification bookkeeping. We notify only when the agent
-  // newly asks a question / needs approval, or when it transitions to idle.
-  let prevAgentStatus = null;
+  // newly asks a question / needs approval, or when it has genuinely finished.
   let hadQuestionnaire = false;
   let hadApproval = false;
   let notificationsPrimed = false;
+  // "Finished" detection: the agent's status flaps between working and idle
+  // mid-run, so we track whether it was working and debounce the idle reading.
+  let wasWorking = false;
+  let finishTimer = null;
+  const FINISH_SETTLE_MS = 5000;
   let activePlanModal = null;
   let activePlanModelContext = null;
   // Text a slash command left in the host composer; when set, sendMessage()
@@ -464,9 +469,17 @@
     $statusIcon.textContent = icons[state.agentStatus] || '';
     const activity = (state.agentActivityText || '').trim();
     const activityLive = !!state.agentActivityLive;
-    const baseLabel = labels[state.agentStatus] || state.agentStatus;
+    // When the ground-truth working flag is set but status momentarily reads
+    // idle/error (transient poll gap), present it as working so the header
+    // matches the abort control the user can see. Genuine `waiting_approval`
+    // is left untouched so a real approval still reads as "Needs approval".
+    const effectiveStatus = (state.canAbort
+      && (state.agentStatus === 'idle' || state.agentStatus === 'error'))
+      ? 'running_tool'
+      : state.agentStatus;
+    const baseLabel = labels[effectiveStatus] || state.agentStatus;
     if ($headerRight) {
-      if (state.agentStatus !== 'idle') $headerRight.classList.remove('header-right-hidden');
+      if (state.agentStatus !== 'idle' || state.canAbort) $headerRight.classList.remove('header-right-hidden');
       else $headerRight.classList.add('header-right-hidden');
     }
     if (activityLive && activity && state.agentStatus !== 'idle') {
@@ -1699,20 +1712,49 @@
     renderQuestionnaire();
   }
 
+  // The abort/stop control must be reachable for the entire turn, but the
+  // server's `agentStatus` legitimately flips between `running_tool`,
+  // `waiting_approval`, `thinking`, and even `idle` between poll cycles.
+  // Keep the button visible with a short hold so those transient gaps don't
+  // make it flicker away.
+  let abortVisibleUntil = 0;
+  let abortHoldTimer = null;
+  const ABORT_HOLD_MS = 12000;
+
   function renderInputState() {
     $input.disabled = !state.inputAvailable && !state.connected;
     $btnSend.disabled = !$input.value.trim() || $input.disabled;
 
-    // Show Stop while the agent is actively working; it drives Cursor's own
-    // "Stop generation" control so the phone can abort a run.
-    const working = !!state.connected && state.agentStatus !== 'idle'
+    // Show Stop while the agent is actively working. Prefer the ground-truth
+    // `canAbort` flag (Cursor's own stop control / live tool spinner), which
+    // stays true for the whole turn. `agentStatus` is only a secondary hint.
+    const statusWorking = !!state.connected && state.agentStatus !== 'idle'
       && state.agentStatus !== 'waiting_approval' && state.agentStatus !== 'error';
-    $btnAbort.classList.toggle('hidden', !working);
+    const groundTruth = !!state.canAbort;
+    const live = !!state.connected && !!state.agentActivityLive;
+    const workingNow = groundTruth || statusWorking || live;
+
+    const now = Date.now();
+    if (workingNow) {
+      abortVisibleUntil = now + ABORT_HOLD_MS;
+      if (abortHoldTimer) { clearTimeout(abortHoldTimer); abortHoldTimer = null; }
+    } else if (now < abortVisibleUntil && !abortHoldTimer) {
+      // Schedule a re-render for when the hold expires so the control hides
+      // even if no further state patch arrives.
+      abortHoldTimer = setTimeout(() => {
+        abortHoldTimer = null;
+        renderInputState();
+      }, abortVisibleUntil - now);
+    }
+    $btnAbort.classList.toggle('hidden', !workingNow && now >= abortVisibleUntil);
   }
 
   /**
-   * Edge-triggered notifications. Fires only when the agent NEWLY asks a
-   * question / needs approval, or when it transitions from working to idle.
+   * Edge-triggered notifications. Fires only when:
+   *   - the agent NEWLY asks a question / needs approval, or
+   *   - the agent has genuinely finished (was working, then stayed idle —
+   *     status alone flaps mid-run, so we key off the ground-truth working
+   *     signal and require the idle reading to settle).
    * Regular messages never trigger a notification (the old behaviour fired
    * one for every tool/command message, which bombarded the user).
    */
@@ -1720,11 +1762,12 @@
     const hasQuestionnaire = !!(state.questionnaire && state.questionnaire.questions
       && state.questionnaire.questions.length > 0);
     const hasApproval = (state.pendingApprovals || []).length > 0;
+    const working = isAgentWorking();
 
     // First render after load: adopt the current state without notifying.
     if (!notificationsPrimed) {
       notificationsPrimed = true;
-      prevAgentStatus = state.agentStatus;
+      wasWorking = working;
       hadQuestionnaire = hasQuestionnaire;
       hadApproval = hasApproval;
       return;
@@ -1735,27 +1778,65 @@
     } else if (hasApproval && !hadApproval) {
       const approval = state.pendingApprovals[0];
       fireNotification((approval && approval.description) || 'Agent needs approval', 'cursor-approval');
-    } else if (state.agentStatus === 'idle' && prevAgentStatus && prevAgentStatus !== 'idle') {
-      fireNotification('Agent finished', 'cursor-finished');
+    }
+
+    if (working) {
+      // Agent picked work back up (or is still going): cancel any pending
+      // "finished" notification and remember we were working.
+      wasWorking = true;
+      if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
+    } else if (wasWorking && !finishTimer) {
+      // Idle after having worked — debounce so transient gaps (idle between
+      // tool steps) don't fire a premature "finished" notification.
+      finishTimer = setTimeout(() => {
+        finishTimer = null;
+        const nowWorking = isAgentWorking();
+        if (nowWorking) { wasWorking = true; return; }
+        // Only announce a true finish — not a state the agent is blocked on
+        // (waiting for approval, erroring, or asking a question).
+        const blocked = state.agentStatus === 'waiting_approval'
+          || state.agentStatus === 'error'
+          || !!(state.questionnaire && state.questionnaire.questions
+                && state.questionnaire.questions.length > 0);
+        wasWorking = false;
+        if (blocked) return;
+        fireNotification('Agent finished', 'cursor-finished');
+      }, FINISH_SETTLE_MS);
     }
 
     hadQuestionnaire = hasQuestionnaire;
     hadApproval = hasApproval;
-    prevAgentStatus = state.agentStatus;
+  }
+
+  /** Ground-truth view of whether the agent is actively working right now. */
+  function isAgentWorking() {
+    if (!state.connected) return false;
+    if (state.canAbort) return true;
+    if (state.agentActivityLive) return true;
+    return state.agentStatus !== 'idle'
+      && state.agentStatus !== 'waiting_approval'
+      && state.agentStatus !== 'error';
   }
 
   function fireNotification(text, tag) {
     if (document.hasFocus()) return;
     if (typeof Notification === 'undefined') return;
     var ntag = tag || 'cursor-agent';
-    if (notificationPermission === 'default') {
+    var show = function () {
+      try {
+        new Notification('CursorRemote', { body: text, tag: ntag });
+      } catch (_) { /* some browsers throw if blocked */ }
+    };
+    if (notificationPermission === 'granted') { show(); return; }
+    if (notificationPermission === 'denied') return;
+    // Permission not yet decided — request it. Browsers may reject this when
+    // there's no user gesture, so we also pre-request on first interaction.
+    try {
       Notification.requestPermission().then(function (perm) {
         notificationPermission = perm;
-        if (perm === 'granted') new Notification('CursorRemote', { body: text, tag: ntag });
+        if (perm === 'granted') show();
       });
-    } else if (notificationPermission === 'granted') {
-      new Notification('CursorRemote', { body: text, tag: ntag });
-    }
+    } catch (_) { /* ignore */ }
   }
 
   // --- Window rendering ---
@@ -2135,6 +2216,25 @@
       setTimeout(() => toast.remove(), 300);
     }, 3000);
   }
+
+  // Pre-request notification permission on the first user interaction — browsers
+  // require a user gesture for this, and we can't rely on one existing at the
+  // moment the agent finishes (usually while the tab is backgrounded).
+  function primeNotificationPermission() {
+    if (typeof Notification === 'undefined') return;
+    if (Notification.permission === 'granted' || Notification.permission === 'denied') {
+      notificationPermission = Notification.permission;
+      return;
+    }
+    try {
+      Notification.requestPermission().then(function (perm) {
+        notificationPermission = perm;
+      });
+    } catch (_) { /* ignore */ }
+  }
+  ['pointerdown', 'keydown'].forEach(function (evt) {
+    window.addEventListener(evt, primeNotificationPermission, { once: true });
+  });
 
   } // end bootstrap
 

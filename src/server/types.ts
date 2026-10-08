@@ -102,6 +102,16 @@ export interface CursorState {
   agentActivityLive: boolean;
   /** Provenance of the current activity signal, for transports/debugging. */
   agentActivitySource: ActivitySource;
+  /**
+   * Ground-truth "the agent is currently working and can be stopped" flag.
+   * Set when Cursor's own Stop control is present in the DOM (the composer
+   * send↔stop toggle, a "Stop generation" button, or a running tool's
+   * "Stop command" control). Unlike `agentStatus` — which oscillates between
+   * `running_tool` and false `waiting_approval`/`idle` across polls — this
+   * stays true for the entire turn, so clients can keep the abort control
+   * visible without flicker.
+   */
+  canAbort: boolean;
   messages: ChatElement[];
   pendingApprovals: Approval[];
   inputAvailable: boolean;
