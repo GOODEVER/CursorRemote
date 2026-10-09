@@ -2502,13 +2502,34 @@
         badge.textContent = 'open';
         header.appendChild(badge);
       }
+
+      // "New Agent" button on every folder header — lets you create an agent
+      // in any folder (including ones showing "No agents yet") directly from
+      // the remote.
+      const newAgent = document.createElement('button');
+      newAgent.className = 'folder-new-agent';
+      newAgent.setAttribute('aria-label', 'New agent in ' + folder.name);
+      newAgent.title = 'New agent in ' + folder.name;
+      newAgent.textContent = '+';
+      newAgent.addEventListener('click', (e) => {
+        e.stopPropagation();
+        createFolderAgent(folder);
+      });
+      header.appendChild(newAgent);
       section.appendChild(header);
+
+      // Clicking the folder header itself also creates a new agent there —
+      // "select itself inside of it, so I can create a new agent".
+      header.addEventListener('click', () => createFolderAgent(folder));
 
       const agents = folder.agents || [];
       if (agents.length === 0) {
-        const none = document.createElement('div');
+        const none = document.createElement('button');
         none.className = 'folder-agent-empty';
-        none.textContent = 'No agents yet';
+        none.type = 'button';
+        none.title = 'Create a new agent in ' + folder.name;
+        none.textContent = 'No agents yet — tap to create one';
+        none.addEventListener('click', () => createFolderAgent(folder));
         section.appendChild(none);
       } else {
         agents.forEach((agent) => {
@@ -2532,6 +2553,18 @@
       }
       $sheetFoldersList.appendChild(section);
     });
+  }
+
+  /** Create a new agent in a folder via the host's section "+" button. */
+  function createFolderAgent(folder) {
+    socket.emit('command:create_folder_agent', {
+      commandId: newCommandId(),
+      type: 'create_folder_agent',
+      sectionId: folder.sectionId,
+      folderName: folder.name,
+    });
+    showToast(`Creating new agent in ${folder.name}...`, 'success');
+    closeSheet();
   }
 
 

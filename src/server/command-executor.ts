@@ -820,6 +820,80 @@ export class CommandExecutor {
     });
   }
 
+  /**
+
+   * Create a new agent inside a specific folder section of Cursor's agent
+   * overview. Clicks that section's "+" (New Agent) button. The "+" appears
+   * when the section is hovered/expanded; if it's not visible we hover the
+   * section header first so Cursor renders it, then retry.
+   */
+  async createFolderAgent(
+    commandId: string,
+    sectionId: string,
+    folderName: string
+  ): Promise<CommandResult> {
+    return this.withRetry(commandId, async (client) => {
+      const result = await client.evaluate(`
+        (() => {
+          const sectionId = ${JSON.stringify(sectionId)};
+          const folderName = ${JSON.stringify(folderName.trim().toLowerCase())};
+          const norm = (s) => (s || '').trim().toLowerCase();
+
+          // Locate the workspace section by drop-section id, falling back to
+          // the section header title when the id is synthesized (folder:<name>).
+          let section = null;
+          if (sectionId) {
+            section = document.querySelector('section[data-agent-drop-section-id="' + CSS.escape(sectionId) + '"]');
+          }
+          if (!section) {
+            for (const sec of document.querySelectorAll('section[data-sidebar-workspace-section-root]')) {
+              const head = sec.querySelector('.ui-sidebar-section-head .ui-sidebar-label-row-title');
+              if (head && norm(head.textContent) === folderName) { section = sec; break; }
+            }
+          }
+          if (!section) return { ok: false, error: 'folder not found' };
+
+          // Hover/expand the section so its "+" (New Agent) button renders.
+          const head = section.querySelector('.ui-sidebar-section-head');
+          const hoverTarget = head || section;
+          const fire = (el, type, opts) => {
+            try { el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, ...opts })); } catch {}
+          };
+          fire(hoverTarget, 'mouseover');
+          fire(hoverTarget, 'mouseenter');
+          fire(hoverTarget, 'mousemove', { clientX: 8, clientY: 8 });
+
+          // Find the "+" button: prefer an explicit New Agent aria-label,
+          // otherwise any hover-revealed action button in the header.
+          let plus = null;
+          for (const b of section.querySelectorAll('button, [role="button"], a')) {
+            const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('data-state') || '')).trim();
+            const text = (b.textContent || '').trim();
+            if (/new agent|new task/i.test(label)) { plus = b; break; }
+            // Hover-only controls usually render as icon buttons; match by class
+            // since Cursor names them consistently across versions.
+            if (/(section-head|label-row).*action|plus|add/i.test(b.className || '')) { plus = b; plus.__byClass = true; }
+          }
+          if (!plus) {
+            // Last resort: the last small icon button inside the header row.
+            const btns = Array.from(head ? head.querySelectorAll('button, [role="button"]') : []);
+            if (btns.length > 1) plus = btns[btns.length - 1];
+          }
+          if (!plus) return { ok: false, error: 'new agent button not found' };
+
+          try { plus.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch {}
+          (plus.querySelector('[data-sidebar-menu-button], .ui-sidebar-menu-button') || plus).click();
+          return { ok: true, byClass: !!plus.__byClass };
+        })()
+      `) as { ok: boolean; error?: string; byClass?: boolean } | null;
+
+      if (!result?.ok) {
+        throw new Error(`Could not create agent in "${folderName}": ${result?.error ?? 'unknown'}`);
+      }
+      console.log(`[command-executor] New agent created in folder "${folderName}"${result.byClass ? ' (matched by class)' : ''}`);
+    });
+  }
+
   async setMode(commandId: string, modeId: string): Promise<CommandResult> {
     return this.withRetry(commandId, async (client) => {
       const strategies = this.selectors.modeDropdown?.strategies ?? [];

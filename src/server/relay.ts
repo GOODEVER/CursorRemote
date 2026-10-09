@@ -688,6 +688,40 @@ export class Relay {
         await this.loadComposerHistory(composerId);
       });
 
+      socket.on('command:create_folder_agent', async (payload: CommandPayload) => {
+        const sectionId = (payload.sectionId || '').trim();
+        const folderName = (payload.folderName || '').trim();
+        if (!payload.commandId || (!sectionId && !folderName)) {
+          socket.emit('command:result', {
+            commandId: payload.commandId ?? 'unknown',
+            ok: false,
+            error: 'Missing commandId and folder target',
+          } satisfies CommandResult);
+          return;
+        }
+        console.log(`[relay] Command: create_folder_agent in "${folderName || sectionId}" from ${socket.id}`);
+        const result = await this.commandExecutor.createFolderAgent(
+          payload.commandId,
+          sectionId,
+          folderName || sectionId.replace(/^folder:/, '')
+        );
+        socket.emit('command:result', result);
+        // Cursor opened the composer on the host; the next extraction picks up
+        // the new agent's composerId and pushes a fresh snapshot. Nudge the
+        // client so the UI switches over without waiting for the poll cycle.
+        if (result.ok) {
+          setTimeout(async () => {
+            const state = this.stateManager.getCurrentState();
+            const composerId = state.activeComposerId || '';
+            if (composerId) {
+              this.historyComposerId = composerId;
+              this.composerHistory.invalidate(composerId);
+              await this.loadComposerHistory(composerId);
+            }
+          }, 1200);
+        }
+      });
+
       socket.on('command:new_chat', async (payload: CommandPayload) => {
         if (!payload.commandId) {
           socket.emit('command:result', {
