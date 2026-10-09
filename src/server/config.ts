@@ -1,6 +1,7 @@
 import 'dotenv/config';
-import { readFileSync } from 'fs';
-import { resolve } from 'path';
+import { readFileSync, existsSync } from 'fs';
+import { resolve, join } from 'path';
+import { homedir } from 'os';
 import type { ServerConfig, SelectorConfig } from './types.js';
 
 export function loadConfig(): ServerConfig {
@@ -23,6 +24,8 @@ export function loadConfig(): ServerConfig {
     webappPassword: process.env.WEBAPP_PASSWORD ?? '',
     windowTitleQualifier: process.env.WINDOW_TITLE_QUALIFIER !== 'false',
     dataDir,
+    cursorStateDb: resolveCursorStateDb(),
+    historyMaxMessages: Math.max(0, parseInt(process.env.HISTORY_MAX_MESSAGES ?? '2000', 10) || 0),
     webPush: {
       enabled: process.env.WEBPUSH_ENABLED !== 'false',
       subject: process.env.WEBPUSH_SUBJECT ?? 'mailto:cursorremote@localhost',
@@ -34,6 +37,23 @@ export function loadConfig(): ServerConfig {
       impl: (process.env.TELEGRAM_IMPL === 'raw' ? 'raw' : 'grammy') as 'grammy' | 'raw',
     },
   };
+}
+
+/**
+ * Resolve the path to Cursor's global `state.vscdb` (the authoritative store of
+ * full chat transcripts). Honors the CURSOR_STATE_DB override; otherwise tries
+ * the platform default. Returns '' when no candidate exists, which disables
+ * history loading rather than crashing the server.
+ */
+function resolveCursorStateDb(): string {
+  const override = process.env.CURSOR_STATE_DB;
+  if (override) return resolve(override);
+  const candidates = [
+    join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'Cursor', 'User', 'globalStorage', 'state.vscdb'),
+    join(homedir(), 'Library', 'Application Support', 'Cursor', 'User', 'globalStorage', 'state.vscdb'),
+    join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'Cursor', 'User', 'globalStorage', 'state.vscdb'),
+  ];
+  return candidates.find((p) => existsSync(p)) ?? '';
 }
 
 export function loadSelectors(config: ServerConfig): SelectorConfig {

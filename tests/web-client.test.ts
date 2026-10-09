@@ -109,6 +109,10 @@ function fireWindowSnapshot(mockSocket: MockSocket, snapshot: Record<string, unk
   mockSocket.fire('window:snapshot', snapshot);
 }
 
+function fireHistory(mockSocket: MockSocket, payload: Record<string, unknown>) {
+  mockSocket.fire('history:full', payload);
+}
+
 // ─── Connection status rendering ───
 
 describe('web: connection status', () => {
@@ -870,5 +874,99 @@ describe('web: questionnaire widget', () => {
       questionnaire: null,
     });
     assert.ok(bar.classList.contains('hidden'), 'Hidden after null snapshot');
+  });
+});
+
+// ─── Full history loading (virtualized transcript fix) ───
+
+describe('web: full history', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  function stateWith(messages: unknown[], activeComposerId = 'comp-1'): CursorState {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    return {
+      ...fixture[0].state!,
+      connected: true,
+      messages: messages as CursorState['messages'],
+      activeComposerId,
+      chatTabs: [],
+      folders: [],
+    };
+  }
+
+  function human(id: string, text: string) {
+    return { type: 'human', id, flatIndex: 0, text, mentions: [] };
+  }
+  function assistant(id: string, text: string) {
+    return { type: 'assistant', id, flatIndex: 0, text, html: `<p>${text}</p>`, codeBlocks: [] };
+  }
+
+  it('requests the full transcript once the active composer is known', () => {
+    fireFullState(env.mockSocket, stateWith([assistant('a-tail', 'newest')], 'comp-1'));
+    const req = env.mockSocket.sent.filter(s => s.event === 'request:history');
+    assert.equal(req.length, 1);
+    assert.equal(req[0].payload.composerId, 'comp-1');
+  });
+
+  it('does not re-request the same composer on subsequent patches', () => {
+    fireFullState(env.mockSocket, stateWith([assistant('a-tail', 'newest')], 'comp-1'));
+    firePatch(env.mockSocket, { agentStatus: 'idle' });
+    firePatch(env.mockSocket, { canAbort: false });
+    const req = env.mockSocket.sent.filter(s => s.event === 'request:history');
+    assert.equal(req.length, 1);
+  });
+
+  it('renders the whole history, not just the virtualized DOM tail', () => {
+    // DOM only mounts the newest message; history carries the full chat.
+    fireFullState(env.mockSocket, stateWith([assistant('a-tail', 'newest')], 'comp-1'));
+    fireHistory(env.mockSocket, {
+      composerId: 'comp-1',
+      name: 'Long chat',
+      total: 40,
+      truncated: false,
+      messages: [human('h1', 'first'), assistant('a1', 'middle'), assistant('a-tail', 'newest')],
+    });
+
+    const els = env.document.querySelectorAll('#messages .chat-el');
+    assert.equal(els.length, 3, 'all history messages rendered');
+    assert.equal(els[0].getAttribute('data-id'), 'h1');
+    assert.equal(els[2].getAttribute('data-id'), 'a-tail');
+  });
+
+  it('prefers the live version of a message present in both history and DOM', () => {
+    fireFullState(env.mockSocket, stateWith([assistant('a-tail', 'streaming now')], 'comp-1'));
+    fireHistory(env.mockSocket, {
+      composerId: 'comp-1',
+      messages: [human('h1', 'first'), assistant('a-tail', 'stale db copy')],
+    });
+    const last = env.document.querySelectorAll('#messages .chat-el')[1];
+    assert.match(last.textContent!, /streaming now/);
+  });
+
+  it('appends live messages that history does not yet contain', () => {
+    fireFullState(env.mockSocket, stateWith([assistant('a-new', 'brand new')], 'comp-1'));
+    fireHistory(env.mockSocket, {
+      composerId: 'comp-1',
+      messages: [human('h1', 'first')],
+    });
+    const els = env.document.querySelectorAll('#messages .chat-el');
+    assert.equal(els.length, 2);
+    assert.equal(els[1].getAttribute('data-id'), 'a-new');
+  });
+
+  it('ignores a history payload for a different composer', () => {
+    fireFullState(env.mockSocket, stateWith([assistant('a-tail', 'newest')], 'comp-1'));
+    fireHistory(env.mockSocket, {
+      composerId: 'other-composer',
+      messages: [human('h1', 'belongs elsewhere')],
+    });
+    // History was requested for comp-1, so comp-2's payload must be dropped.
+    const els = env.document.querySelectorAll('#messages .chat-el');
+    assert.equal(els.length, 1);
+    assert.equal(els[0].getAttribute('data-id'), 'a-tail');
   });
 });

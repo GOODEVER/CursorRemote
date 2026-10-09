@@ -27,6 +27,7 @@
     questionnaire: null,
     slashCommands: [],
     folders: [],
+    activeComposerId: '',
   };
 
   function getAuthToken() {
@@ -136,6 +137,16 @@
   // submits in place via send_prompt rather than retyping.
   let composerPrefilledText = '';
   const pendingCommandResults = new Map();
+
+  // Full transcript for the composer currently open, sourced from Cursor's
+  // database (event `history:full`). Cursor virtualizes the transcript DOM and
+  // only mounts the messages nearest its scroll position, so the live state
+  // stream is clipped to a handful of items; we merge this history ahead of the
+  // live tail in renderMessages() so switching folders shows the whole chat.
+  let fullHistory = { composerId: '', messages: [] };
+  // Composer we are expecting a history payload for / last asked the server for.
+  let pendingHistoryComposerId = '';
+  let lastRequestedHistoryComposerId = '';
 
   function isNearMessagesBottom() {
     const threshold = 80;
@@ -274,6 +285,17 @@
     Object.assign(state, patch);
     if ('questionnaire' in patch) homeQuestionnaire = patch.questionnaire || null;
     recomputeQuestionnaire();
+    renderAll();
+  });
+
+  // Full transcript for a composer (from Cursor's database). Merge it ahead of
+  // the live DOM tail so the whole chat renders, regardless of Cursor's
+  // transcript virtualization.
+  socket.on('history:full', (payload) => {
+    if (!payload || !Array.isArray(payload.messages)) return;
+    if (payload.composerId && pendingHistoryComposerId && payload.composerId !== pendingHistoryComposerId) return;
+    fullHistory = { composerId: payload.composerId || '', messages: payload.messages };
+    pendingHistoryComposerId = '';
     renderAll();
   });
 
@@ -448,14 +470,68 @@
     renderWindows();
     renderMessages();
     renderApprovals();
-      renderQuestionnaire();
+    renderQuestionnaire();
     renderInputState();
     renderTabs();
     renderFoldersButton();
     renderModeModel();
     syncPlanModalFromState();
+    maybeRequestHistory();
     maybeNotifyTransitions();
     maybeAutoOpenChat();
+  }
+
+  /**
+   * Ensure the full transcript for the currently-open composer is loaded. We
+   * key off `state.activeComposerId` (now included in state patches) and ask the
+   * server once per composer; the `history:full` response is merged into the
+   * rendered transcript by renderMessages().
+   */
+  function maybeRequestHistory() {
+    const composerId = state.activeComposerId || '';
+    if (!composerId) return;
+    if (fullHistory.composerId === composerId) return;
+    if (pendingHistoryComposerId === composerId) return;
+    if (lastRequestedHistoryComposerId === composerId) return;
+    requestHistory(composerId);
+  }
+
+  function requestHistory(composerId) {
+    if (!composerId) return;
+    if (fullHistory.composerId === composerId) return; // already loaded
+    // Clear any previous composer's transcript so we never show the wrong chat
+    // while the new one loads.
+    fullHistory = { composerId: '', messages: [] };
+    pendingHistoryComposerId = composerId;
+    lastRequestedHistoryComposerId = composerId;
+    socket.emit('request:history', { composerId });
+  }
+
+  /**
+   * Merge the full-history transcript with the live DOM tail. History is
+   * authoritative and ordered; the DOM only ever contributes the newest few
+   * messages (nearest its scroll position). We rebuild the tail from live
+   * messages whose ids appear in history (so streaming updates stay live), then
+   * append any remaining live messages that history doesn't yet contain (e.g.
+   * the message currently being generated).
+   */
+  function mergeHistoryWithLive(historyMsgs, liveMsgs) {
+    if (!historyMsgs || historyMsgs.length === 0) return liveMsgs || [];
+    if (!liveMsgs || liveMsgs.length === 0) return historyMsgs;
+
+    const liveById = new Map();
+    for (const m of liveMsgs) if (m && m.id) liveById.set(m.id, m);
+
+    const historyIds = new Set();
+    for (const m of historyMsgs) if (m && m.id) historyIds.add(m.id);
+
+    const merged = historyMsgs.map((h) => (h && h.id && liveById.has(h.id) ? liveById.get(h.id) : h));
+
+    const extra = [];
+    for (const m of liveMsgs) {
+      if (m && m.id && !historyIds.has(m.id)) extra.push(m);
+    }
+    return extra.length > 0 ? merged.concat(extra) : merged;
   }
 
   /**
@@ -657,7 +733,19 @@
   // --- Message rendering ---
 
   function renderMessages() {
-    if (state.messages.length === 0) {
+    // Full history (when loaded for the open composer) is the source of truth
+    // for everything but the newest messages; the live DOM tail is merged in so
+    // streaming stays live.
+    let msgs = state.messages;
+    if (fullHistory.messages.length > 0) {
+      const historyMatchesComposer =
+        !fullHistory.composerId || !state.activeComposerId || fullHistory.composerId === state.activeComposerId;
+      if (historyMatchesComposer) {
+        msgs = mergeHistoryWithLive(fullHistory.messages, state.messages);
+      }
+    }
+
+    if (msgs.length === 0) {
       const ui = getConnectionUiState();
       $emptyState.style.display = '';
       $messages.querySelectorAll('.chat-el').forEach(el => el.remove());
@@ -672,13 +760,13 @@
     const existingIds = new Map();
     existingEls.forEach(el => existingIds.set(el.dataset.id, el));
 
-    const newIds = new Set(state.messages.map(m => m.id));
+    const newIds = new Set(msgs.map(m => m.id));
 
     existingEls.forEach(el => {
       if (!newIds.has(el.dataset.id)) el.remove();
     });
 
-    state.messages.forEach((msg, index) => {
+    msgs.forEach((msg, index) => {
       let el = existingIds.get(msg.id);
 
       if (!el) {
@@ -2089,7 +2177,9 @@
             commandId: newCommandId(),
             tabTitle: tab.title,
             selectorPath: tab.selectorPath,
+            composerId: tab.composerId,
           });
+          requestHistory(tab.composerId);
         });
         $tabList.appendChild(btn);
       }
@@ -2433,6 +2523,7 @@
               tabTitle: agent.title,
               selectorPath: agent.selectorPath,
             });
+            requestHistory(agent.composerId);
             showToast(`Opening ${agent.title}...`, 'success');
             closeSheet();
           });

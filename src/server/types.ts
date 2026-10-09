@@ -424,6 +424,19 @@ export interface ServerConfig {
   webappPassword: string;
   windowTitleQualifier: boolean;
   dataDir: string;
+  /**
+   * Absolute path to Cursor's global SQLite store (`state.vscdb`). Used to read
+   * the FULL chat transcript (Cursor virtualizes the DOM and only mounts a few
+   * messages, so the DOM alone can never yield full history). Empty string
+   * disables history loading.
+   */
+  cursorStateDb: string;
+  /**
+   * Max messages restored from the full-history source (0 = unlimited). Cursor
+   * mounts only a handful of transcript nodes, so this bounds how much of a very
+   * long chat is sent to the client on switch.
+   */
+  historyMaxMessages: number;
   webPush: WebPushConfig;
   telegram: TelegramConfig;
 }

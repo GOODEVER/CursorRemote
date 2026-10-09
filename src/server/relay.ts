@@ -11,6 +11,7 @@ import type { CommandExecutor } from './command-executor.js';
 import type { CDPBridge } from './cdp-bridge.js';
 import type { WindowMonitor, WindowSnapshot } from './window-monitor.js';
 import { markdownToWebHtml, readPlanFile } from './plan-files.js';
+import { ComposerHistory } from './composer-history.js';
 import {
   createWebPushManager,
   type WebPushManager,
@@ -131,6 +132,14 @@ export class Relay {
   private sessionStore: WebappSessionStore;
   private loginAttempts = new Map<string, RateLimitEntry>();
   private webPush: WebPushManager;
+  /**
+   * Reads the FULL transcript for a composer from Cursor's SQLite store. Cursor
+   * virtualizes the transcript DOM, so the DOM extractor only ever yields a few
+   * mounted messages; this restores complete history when switching folders.
+   */
+  private composerHistory: ComposerHistory;
+  /** Composer whose full history was most recently loaded (guards stale reads). */
+  private historyComposerId = '';
   /** Latest push-relevant signals per window (from window:update snapshots). */
   private pushWindowSignals = new Map<string, {
     questionnaire: boolean;
@@ -171,6 +180,15 @@ export class Relay {
       config.webPush.subject,
       config.webPush.enabled
     );
+    this.composerHistory = new ComposerHistory({
+      dbPath: config.cursorStateDb,
+      maxMessages: config.historyMaxMessages,
+    });
+    if (config.cursorStateDb) {
+      console.log(`[relay] Full-history source: ${config.cursorStateDb}`);
+    } else {
+      console.warn('[relay] Cursor state DB not found — chat history will be limited to the virtualized DOM');
+    }
 
     this.app = express();
     this.httpServer = createServer(this.app);
@@ -630,6 +648,10 @@ export class Relay {
           payload.selectorPath
         );
         socket.emit('command:result', result);
+        if (payload.composerId) {
+          this.historyComposerId = payload.composerId;
+          await this.loadComposerHistory(payload.composerId);
+        }
       });
 
       socket.on('command:open_folder_agent', async (payload: CommandPayload) => {
@@ -649,6 +671,21 @@ export class Relay {
           payload.selectorPath
         );
         socket.emit('command:result', result);
+        // Restore the FULL transcript from Cursor's database. The DOM only
+        // mounts a few messages, so switching folders otherwise showed a
+        // clipped history until the user scrolled.
+        if (payload.composerId) {
+          this.historyComposerId = payload.composerId;
+          this.composerHistory.invalidate(payload.composerId);
+          await this.loadComposerHistory(payload.composerId);
+        }
+      });
+
+      socket.on('request:history', async (payload?: { composerId?: string }) => {
+        const composerId = (payload?.composerId || this.stateManager.getCurrentState().activeComposerId || '').trim();
+        if (!composerId) return;
+        this.historyComposerId = composerId;
+        await this.loadComposerHistory(composerId);
       });
 
       socket.on('command:new_chat', async (payload: CommandPayload) => {
@@ -914,6 +951,32 @@ export class Relay {
     this.stateManager.on('connection:changed', (connected: boolean) => {
       this.io.emit('connection:status', { connected });
     });
+  }
+
+  /**
+   * Load the complete transcript for `composerId` straight from Cursor's
+   * database and push it to clients. Cursor virtualizes the transcript DOM (only
+   * a handful of messages are ever mounted), so without this the remote's
+   * transcript is clipped to whatever is currently rendered — the "switching
+   * folders doesn't load the full history" bug. The client merges this with the
+   * live DOM tail (deduped by message id) so streaming keeps updating it.
+   */
+  private async loadComposerHistory(composerId: string): Promise<void> {
+    if (!composerId) return;
+    const history = await this.composerHistory.getHistory(composerId);
+    if (!history || history.messages.length === 0) return;
+    if (this.historyComposerId !== composerId) return; // Composer switched mid-read.
+
+    this.io.emit('history:full', {
+      composerId,
+      name: history.name,
+      total: history.total,
+      truncated: history.truncated,
+      messages: history.messages,
+    });
+    console.log(
+      `[relay] History loaded for ${composerId.substring(0, 8)} "${history.name}": ${history.messages.length}/${history.total} messages`
+    );
   }
 
   private isWorkingState(s: CursorState): boolean {

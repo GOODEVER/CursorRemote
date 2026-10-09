@@ -299,6 +299,11 @@ export class StateManager extends EventEmitter {
       hasChange = true;
     }
 
+    if (prev.activeComposerId !== next.activeComposerId) {
+      patch.activeComposerId = next.activeComposerId;
+      hasChange = true;
+    }
+
     if (prev.inputAvailable !== next.inputAvailable) {
       patch.inputAvailable = next.inputAvailable;
       hasChange = true;
