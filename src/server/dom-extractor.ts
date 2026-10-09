@@ -1647,10 +1647,13 @@ export function extractionFunction(
         const kind: WorkspaceFolder['kind'] = sectionId.startsWith('repo:') ? 'repo' : 'workspace';
 
         const agents: FolderAgent[] = [];
+        // Agent rows normally live in .glass-sidebar-agent-list-container,
+        // but some sections (single-repo workspaces, empty folders) render
+        // their li.ui-sidebar-menu-item directly inside the section root.
         const listContainer = section.querySelector('.glass-sidebar-agent-list-container');
         const items = listContainer
           ? Array.from(listContainer.querySelectorAll('li.ui-sidebar-menu-item'))
-          : [];
+          : Array.from(section.querySelectorAll('li.ui-sidebar-menu-item'));
         for (const li of items) {
           const btn = li.querySelector(
             '[data-sidebar-menu-button], .ui-sidebar-menu-button, [role="button"], button'
