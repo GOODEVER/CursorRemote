@@ -1989,7 +1989,18 @@ export function extractionFunction(
       pendingApprovals,
       inputAvailable: inputEl !== null,
       chatTabs,
-      activeComposerId: containerComposerId || (chatTabs.find((t) => t.isActive)?.composerId ?? ''),
+      // The composer currently open in the pane. `container` is the chat panel,
+      // which may stay mounted even when no chat is open (Agents overview), so
+      // prefer the actual `.composer-bar.editor[data-composer-id]` element. This
+      // lets the client auto-open the chat Cursor is already showing instead of
+      // waiting for a manual tap.
+      activeComposerId: (
+        document.querySelector('.composer-bar.editor[data-composer-id]')?.getAttribute('data-composer-id')
+        || document.querySelector('.agent-conversation-composer [data-composer-id]')?.getAttribute('data-composer-id')
+        || (container.querySelector('[data-composer-id]')?.getAttribute('data-composer-id'))
+        || containerComposerId
+        || (chatTabs.find((t) => t.isActive)?.composerId ?? '')
+      ),
       mode,
       model,
       windows: [],

@@ -1528,6 +1528,66 @@ header {
 .toast.error { border-left: 2px solid var(--accent-red); }
 .toast.success { border-left: 2px solid var(--accent-green); }
 
+/* --- Big "agent finished" banner --- */
+
+.finished-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(24, 24, 24, 0.92);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  animation: finishedFade 0.18s ease-out;
+}
+
+.finished-overlay.hidden { display: none; }
+
+.finished-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: min(100%, 420px);
+  padding: 44px 28px;
+  text-align: center;
+  background: var(--accent-green);
+  color: #ffffff;
+  border-radius: 18px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.12);
+  animation: finishedPop 0.22s ease-out;
+}
+
+.finished-icon {
+  font-size: 56px;
+  line-height: 1;
+  font-weight: 700;
+}
+
+.finished-title {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.finished-sub {
+  font-size: 13px;
+  opacity: 0.9;
+}
+
+@keyframes finishedFade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes finishedPop {
+  from { opacity: 0; transform: scale(0.94); }
+  to { opacity: 1; transform: scale(1); }
+}
+
 @keyframes toastIn {
   from { opacity: 0; transform: translateY(-8px); }
   to { opacity: 1; transform: translateY(0); }

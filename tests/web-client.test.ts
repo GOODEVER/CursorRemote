@@ -200,6 +200,37 @@ describe('web: finished notification', () => {
     await new Promise((r) => setTimeout(r, 5200));
     assert.equal(notifications().filter((n) => n.tag === 'cursor-finished').length, 0);
   });
+
+  it('shows a dismissible green banner when the agent finishes', async () => {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    const overlay = () => env.document.getElementById('finished-overlay')!;
+    assert.ok(overlay().classList.contains('hidden'), 'banner hidden initially');
+
+    fireFullState(env.mockSocket, { ...fixture[1].state!, canAbort: true });
+    assert.ok(overlay().classList.contains('hidden'), 'no banner while working');
+
+    firePatch(env.mockSocket, { agentStatus: 'idle', canAbort: false, agentActivityLive: false, agentActivityText: null });
+    await new Promise((r) => setTimeout(r, 5200));
+
+    assert.ok(!overlay().classList.contains('hidden'), 'banner shown on genuine finish');
+
+    // Clicking anywhere dismisses it.
+    overlay().click();
+    assert.ok(overlay().classList.contains('hidden'), 'banner dismissed on click');
+  });
+
+  it('hides the banner when the agent starts working again', async () => {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    const overlay = () => env.document.getElementById('finished-overlay')!;
+
+    fireFullState(env.mockSocket, { ...fixture[1].state!, canAbort: true });
+    firePatch(env.mockSocket, { agentStatus: 'idle', canAbort: false, agentActivityLive: false, agentActivityText: null });
+    await new Promise((r) => setTimeout(r, 5200));
+    assert.ok(!overlay().classList.contains('hidden'), 'banner shown on finish');
+
+    firePatch(env.mockSocket, { agentStatus: 'thinking', canAbort: true, agentActivityLive: true });
+    assert.ok(overlay().classList.contains('hidden'), 'banner hidden once work resumes');
+  });
 });
 
 // ─── Message rendering ───
@@ -434,6 +465,88 @@ describe('web: folders drawer', () => {
     assert.equal(evt!.payload.composerId, 'composer-abc-123');
     assert.equal(evt!.payload.tabTitle, 'Roblox factory game design');
     assert.equal(evt!.payload.type, 'open_folder_agent');
+  });
+});
+
+// ─── Auto-open chat on load ───
+
+describe('web: auto-open chat', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+    // Auto-open only runs for a logged-in session.
+    env.window.localStorage.setItem('cursor-remote-token', 'test-token');
+  });
+
+  function agentState(overrides?: Partial<CursorState>): CursorState {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    return {
+      ...fixture[0].state!,
+      messages: [],
+      canAbort: false,
+      agentActivityLive: false,
+      agentStatus: 'idle',
+      activeComposerId: '',
+      chatTabs: [],
+      folders: [
+        {
+          name: 'FactoryTycoonGame',
+          sectionId: 'workspace:abc',
+          kind: 'workspace',
+          isCurrent: false,
+          agents: [
+            { title: 'Roblox factory game design', composerId: 'composer-aaa', sectionId: 'workspace:abc', isActive: false, selectorPath: '' },
+          ],
+        },
+        {
+          name: 'beabee',
+          sectionId: 'repo:github.com/juliasabel/beabee',
+          kind: 'repo',
+          isCurrent: false,
+          agents: [
+            { title: 'Game currency and lives', composerId: 'composer-bbb', sectionId: 'repo:x', isActive: false, selectorPath: '' },
+          ],
+        },
+      ],
+      ...overrides,
+    };
+  }
+
+  it('opens the relay\'s current composer automatically instead of waiting for a tap', () => {
+    fireFullState(env.mockSocket, agentState({ activeComposerId: 'composer-aaa' }));
+
+    const evt = env.mockSocket.sent.filter(s => s.event === 'command:open_folder_agent').pop();
+    assert.ok(evt, 'should auto-emit command:open_folder_agent');
+    assert.equal(evt!.payload.composerId, 'composer-aaa');
+    assert.equal(evt!.payload.type, 'open_folder_agent');
+  });
+
+  it('falls back to the most recent agent when no composer is current', () => {
+    fireFullState(env.mockSocket, agentState());
+
+    const evt = env.mockSocket.sent.filter(s => s.event === 'command:open_folder_agent').pop();
+    assert.ok(evt, 'should auto-open the last agent with a composer id');
+    assert.equal(evt!.payload.composerId, 'composer-bbb');
+  });
+
+  it('does not auto-open when a chat is already loaded', () => {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    fireFullState(env.mockSocket, {
+      ...agentState({ activeComposerId: 'composer-aaa' }),
+      messages: fixture[1].state!.messages,
+    });
+
+    const evt = env.mockSocket.sent.filter(s => s.event === 'command:open_folder_agent');
+    assert.equal(evt.length, 0, 'no auto-open once messages are present');
+  });
+
+  it('does not auto-open once per render (bounded attempts)', () => {
+    fireFullState(env.mockSocket, agentState({ activeComposerId: 'composer-aaa' }));
+    firePatch(env.mockSocket, { folders: agentState({ activeComposerId: 'composer-aaa' }).folders });
+
+    const evt = env.mockSocket.sent.filter(s => s.event === 'command:open_folder_agent');
+    assert.equal(evt.length, 1, 'should only fire one auto-open attempt without a new connection');
   });
 });
 

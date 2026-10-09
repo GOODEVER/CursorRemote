@@ -158,6 +158,17 @@
 
   <div id="toast-container"></div>
 
+  <!-- Big visual "agent finished" banner. Shown only when the page is not
+       focused (same rule as notifications) so users without notification
+       permission still get an unmissable visual. Click anywhere to dismiss. -->
+  <div id="finished-overlay" class="finished-overlay hidden" role="status" aria-live="polite">
+    <div class="finished-card">
+      <div class="finished-icon" aria-hidden="true">&#10003;</div>
+      <div class="finished-title">Agent finished</div>
+      <div class="finished-sub">Tap anywhere to dismiss</div>
+    </div>
+  </div>
+
   <script src="vendor-socket.io.min.js"></script>
   <script src="app.js"></script>
 </body>

@@ -107,6 +107,16 @@
   let hadQuestionnaire = false;
   let hadApproval = false;
   let notificationsPrimed = false;
+  // Auto-open bookkeeping: when the relay is pointed at Cursor's "Cursor Agents"
+  // overview, no chat is mounted, so the transcript is empty until the user
+  // taps an agent. We automatically open a chat (the relay's current one, or the
+  // most recent agent) once per connection so the chats start loading on their
+  // own instead of requiring a manual init click.
+  const AUTO_OPEN_TRIES = 3;
+  let autoOpenAttempts = 0;
+  let autoOpenDone = false;
+  let autoOpenPending = false;
+  let autoOpenTimer = null;
   // "Finished" detection: the agent's status flaps between working and idle
   // mid-run, so we track whether it was working and debounce the idle reading.
   let wasWorking = false;
@@ -192,6 +202,7 @@
   const $foldersCount = document.getElementById('folders-count');
   const $btnNotify = document.getElementById('btn-notify');
   const $notifyIcon = document.getElementById('notify-icon');
+  const $finishedOverlay = document.getElementById('finished-overlay');
   const $sheetNotify = document.getElementById('sheet-notify');
   const $notifyStatus = document.getElementById('notify-status');
   const $btnNotifyToggle = document.getElementById('btn-notify-toggle');
@@ -233,7 +244,14 @@
     });
   }
 
-  socket.on('connect', () => renderAll());
+  socket.on('connect', () => {
+    // Fresh connection: allow auto-open to run again.
+    autoOpenDone = false;
+    autoOpenAttempts = 0;
+    autoOpenPending = false;
+    if (autoOpenTimer) { clearTimeout(autoOpenTimer); autoOpenTimer = null; }
+    renderAll();
+  });
   socket.on('disconnect', () => renderAll());
 
   let connectFailCount = 0;
@@ -394,6 +412,9 @@
   $pillModel.addEventListener('click', () => openSheet('model'));
   $btnFolders.addEventListener('click', () => openSheet('folders'));
   $sheetOverlay.addEventListener('click', closeSheet);
+  if ($finishedOverlay) {
+    $finishedOverlay.addEventListener('click', hideFinishedBanner);
+  }
   $planModalClose.addEventListener('click', closePlanModal);
   $planModalOverlay.addEventListener('click', (e) => {
     if (e.target === $planModalOverlay) closePlanModal();
@@ -434,6 +455,65 @@
     renderModeModel();
     syncPlanModalFromState();
     maybeNotifyTransitions();
+    maybeAutoOpenChat();
+  }
+
+  /**
+   * Open the chat the relay is already showing (or the most recent agent chat)
+   * automatically so the transcript loads without a manual tap. Only runs when
+   * logged in with an empty transcript and no chat actually open — i.e. Cursor
+   * sitting on the "Cursor Agents" overview, where nothing is mounted yet.
+   */
+  function maybeAutoOpenChat() {
+    if (autoOpenDone || autoOpenPending) return;
+    const loggedIn = !!getAuthToken();
+    if (!loggedIn) return;
+    if (state.messages.length > 0) { autoOpenDone = true; return; }
+    if (!state.connected) return;
+
+    const target = pickAutoOpenAgent();
+    if (!target) return;
+
+    if (autoOpenAttempts >= AUTO_OPEN_TRIES) { autoOpenDone = true; return; }
+    autoOpenAttempts += 1;
+    autoOpenPending = true;
+    socket.emit('command:open_folder_agent', {
+      commandId: newCommandId(),
+      type: 'open_folder_agent',
+      composerId: target.composerId,
+      tabTitle: target.title,
+      selectorPath: target.selectorPath,
+    });
+
+    if (autoOpenTimer) clearTimeout(autoOpenTimer);
+    autoOpenTimer = setTimeout(() => {
+      autoOpenTimer = null;
+      autoOpenPending = false;
+      if (state.messages.length === 0) maybeAutoOpenChat();
+    }, 2500);
+  }
+
+  /**
+   * Prefer the relay's currently-open composer (it resolves to a real agent row
+   * even when no chat is mounted); otherwise fall back to the last agent with a
+   * real composer id — Cursor lists agents in recency order.
+   */
+  function pickAutoOpenAgent() {
+    const folders = state.folders || [];
+    const withIds = folders.flatMap(f => (f.agents || [])
+      .filter(a => a && typeof a.composerId === 'string' && a.composerId.length > 0));
+
+    const activeId = (state.activeComposerId || '').trim();
+    if (activeId) {
+      const match = withIds.find(a => a.composerId === activeId);
+      if (match) return match;
+      // Not listed in the sidebar (e.g. an open chat) — still safe to open it.
+      return { composerId: activeId, title: '', selectorPath: '' };
+    }
+
+    const activeRow = withIds.find(a => a.isActive);
+    if (activeRow) return activeRow;
+    return withIds.length > 0 ? withIds[withIds.length - 1] : null;
   }
 
   function renderConnectionStatus() {
@@ -496,8 +576,8 @@
     return {
       status: 'connected',
       label: 'Connected',
-      emptyPrimary: 'No messages in this chat yet.',
-      emptyHint: 'Send a message below or switch chat tab / window in Cursor.',
+      emptyPrimary: 'Opening the current chat…',
+      emptyHint: 'This chat has no messages yet. Send one below, or open another chat from the Folders button.',
     };
   }
 
@@ -1848,8 +1928,10 @@
     }
 
     if (hasQuestionnaire && !hadQuestionnaire) {
+      hideFinishedBanner();
       fireNotification('Agent has a question for you', 'cursor-questionnaire');
     } else if (hasApproval && !hadApproval) {
+      hideFinishedBanner();
       const approval = state.pendingApprovals[0];
       fireNotification((approval && approval.description) || 'Agent needs approval', 'cursor-approval');
     }
@@ -1857,6 +1939,7 @@
     if (working) {
       // Agent picked work back up (or is still going): cancel any pending
       // "finished" notification and remember we were working.
+      hideFinishedBanner();
       wasWorking = true;
       if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
     } else if (wasWorking && !finishTimer) {
@@ -1875,6 +1958,7 @@
         wasWorking = false;
         if (blocked) return;
         fireNotification('Agent finished', 'cursor-finished');
+        showFinishedBanner();
       }, FINISH_SETTLE_MS);
     }
 
@@ -1890,6 +1974,27 @@
     return state.agentStatus !== 'idle'
       && state.agentStatus !== 'waiting_approval'
       && state.agentStatus !== 'error';
+  }
+
+  /**
+   * Big visual "the agent finished" banner — a fake notification for people
+   * who can't (or don't want to) grant real notification permission. Unlike an
+   * OS notification this shows even while the app is focused (so the finish is
+   * unmissable), but it never interrupts active typing. Click anywhere to
+   * dismiss.
+   */
+  function showFinishedBanner() {
+    if (!$finishedOverlay) return;
+    const input = document.getElementById('message-input');
+    const typing = !!input
+      && (document.activeElement === input || (input.value || '').trim().length > 0);
+    if (typing) return;
+    $finishedOverlay.classList.remove('hidden');
+  }
+
+  function hideFinishedBanner() {
+    if (!$finishedOverlay) return;
+    $finishedOverlay.classList.add('hidden');
   }
 
   function fireNotification(text, tag) {
@@ -2543,9 +2648,11 @@
     }
     $notifyStatus.textContent = statusText;
     $notifyHint.textContent = pwa
-      ? 'You will be notified when the agent asks a question, needs approval, or finishes.'
-      : 'Tip: add this app to your Home Screen for reliable notifications. ' +
-        'You will be notified when the agent asks a question, needs approval, or finishes.';
+      ? 'You will be notified when the agent asks a question, needs approval, or finishes. '
+        + 'A big green banner also appears in the app when the agent finishes, even without push.'
+      : 'Tip: add this app to your Home Screen for reliable notifications. '
+        + 'You will be notified when the agent asks a question, needs approval, or finishes. '
+        + 'A big green banner also appears in the app when the agent finishes, even without push.';
   }
 
   if ($btnNotify) {
