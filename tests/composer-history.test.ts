@@ -190,4 +190,48 @@ describe('ComposerHistory', () => {
     const second = await h.getHistory(COMPOSER_ID);
     assert.deepEqual(first, second);
   });
+
+  it('evicts the least-recently-used composer beyond cacheMaxEntries', async () => {
+    // Dedicated DB so this test doesn't fight the shared fixture rows.
+    const lruDb = join(dir, 'lru.vscdb');
+    const db = new DatabaseSync(lruDb);
+    db.exec('CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)');
+    const ins = db.prepare('INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)');
+    const ids = [
+      'ffffffff-0000-0000-0000-000000000001',
+      'ffffffff-0000-0000-0000-000000000002',
+      'ffffffff-0000-0000-0000-000000000003',
+    ];
+    for (const id of ids) {
+      ins.run(
+        `composerData:${id}`,
+        JSON.stringify({
+          composerId: id,
+          name: 'C-' + id.slice(-2),
+          fullConversationHeadersOnly: [
+            { bubbleId: 'h1', type: 1, grouping: { isRenderable: true, textPreview: 'x' } },
+          ],
+        })
+      );
+      ins.run(`bubbleId:${id}:h1`, JSON.stringify({ type: 1, text: 'x' }));
+    }
+    db.close();
+
+    const h = new ComposerHistory({ dbPath: lruDb, cacheTtlMs: 60000, cacheMaxEntries: 2 });
+    const first = await h.getHistory(ids[0]);
+    const second = await h.getHistory(ids[1]);
+    // Touch ids[0] so ids[1] becomes LRU.
+    const firstAgain = await h.getHistory(ids[0]);
+    assert.ok(first && second && firstAgain);
+    assert.equal(firstAgain, first); // cache hit returns the same object
+    await h.getHistory(ids[2]); // inserts a 3rd entry → evicts ids[1]
+    // ids[1] was evicted, so this re-read returns a NEW object (fresh load).
+    const reloaded = await h.getHistory(ids[1]);
+    assert.ok(reloaded);
+    assert.notEqual(reloaded, second);
+    // That re-load re-inserted ids[1], making ids[0] the new LRU — it gets
+    // evicted next, so its third read is also a fresh object. This proves
+    // the cap holds (never more than cacheMaxEntries cached at once).
+    assert.notEqual(await h.getHistory(ids[0]), first);
+  });
 });

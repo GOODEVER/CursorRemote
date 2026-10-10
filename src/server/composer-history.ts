@@ -65,6 +65,8 @@ export interface ComposerHistoryOptions {
   maxMessages?: number;
   /** TTL for the per-composer result cache. Default 5000ms. */
   cacheTtlMs?: number;
+  /** Max cached composers; LRU beyond this is dropped. Default 4. */
+  cacheMaxEntries?: number;
 }
 
 interface RawHeader {
@@ -92,6 +94,17 @@ interface RawBubble {
 
 const DEFAULT_MAX_MESSAGES = 500;
 const DEFAULT_CACHE_TTL_MS = 5000;
+/** Bound the number of cached transcripts: each entry can hold up to
+ * maxMessages mapped ChatElements (incl. rendered HTML), so an unbounded map
+ * grows the heap by tens of MB per visited composer and never lets go
+ * (observed: multi-GB heap after hours of browsing folders). */
+const DEFAULT_CACHE_MAX_ENTRIES = 4;
+/** Per-message text cap. Tool dumps in cursorDiskKV can be several MB each;
+ * past a few thousand chars they are unreadable in the chat view anyway. */
+const MAX_MESSAGE_TEXT_CHARS = 8000;
+/** Total mapped-transcript char budget. Large histories of tool-heavy agent
+ * chats previously pushed the heap past its cap when mapped+cached. */
+const MAX_TOTAL_HISTORY_CHARS = 600_000;
 
 const TOOL_LABELS: Record<string, string> = {
   read_file_v2: 'Read file',
@@ -122,12 +135,14 @@ export class ComposerHistory {
   private dbPath: string;
   private maxMessages: number;
   private cacheTtlMs: number;
+  private cacheMaxEntries: number;
   private cache = new Map<string, { at: number; result: ComposerHistoryResult | null }>();
 
   constructor(options: ComposerHistoryOptions) {
     this.dbPath = options.dbPath;
     this.maxMessages = options.maxMessages ?? DEFAULT_MAX_MESSAGES;
     this.cacheTtlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+    this.cacheMaxEntries = Math.max(1, options.cacheMaxEntries ?? DEFAULT_CACHE_MAX_ENTRIES);
   }
 
   /** True when a database path is configured (loading is otherwise disabled). */
@@ -146,7 +161,12 @@ export class ComposerHistory {
 
     const now = Date.now();
     const cached = this.cache.get(composerId);
-    if (cached && now - cached.at < this.cacheTtlMs) return cached.result;
+    if (cached && now - cached.at < this.cacheTtlMs) {
+      // LRU touch: re-insert so the entry counts as most-recent.
+      this.cache.delete(composerId);
+      this.cache.set(composerId, cached);
+      return cached.result;
+    }
 
     let result: ComposerHistoryResult | null = null;
     try {
@@ -157,7 +177,18 @@ export class ComposerHistory {
       result = null;
     }
     this.cache.set(composerId, { at: now, result });
+    this.evictOverLimit(composerId);
     return result;
+  }
+
+  /** Keep the newest `cacheMaxEntries` entries (LRU by insertion order). */
+  private evictOverLimit(justInserted: string): void {
+    while (this.cache.size > this.cacheMaxEntries) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey === undefined) break;
+      if (oldestKey === justInserted) break; // never evict the entry we just set
+      this.cache.delete(oldestKey);
+    }
   }
 
   private async readComposer(composerId: string): Promise<ComposerHistoryResult | null> {
@@ -188,31 +219,45 @@ export class ComposerHistory {
         return { composerId, name: composer.name ?? '', messages: [], total, truncated: false };
       }
 
-      // One query gets every bubble body for this composer. `composerId` is
-      // validated as hex/dashes (no LIKE wildcards), so the prefix match is safe.
+      // Fetch each bubble body individually with a prepared statement instead
+      // of one `LIKE` sweep. The LIKE sweep materialized EVERY row for the
+      // composer in one array — long agent chats hold hundreds of MB of tool
+      // output in cursorDiskKV, which spiked the heap past its cap and OOM'd
+      // the relay. Per-key lookups only touch the windowed rows.
+      const bubbleStmt = db.prepare('SELECT value FROM cursorDiskKV WHERE key = ?');
       const prefix = `bubbleId:${composerId}:`;
-      const bubbleRows = db
-        .prepare('SELECT key, value FROM cursorDiskKV WHERE key LIKE ?')
-        .all(`${prefix}%`);
-      const bodies = new Map<string, RawBubble>();
-      for (const row of bubbleRows) {
-        const key = row.key;
-        const value = row.value;
-        if (typeof key !== 'string' || typeof value !== 'string') continue;
-        const bubbleId = key.slice(prefix.length);
-        const bubble = safeParse<RawBubble>(value);
-        if (bubble) bodies.set(bubbleId, bubble);
-      }
-
       const messages: ChatElement[] = [];
+      let totalChars = 0;
       for (let i = 0; i < window.length; i++) {
         const header = window[i];
         if (!header || typeof header.bubbleId !== 'string' || !header.bubbleId) continue;
         const grouping = header.grouping ?? {};
         if (grouping.isRenderable === false) continue;
-        const bubble = bodies.get(header.bubbleId) ?? null;
+
+        let bubble: RawBubble | null = null;
+        try {
+          const row = bubbleStmt.get(prefix + header.bubbleId);
+          if (row && typeof row.value === 'string') bubble = safeParse<RawBubble>(row.value);
+        } catch {
+          /* missing/corrupt body → treat as null */
+        }
         const mapped = mapHeader(header, bubble, startIndex + i);
-        if (mapped) messages.push(mapped);
+        if (!mapped) continue;
+        // Drop enormous text payloads (crashed tool dumps etc.) — they are not
+        // readable in the chat view anyway and each one can be several MB.
+        if (mapped.type === 'assistant') {
+          const text = mapped.text;
+          if (text.length > MAX_MESSAGE_TEXT_CHARS) {
+            mapped.text = text.slice(0, MAX_MESSAGE_TEXT_CHARS) + '…';
+            mapped.html = markdownToWebHtml(mapped.text);
+          }
+        } else if (mapped.type === 'thought' && mapped.detail && mapped.detail.length > MAX_MESSAGE_TEXT_CHARS) {
+          mapped.detail = mapped.detail.slice(0, MAX_MESSAGE_TEXT_CHARS) + '…';
+        }
+        totalChars += mapped.type === 'assistant' ? mapped.text.length : (mapped as { detail?: string }).detail?.length ?? 0;
+        messages.push(mapped);
+        // Hard stop if the mapped transcript would exceed the byte budget.
+        if (totalChars > MAX_TOTAL_HISTORY_CHARS) break;
       }
 
       return {

@@ -140,7 +140,7 @@ echo.
 
 start "" cmd /c "timeout /t 3 /nobreak >nul & start "" http://127.0.0.1:%SERVER_PORT%"
 
-node dist\server\index.js
+node --max-old-space-size=2048 dist\server\index.js
 
 echo.
 echo Server stopped.

@@ -650,7 +650,7 @@ export class Relay {
         socket.emit('command:result', result);
         if (payload.composerId) {
           this.historyComposerId = payload.composerId;
-          await this.loadComposerHistory(payload.composerId);
+          await this.loadComposerHistory(payload.composerId, socket);
         }
       });
 
@@ -677,7 +677,7 @@ export class Relay {
         if (payload.composerId) {
           this.historyComposerId = payload.composerId;
           this.composerHistory.invalidate(payload.composerId);
-          await this.loadComposerHistory(payload.composerId);
+          await this.loadComposerHistory(payload.composerId, socket);
         }
       });
 
@@ -685,7 +685,7 @@ export class Relay {
         const composerId = (payload?.composerId || this.stateManager.getCurrentState().activeComposerId || '').trim();
         if (!composerId) return;
         this.historyComposerId = composerId;
-        await this.loadComposerHistory(composerId);
+        await this.loadComposerHistory(composerId, socket);
       });
 
       socket.on('command:create_folder_agent', async (payload: CommandPayload) => {
@@ -716,7 +716,7 @@ export class Relay {
             if (composerId) {
               this.historyComposerId = composerId;
               this.composerHistory.invalidate(composerId);
-              await this.loadComposerHistory(composerId);
+              await this.loadComposerHistory(composerId, socket);
             }
           }, 1200);
         }
@@ -995,19 +995,28 @@ export class Relay {
    * folders doesn't load the full history" bug. The client merges this with the
    * live DOM tail (deduped by message id) so streaming keeps updating it.
    */
-  private async loadComposerHistory(composerId: string): Promise<void> {
+  private async loadComposerHistory(composerId: string, target?: Socket): Promise<void> {
     if (!composerId) return;
     const history = await this.composerHistory.getHistory(composerId);
     if (!history || history.messages.length === 0) return;
     if (this.historyComposerId !== composerId) return; // Composer switched mid-read.
 
-    this.io.emit('history:full', {
+    const payload = {
       composerId,
       name: history.name,
       total: history.total,
       truncated: history.truncated,
       messages: history.messages,
-    });
+    };
+    // Unicast to the requesting client when known. These payloads can be
+    // several MB (2000 mapped messages incl. HTML); broadcasting to every
+    // socket makes each connected client hold its own copy and lets a
+    // slow/stalled client buffer unboundedly.
+    if (target && target.connected) {
+      target.emit('history:full', payload);
+    } else {
+      this.io.emit('history:full', payload);
+    }
     console.log(
       `[relay] History loaded for ${composerId.substring(0, 8)} "${history.name}": ${history.messages.length}/${history.total} messages`
     );
