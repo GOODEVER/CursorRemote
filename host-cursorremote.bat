@@ -6,12 +6,12 @@ REM =====================================================================
 REM  CursorRemote - one-click host
 REM  ---------------------------------------------------------------
 REM  Double-click this file. It will:
-REM    1. Fix Cursor shortcuts so Cursor opens with remote debugging
-REM       (one-time; asks for admin if needed)
-REM    2. Open the Windows Firewall for LAN access (one-time; needs admin)
-REM    3. Make sure Cursor is running with the debug port (offer restart)
-REM    4. Start the relay server and open the web client
-REM  Keep this window open while you use the remote.
+REM    1. Best-effort check shortcuts + firewall (no admin, no prompts)
+REM    2. Make sure Cursor is running with the debug port (auto-restarts
+REM       Cursor when the port is not reachable - no prompts)
+REM    3. Start the relay server and open the web client
+REM  One-time LAN setup: run setup-firewall.bat once if phones cannot
+REM  connect. Keep this window open while you use the remote.
 REM =====================================================================
 
 cd /d "%~dp0"
@@ -26,15 +26,9 @@ set CURSOR_REMOTE_LICENSE_BYPASS=1
 set CURSOR_EXE=C:\Program Files\cursor\Cursor.exe
 REM ----------------------------------------------------------
 
-set FIXONLY=0
-if /i "%~1"=="fixonly" set FIXONLY=1
-
 if not exist "dist\server\index.js" goto NO_BUILD
 if not exist temp mkdir temp
 if not exist data mkdir data
-
-net session >nul 2>&1
-if %errorlevel%==0 (set ELEVATED=1) else (set ELEVATED=0)
 
 echo =====================================================================
 echo   CursorRemote setup
@@ -52,22 +46,10 @@ set CR_CDP=%CDP_URL%
 
 call :PREFLIGHT
 
-REM ---------- One-time fixes (may need admin) ----------
-set NEED_ELEV=0
-if "!SC_ADMIN!"=="1" set NEED_ELEV=1
-if "!FW!"=="0" set NEED_ELEV=1
-
-if "!NEED_ELEV!"=="0" goto FIXES_DONE
-if "!ELEVATED!"=="1" goto FIXES_DONE
-if exist "%TEMP%\cursorremote-elev-attempt" goto FIXES_DONE
-type nul > "%TEMP%\cursorremote-elev-attempt"
-echo [setup] Requesting administrator privileges for one-time setup...
-echo         Approve the UAC prompt if it appears ^(or ignore to skip^).
-start "" powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs -ArgumentList 'fixonly'"
-timeout /t 5 /nobreak >nul
-
-:FIXES_DONE
-if "!FIXONLY!"=="1" goto FIXONLY_EXIT
+REM ---------- Fixes (best-effort, no admin/UAC prompts) ----------
+REM Shortcut fixes are applied by the preflight where permissions allow.
+REM Anything that needs admin is skipped silently - the launcher itself
+REM restarts Cursor with the debug flag below, so no elevation is needed.
 
 if "!SC_ADMIN!"=="1" goto SC_NEEDS_ADMIN
 if "!SC_FIXED!"=="0" goto SC_OK
@@ -77,8 +59,9 @@ goto FW_STEP
 echo [1/4] Cursor shortcuts already OK.
 goto FW_STEP
 :SC_NEEDS_ADMIN
-echo [1/4] [i] Could not update every shortcut ^(needs admin^).
-echo       Right-click this file and "Run as administrator" once for full setup.
+echo [1/4] [i] Some Cursor shortcuts could not be updated (permission).
+echo       Not a problem - this launcher starts Cursor with the debug
+echo       flag itself whenever the port is missing.
 goto FW_STEP
 
 :FW_STEP
@@ -88,7 +71,9 @@ if errorlevel 1 goto FW_FAIL
 echo [2/4] Firewall opened for port %SERVER_PORT%.
 goto CDP_STEP
 :FW_FAIL
-echo [2/4] [i] Could not open the firewall ^(needs admin^).
+echo [2/4] [i] Firewall rule missing and could not be added without admin.
+echo       Phone/LAN devices will not connect until it exists.
+echo       Run setup-firewall.bat ONCE to fix this permanently.
 goto CDP_STEP
 :FW_OK
 echo [2/4] Firewall for port %SERVER_PORT% already OK.
@@ -97,14 +82,8 @@ goto CDP_STEP
 :CDP_STEP
 if "!CDPOK!"=="1" goto CDP_OK
 echo [3/4] [i] Cursor is not exposing its debug port yet.
-echo          The web client loads, but shows no live data until Cursor
-echo          runs with --remote-debugging-port=9222.
-set "RESTART_CURSOR="
-set /p "RESTART_CURSOR=      Restart Cursor now with debug enabled? [Y/N] "
-if /i "!RESTART_CURSOR!"=="Y" goto DO_RESTART
-echo          Skipped. Reopen this file and answer Y, or launch Cursor
-echo          from a shortcut ^(now fixed^).
-goto SECTION4
+echo          Restarting Cursor automatically with --remote-debugging-port=9222...
+goto DO_RESTART
 :CDP_OK
 echo [3/4] Cursor debug port is reachable.
 goto SECTION4
@@ -119,7 +98,8 @@ goto SECTION4
 
 :SECTION4
 set "OLD_PID="
-for /f "delims=" %%p in ('powershell -NoProfile -Command "(Get-NetTCPConnection -State Listen -LocalPort %SERVER_PORT% -ErrorAction SilentlyContinue ^| Select-Object -First 1 -ExpandProperty OwningProcess)"') do set "OLD_PID=%%p"
+powershell -NoProfile -Command "(Get-NetTCPConnection -State Listen -LocalPort %SERVER_PORT% -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess)" > "%TEMP%\cr-pid.txt" 2>nul
+for /f "delims=" %%p in (%TEMP%\cr-pid.txt) do set "OLD_PID=%%p"
 if not defined OLD_PID goto LAUNCH
 echo [4/4] Port %SERVER_PORT% in use ^(PID !OLD_PID!^) - stopping previous instance...
 taskkill /PID !OLD_PID! /F >nul 2>&1
@@ -145,11 +125,6 @@ node --max-old-space-size=2048 dist\server\index.js
 echo.
 echo Server stopped.
 pause
-exit /b 0
-
-:FIXONLY_EXIT
-REM Elevated helper pass: apply the privileged one-time firewall fix, then exit.
-netsh advfirewall firewall add rule name="CursorRemote %SERVER_PORT%" dir=in action=allow protocol=TCP localport=%SERVER_PORT% >nul 2>&1
 exit /b 0
 
 :PREFLIGHT
