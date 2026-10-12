@@ -875,6 +875,148 @@ describe('web: questionnaire widget', () => {
     });
     assert.ok(bar.classList.contains('hidden'), 'Hidden after null snapshot');
   });
+
+  function freeformState() {
+    const state = baseState();
+    state.questionnaire = {
+      questions: [
+        {
+          number: '1.', text: 'Pick one?', isActive: true,
+          options: [
+            { letter: 'A', label: 'Red', isFreeform: false, selectorPath: 'sp-red' },
+            {
+              letter: 'C', label: 'Other', isFreeform: true,
+              selectorPath: '.tray .ui-tray-option:nth-of-type(2)',
+              freeformInputSelectorPath: '.tray .ui-tray-option:nth-of-type(2)',
+            },
+          ],
+        },
+      ],
+      activeIndex: 0, totalLabel: '1 of 1',
+      skipSelectorPath: 'sp-skip', continueSelectorPath: 'sp-continue',
+      continueDisabled: false,
+    };
+    return state;
+  }
+
+  it('reveals the inline freeform text box when "Other" is clicked', () => {
+    fireFullState(env.mockSocket, freeformState());
+
+    const options = env.document.querySelectorAll('.questionnaire-option');
+    const otherBtn = Array.from(options).find(
+      o => (o as HTMLElement).dataset.freeform === '1'
+    ) as HTMLButtonElement;
+    assert.ok(otherBtn, 'freeform option should be rendered');
+
+    otherBtn.click();
+    const ff = env.document.querySelector('.questionnaire-freeform');
+    assert.ok(ff, 'inline freeform answer box should appear after clicking Other');
+    assert.ok(ff!.querySelector('.questionnaire-freeform-input'), 'has a text input');
+  });
+
+  it('keeps the inline freeform answer box across state:patch re-renders', () => {
+    // Regression: the "Other" box appeared then instantly vanished on the next
+    // poll-driven state:patch because renderQuestionnaire() rebuilt the option
+    // list. The user could never type a custom answer on the phone.
+    const state = freeformState();
+    fireFullState(env.mockSocket, state);
+
+    const otherBtn = Array.from(env.document.querySelectorAll('.questionnaire-option')).find(
+      o => (o as HTMLElement).dataset.freeform === '1'
+    ) as HTMLButtonElement;
+    otherBtn.click();
+
+    const ta = env.document.querySelector('.questionnaire-freeform-input') as HTMLTextAreaElement;
+    assert.ok(ta, 'freeform box appears');
+    ta.value = 'my custom answer';
+
+    // Simulate the frequent poll patches: volatile fields change, structure does not.
+    firePatch(env.mockSocket, { questionnaire: { ...state.questionnaire!, continueDisabled: true } });
+    firePatch(env.mockSocket, { agentStatus: 'idle' });
+    firePatch(env.mockSocket, { questionnaire: { ...state.questionnaire!, continueDisabled: false } });
+
+    const taAfter = env.document.querySelector('.questionnaire-freeform-input') as HTMLTextAreaElement;
+    assert.ok(taAfter, 'freeform box must survive state:patch re-renders');
+    assert.equal(taAfter.value, 'my custom answer', 'typed text must be preserved');
+    assert.equal(taAfter, ta, 'the same textarea element should be reused, not recreated');
+  });
+
+  it('submits the freeform answer via set_answer_text then Continue', async () => {
+    fireFullState(env.mockSocket, freeformState());
+
+    const otherBtn = Array.from(env.document.querySelectorAll('.questionnaire-option')).find(
+      o => (o as HTMLElement).dataset.freeform === '1'
+    ) as HTMLButtonElement;
+    otherBtn.click();
+
+    const ta = env.document.querySelector('.questionnaire-freeform-input') as HTMLTextAreaElement;
+    ta.value = 'typed custom answer';
+    // The send button stays disabled until an input event fires (matches app.js).
+    ta.dispatchEvent(new (env.window as any).Event('input', { bubbles: true }));
+    const send = env.document.querySelector('.questionnaire-freeform-send') as HTMLButtonElement;
+    assert.ok(!send.disabled, 'send should enable once text is entered');
+    send.click();
+
+    await new Promise(r => setTimeout(r, 0));
+    const setText = env.mockSocket.sent.filter(s => s.event === 'command:set_answer_text').pop();
+    assert.ok(setText, 'set_answer_text should be emitted');
+    assert.equal(setText!.payload.selectorPath, '.tray .ui-tray-option:nth-of-type(2)');
+    assert.equal(setText!.payload.text, 'typed custom answer');
+
+    // Resolve the command so submitFreeformAnswer advances to Continue.
+    env.mockSocket.fire('command:result', { commandId: setText!.payload.commandId, ok: true });
+    await new Promise(r => setTimeout(r, 0));
+
+    const cont = env.mockSocket.sent.filter(s => s.event === 'command:click_action').pop();
+    assert.ok(cont, 'Continue should be clicked after typing');
+    assert.equal(cont!.payload.actionLabel, 'Continue');
+  });
+
+  it('keeps the freeform box (and its text) when a poll briefly reports no questionnaire', () => {
+    // Regression: selecting "Other" makes Cursor remount its tray, so a poll can
+    // momentarily report `questionnaire: null`. That reset the render key, the
+    // next patch rebuilt the option list, and the inline box (with the user's
+    // typed text) vanished instantly — "Other" was unusable on the phone.
+    const state = freeformState();
+    fireFullState(env.mockSocket, state);
+
+    const otherBtn = Array.from(env.document.querySelectorAll('.questionnaire-option')).find(
+      o => (o as HTMLElement).dataset.freeform === '1'
+    ) as HTMLButtonElement;
+    otherBtn.click();
+
+    const ta = env.document.querySelector('.questionnaire-freeform-input') as HTMLTextAreaElement;
+    assert.ok(ta, 'freeform box appears');
+    ta.value = 'half-typed custom answer';
+    ta.dispatchEvent(new (env.window as any).Event('input', { bubbles: true }));
+
+    // Simulate the tray remount: null, then the same question again.
+    firePatch(env.mockSocket, { questionnaire: null });
+    firePatch(env.mockSocket, { questionnaire: state.questionnaire! });
+
+    const taAfter = env.document.querySelector('.questionnaire-freeform-input') as HTMLTextAreaElement;
+    assert.ok(taAfter, 'freeform box must reappear after the tray remount');
+    assert.equal(taAfter.value, 'half-typed custom answer', 'typed text must survive the remount');
+  });
+
+  it('re-focuses the freeform box after a rebuild so typing continues', () => {
+    const state = freeformState();
+    fireFullState(env.mockSocket, state);
+
+    const otherBtn = Array.from(env.document.querySelectorAll('.questionnaire-option')).find(
+      o => (o as HTMLElement).dataset.freeform === '1'
+    ) as HTMLButtonElement;
+    otherBtn.click();
+
+    const ta = env.document.querySelector('.questionnaire-freeform-input') as HTMLTextAreaElement;
+    assert.equal(env.document.activeElement, ta, 'input focused right after opening');
+
+    firePatch(env.mockSocket, { questionnaire: null });
+    firePatch(env.mockSocket, { questionnaire: state.questionnaire! });
+
+    const taAfter = env.document.querySelector('.questionnaire-freeform-input') as HTMLTextAreaElement;
+    assert.equal(env.document.activeElement, taAfter, 'rebuilt input regains focus');
+  });
 });
 
 // ─── Full history loading (virtualized transcript fix) ───

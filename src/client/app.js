@@ -176,6 +176,20 @@
   const $btnApprove = document.getElementById('btn-approve');
   const $btnReject = document.getElementById('btn-reject');
   var questionnaireSelections = {};
+  // Signature of the questionnaire DOM we last rendered. Used to skip a full
+  // rebuild on every state:patch, which would otherwise destroy the inline
+  // freeform ("Other") answer box the user is typing into (it lives inside the
+  // option list that renderQuestionnaire() blanks out).
+  var questionnaireRenderKey = '';
+  // Freeform ("Other") drafts, keyed by question number. Selecting "Other" makes
+  // Cursor remount its tray, so a poll can briefly report no questionnaire and
+  // force a full rebuild that would wipe the inline textarea — persisting the
+  // draft here lets us restore the box (with its text and focus) after any
+  // re-render. `...Selector` remembers the row path; `...Active` marks which
+  // question currently has its answer box open.
+  var questionnaireFreeformDrafts = {};
+  var questionnaireFreeformSelector = {};
+  var questionnaireFreeformActive = {};
   const $questionnaireBar = document.getElementById('questionnaire-bar');
   const $questionnaireStepper = document.getElementById('questionnaire-stepper');
   const $questionnaireQuestions = document.getElementById('questionnaire-questions');
@@ -1825,16 +1839,47 @@
     questionnaireWindowId = active ? active.windowId : '';
   }
 
+  /**
+   * Build a stable signature of the questionnaire's structure. When it is
+   * unchanged we skip the DOM rebuild so an in-progress freeform ("Other")
+   * answer box is not wiped by the every-poll `state:patch` -> renderAll().
+   * Includes isActive (so advancing a question still highlights correctly) but
+   * excludes volatile fields like continueDisabled that we patch in place.
+   */
+  function questionnaireSignature(q) {
+    var parts = [q.totalLabel || ''];
+    for (var i = 0; i < q.questions.length; i++) {
+      var question = q.questions[i];
+      var opts = [];
+      for (var j = 0; j < question.options.length; j++) {
+        var opt = question.options[j];
+        opts.push(opt.letter + '|' + opt.label + '|' + (opt.isFreeform ? '1' : '0') + '|' + (opt.selectorPath || ''));
+      }
+      parts.push(question.number + '|' + question.text + '|' + (question.isActive ? '1' : '0') + '|' + opts.join('||'));
+    }
+    return parts.join('###');
+  }
+
   function renderQuestionnaire() {
     var q = state.questionnaire;
     if (!q || !q.questions || q.questions.length === 0) {
       $questionnaireBar.classList.add('hidden');
       questionnaireSelections = {};
+      questionnaireRenderKey = '';
       return;
     }
     $questionnaireBar.classList.remove('hidden');
     $questionnaireStepper.textContent = q.totalLabel || '';
     $btnQContinue.disabled = q.continueDisabled;
+
+    // Same structure as last render -> only refresh volatile bits in place.
+    // This preserves the inline freeform textarea (and its typed text) across
+    // the constant state:patch re-renders.
+    var key = questionnaireSignature(q);
+    if (key === questionnaireRenderKey && $questionnaireQuestions.children.length > 0) {
+      return;
+    }
+    questionnaireRenderKey = key;
 
     $questionnaireQuestions.innerHTML = '';
     for (var i = 0; i < q.questions.length; i++) {
@@ -1885,9 +1930,12 @@
             ...(questionnaireWindowId ? { windowId: questionnaireWindowId } : {}),
           });
           // Freeform ("Other"): reveal a local text box so the user can compose
-          // an answer; it is pushed into Cursor on submit.
+          // an answer; it is pushed into Cursor on submit. Record the row path +
+          // active flag so the box survives a state:patch re-render.
           var ffHost = this.parentNode.querySelector('.questionnaire-freeform');
           if (this.dataset.freeform === '1') {
+            questionnaireFreeformActive[this.dataset.questionNumber] = true;
+            questionnaireFreeformSelector[this.dataset.questionNumber] = this.dataset.freeformSelector;
             if (!ffHost) {
               ffHost = buildFreeformAnswer(this.dataset.questionNumber, this.dataset.freeformSelector);
               this.parentNode.appendChild(ffHost);
@@ -1896,6 +1944,8 @@
             if (ta) ta.focus();
           } else {
             if (ffHost) ffHost.remove();
+            delete questionnaireFreeformActive[this.dataset.questionNumber];
+            delete questionnaireFreeformDrafts[this.dataset.questionNumber];
             showToast('Answer sent', 'success');
           }
         });
@@ -1904,6 +1954,9 @@
       qDiv.appendChild(optionsDiv);
       $questionnaireQuestions.appendChild(qDiv);
     }
+
+    // Re-mount any inline "Other" answer box the rebuild above dropped.
+    restoreFreeformAnswers();
   }
 
   /** Inline "Other" answer box for a freeform questionnaire option. */
@@ -1914,12 +1967,15 @@
     ta.className = 'questionnaire-freeform-input';
     ta.rows = 1;
     ta.placeholder = 'Type your answer…';
+    // Restore any draft the user already typed before a re-render wiped the box.
+    ta.value = questionnaireFreeformDrafts[questionNumber] || '';
     var send = document.createElement('button');
     send.type = 'button';
     send.className = 'questionnaire-freeform-send';
     send.textContent = 'Send answer';
-    send.disabled = true;
+    send.disabled = !ta.value.trim();
     ta.addEventListener('input', function() {
+      questionnaireFreeformDrafts[questionNumber] = ta.value;
       ta.style.height = 'auto';
       ta.style.height = Math.min(ta.scrollHeight, 100) + 'px';
       send.disabled = !ta.value.trim();
@@ -1927,11 +1983,60 @@
     send.addEventListener('click', function() {
       var text = ta.value.trim();
       if (!text) return;
-      void submitFreeformAnswer(questionNumber, freeformSelector, text);
+      // Resolve the row path fresh: the tray may have remounted after "Other"
+      // was selected, shifting the stored path.
+      var selector = liveFreeformSelector(questionNumber) || freeformSelector || '';
+      void submitFreeformAnswer(questionNumber, selector, text);
     });
     wrap.appendChild(ta);
     wrap.appendChild(send);
     return wrap;
+  }
+
+  /**
+   * Re-mount the inline "Other" answer box after renderQuestionnaire() rebuilt
+   * the option list (which drops the previously appended box). Restores the
+   * draft text and returns focus to the input that was being edited.
+   */
+  function restoreFreeformAnswers() {
+    var activeEl = document.activeElement;
+    var refocus = null;
+    for (var i = 0; i < $questionnaireQuestions.children.length; i++) {
+      var qDiv = $questionnaireQuestions.children[i];
+      var numEl = qDiv.querySelector('.questionnaire-question-number');
+      if (!numEl) continue;
+      var qNum = numEl.textContent;
+      if (!questionnaireFreeformActive[qNum]) continue;
+      var optionsDiv = qDiv.querySelector('.questionnaire-options');
+      if (!optionsDiv) continue;
+      // Prefer the freshly-extracted row path (the tray may have remounted and
+      // shifted); fall back to the path recorded when "Other" was clicked.
+      var selector = liveFreeformSelector(qNum) || questionnaireFreeformSelector[qNum] || '';
+      questionnaireFreeformSelector[qNum] = selector;
+      var ffHost = optionsDiv.querySelector('.questionnaire-freeform');
+      var hadFocus = !!activeEl && ffHost && ffHost.contains(activeEl);
+      if (!ffHost) {
+        ffHost = buildFreeformAnswer(qNum, selector);
+        optionsDiv.appendChild(ffHost);
+        hadFocus = true;
+      }
+      if (hadFocus) refocus = ffHost.querySelector('.questionnaire-freeform-input');
+    }
+    if (refocus) refocus.focus();
+  }
+
+  /** Current freeform row path for a question number, straight from state. */
+  function liveFreeformSelector(questionNumber) {
+    var q = state.questionnaire;
+    if (!q || !q.questions) return '';
+    for (var i = 0; i < q.questions.length; i++) {
+      if (q.questions[i].number !== questionNumber) continue;
+      var opts = q.questions[i].options || [];
+      for (var j = 0; j < opts.length; j++) {
+        if (opts[j].isFreeform) return opts[j].freeformInputSelectorPath || opts[j].selectorPath || '';
+      }
+    }
+    return '';
   }
 
   async function submitFreeformAnswer(questionNumber, freeformSelector, text) {
@@ -1952,6 +2057,7 @@
       socket.emit('command:send_message', { commandId: newCommandId(), text });
       showToast('Answer sent', 'success');
       questionnaireSelections[questionNumber] = '';
+      clearFreeformAnswer(questionNumber);
       renderQuestionnaire();
       return;
     }
@@ -1965,8 +2071,16 @@
       });
     }
     questionnaireSelections[questionNumber] = '';
+    clearFreeformAnswer(questionNumber);
     showToast('Answer sent', 'success');
     renderQuestionnaire();
+  }
+
+  /** Drop the inline "Other" answer box state for a question after it is sent. */
+  function clearFreeformAnswer(questionNumber) {
+    delete questionnaireFreeformDrafts[questionNumber];
+    delete questionnaireFreeformActive[questionNumber];
+    delete questionnaireFreeformSelector[questionNumber];
   }
 
   // The abort/stop control must be reachable for the entire turn, but the
