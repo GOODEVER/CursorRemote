@@ -215,6 +215,111 @@ describe('action click target resolution', () => {
     assert.equal(assertElement(result).id, 'row-a');
   });
 
+  // Live Cursor 2026 questionnaire tray structure. The freeform row's label
+  // span reads "Other…" (with a trailing ellipsis) while the client-facing
+  // label is always "Other"; the class check must win so the ellipsis can't
+  // break the match (public: "Other" button didn't work).
+  const trayHtml = `
+    <div class="ui-tray glass-questionnaire-tray">
+      <div class="ui-tray-step" data-active="true">
+        <div class="ui-tray-options">
+          <div id="tray-a" class="ui-tray-option" role="button">
+            <span class="ui-tray-option__badge">A</span>
+            <span class="ui-tray-option__label">Red</span>
+          </div>
+          <div id="tray-c" class="ui-tray-option questionnaire-freeform-option" data-text-input="true" role="button">
+            <span class="ui-tray-option__badge">C</span>
+            <span class="ui-tray-option__label">Other...</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  it('resolves a freeform tray option for "Other" despite the trailing-ellipsis label', () => {
+    const document = documentFor(trayHtml);
+
+    const result = resolveActionClickTarget(
+      document,
+      '.glass-questionnaire-tray .ui-tray-step:nth-of-type(1) .ui-tray-option:nth-of-type(2)',
+      'Other'
+    );
+
+    assert.equal(assertElement(result).id, 'tray-c');
+  });
+
+  it('resolves a standard tray option by its label span', () => {
+    const document = documentFor(trayHtml);
+
+    const result = resolveActionClickTarget(
+      document,
+      '.glass-questionnaire-tray .ui-tray-step:nth-of-type(1) .ui-tray-option:nth-of-type(1)',
+      'Red'
+    );
+
+    assert.equal(assertElement(result).id, 'tray-a');
+  });
+
+  it('setAnswerText focuses an already-mounted editor inside the option row and types', async () => {
+    const typed: string[] = [];
+    const evaluations: string[] = [];
+    const fakeClient = {
+      isConnected: () => true,
+      click: async () => {},
+      typeText: async (text: string) => {
+        typed.push(text);
+      },
+      evaluate: async (expr: string) => {
+        evaluations.push(expr);
+        // Editor already mounted in the row (client clicked "Other" first).
+        if (expr.includes('.tiptap.ProseMirror')) return 'ok';
+        return null;
+      },
+    } as unknown as CdpClient;
+    const executor = new CommandExecutor({} as SelectorConfig);
+    executor.setClient(fakeClient);
+
+    const result = await executor.setAnswerText('cmd-ff', '#tray-c', 'My custom answer');
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(typed, ['My custom answer']);
+    assert.ok(
+      evaluations.some((e) => e.includes('#tray-c')),
+      'should resolve the editor inside the option row'
+    );
+  });
+
+  it('setAnswerText clicks the row to mount the editor when none is present yet', async () => {
+    const typed: string[] = [];
+    const clicked: string[] = [];
+    let focusCalls = 0;
+    const fakeClient = {
+      isConnected: () => true,
+      click: async (selector: string) => {
+        clicked.push(selector);
+      },
+      typeText: async (text: string) => {
+        typed.push(text);
+      },
+      evaluate: async (expr: string) => {
+        // First focus attempt: editor not mounted. After the row click: mounted.
+        if (expr.includes('.tiptap.ProseMirror')) {
+          focusCalls += 1;
+          return focusCalls >= 2 ? 'ok' : 'no-editor';
+        }
+        return null;
+      },
+    } as unknown as CdpClient;
+    const executor = new CommandExecutor({} as SelectorConfig);
+    executor.setClient(fakeClient);
+
+    const result = await executor.setAnswerText('cmd-ff', '#tray-c', 'typed text');
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(clicked, ['#tray-c'], 'should click the option row once to mount the editor');
+    assert.deepEqual(typed, ['typed text']);
+  });
+
   it('keeps clickAction legacy behavior when no expected label is provided', async () => {
     const clickedSelectors: string[] = [];
     let evaluateCalled = false;

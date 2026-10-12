@@ -169,6 +169,18 @@
     </div>
   </div>
 
+  <!-- Big "the agent has a question" alert. Shown when a question first appears
+       so it can't be missed; tapping "Open questions" reveals the answer card. -->
+  <div id="question-overlay" class="finished-overlay question-overlay hidden" role="alert" aria-live="assertive">
+    <div class="finished-card question-card">
+      <div class="finished-icon" aria-hidden="true">&#10067;</div>
+      <div class="finished-title">Agent asked a question</div>
+      <div class="finished-sub" id="question-overlay-preview"></div>
+      <button id="btn-open-questions" class="btn question-open-btn">Open questions</button>
+      <div class="finished-sub question-overlay-dismiss">Tap outside the card to dismiss</div>
+    </div>
+  </div>
+
   <script src="vendor-socket.io.min.js"></script>
   <script src="app.js"></script>
 </body>

@@ -232,20 +232,34 @@ function normalizeActionLabel(value: string | null | undefined): string {
 function elementLabelMatches(element: Element, expectedLabel: string): boolean {
   // Questionnaire option rows render letter + label ("A" + "Explore…"), so
   // whole-text equality can never pass; compare the dedicated label span.
-  // Freeform ("Other") rows have a textarea instead of a label span — the
-  // client-facing label for them is always "Other".
-  const optionLabel = element.querySelector('.composer-questionnaire-toolbar-option-label');
+  // Freeform ("Other") rows expose a label span reading "Other…" but the
+  // client-facing label is always "Other", so check the freeform classes FIRST
+  // — otherwise the trailing ellipsis breaks the match. Cursor's newer tray
+  // uses `.ui-tray-option` with `.ui-tray-option__label` +
+  // `questionnaire-freeform-option`.
+  if (
+    element.classList.contains('composer-questionnaire-toolbar-option-freeform')
+    || element.classList.contains('questionnaire-freeform-option')
+    || element.getAttribute('data-text-input') === 'true'
+  ) {
+    return normalizeActionLabel(expectedLabel) === 'other';
+  }
+  const optionLabel = element.querySelector('.composer-questionnaire-toolbar-option-label')
+    ?? element.querySelector('.ui-tray-option__label');
   if (optionLabel) {
     return normalizeActionLabel(optionLabel.textContent) === normalizeActionLabel(expectedLabel);
-  }
-  if (element.classList.contains('composer-questionnaire-toolbar-option-freeform')) {
-    return normalizeActionLabel(expectedLabel) === 'other';
   }
   const truncatedLabel = element.querySelector('span.truncate');
   if (truncatedLabel) {
     return normalizeActionLabel(truncatedLabel.textContent) === normalizeActionLabel(expectedLabel);
   }
-  return normalizeActionLabel(element.textContent) === normalizeActionLabel(expectedLabel);
+  // Strip inert decorations (e.g. Cursor's tray shortcut glyph "⏎") so a
+  // "Continue⏎" footer button still matches the "Continue" label.
+  const clone = element.cloneNode(true) as Element;
+  for (const deco of Array.from(clone.querySelectorAll('.ui-tray-footer__shortcut, .ui-tray-option__badge'))) {
+    deco.remove();
+  }
+  return normalizeActionLabel(clone.textContent) === normalizeActionLabel(expectedLabel);
 }
 
 function isElementRoot(root: Document | Element): root is Element {
@@ -320,18 +334,29 @@ export const ACTION_CLICK_RESOLVER_JS = `
   const normalizeActionLabel = (value) => (value || '').trim().toLowerCase();
 
   const elementLabelMatches = (element, expectedLabel) => {
-    const optionLabel = element.querySelector('.composer-questionnaire-toolbar-option-label');
+    // Freeform ("Other") first — its label span reads "Other…" (trailing
+    // ellipsis) while the client-facing label is always "Other".
+    if (
+      element.classList.contains('composer-questionnaire-toolbar-option-freeform')
+      || element.classList.contains('questionnaire-freeform-option')
+      || element.getAttribute('data-text-input') === 'true'
+    ) {
+      return normalizeActionLabel(expectedLabel) === 'other';
+    }
+    const optionLabel = element.querySelector('.composer-questionnaire-toolbar-option-label')
+      || element.querySelector('.ui-tray-option__label');
     if (optionLabel) {
       return normalizeActionLabel(optionLabel.textContent) === normalizeActionLabel(expectedLabel);
-    }
-    if (element.classList.contains('composer-questionnaire-toolbar-option-freeform')) {
-      return normalizeActionLabel(expectedLabel) === 'other';
     }
     const truncatedLabel = element.querySelector('span.truncate');
     if (truncatedLabel) {
       return normalizeActionLabel(truncatedLabel.textContent) === normalizeActionLabel(expectedLabel);
     }
-    return normalizeActionLabel(element.textContent) === normalizeActionLabel(expectedLabel);
+    const clone = element.cloneNode(true);
+    for (const deco of Array.from(clone.querySelectorAll('.ui-tray-footer__shortcut, .ui-tray-option__badge'))) {
+      deco.remove();
+    }
+    return normalizeActionLabel(clone.textContent) === normalizeActionLabel(expectedLabel);
   };
 
   const queryWithin = (root, selector) => {
@@ -1132,20 +1157,46 @@ export class CommandExecutor {
     });
   }
 
-  /** Fill a text field (e.g. a questionnaire freeform "Other" answer) without sending. */
+  /**
+   * Fill the freeform ("Other") questionnaire answer without sending.
+   *
+   * Cursor mounts its rich-text editor (`.tiptap.ProseMirror`, role=combobox)
+   * INSIDE the option row only AFTER the row has been clicked — it does not
+   * exist in the DOM at extraction time. So `selectorPath` is the stable option
+   * ROW; we click it first (selecting "Other"), wait for the editor to mount,
+   * then focus the editor and insert the text. The client submits afterwards by
+   * pressing Continue.
+   */
   async setAnswerText(commandId: string, selectorPath: string, text: string): Promise<CommandResult> {
     return this.withRetry(commandId, async (client) => {
-      const found = await client.evaluate(`
+      // 1) Focus an editor already mounted in the row (the client's option
+      //    click normally mounts it). Only click to mount if it is missing —
+      //    re-clicking an already-selected row risks toggling it off.
+      const focusRow = `
         (() => {
-          const el = document.querySelector(${JSON.stringify(selectorPath)});
-          if (!el) return false;
-          el.scrollIntoView({ block: 'center', behavior: 'instant' });
-          el.focus();
-          el.click();
-          return true;
+          const row = document.querySelector(${JSON.stringify(selectorPath)});
+          if (!row) return 'missing';
+          const editor = row.querySelector('.tiptap.ProseMirror, [contenteditable="true"], textarea, input, [role="textbox"], [role="combobox"]');
+          if (!editor) return 'no-editor';
+          editor.scrollIntoView({ block: 'center', behavior: 'instant' });
+          editor.focus();
+          editor.click();
+          return (document.activeElement === editor || row.contains(document.activeElement)) ? 'ok' : 'unfocused';
         })()
-      `) as boolean;
-      if (!found) throw new Error('answer input not found');
+      `;
+      let state = (await client.evaluate(focusRow)) as string;
+      if (state === 'missing') throw new Error('freeform option row not found');
+      if (state !== 'ok') {
+        // Editor not mounted yet — select the option, then poll for the editor.
+        await client.click(selectorPath);
+        await sleep(120);
+        for (let attempt = 0; attempt < 8 && state !== 'ok'; attempt++) {
+          state = (await client.evaluate(focusRow)) as string;
+          if (state !== 'ok') await sleep(120);
+        }
+      }
+      if (state !== 'ok') throw new Error('freeform answer editor did not appear in option row');
+
       await sleep(80);
       await client.typeText(text);
       console.log(`[command-executor] Answer text inserted (${text.length} chars)`);

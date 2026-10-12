@@ -214,6 +214,9 @@
   const $btnNotify = document.getElementById('btn-notify');
   const $notifyIcon = document.getElementById('notify-icon');
   const $finishedOverlay = document.getElementById('finished-overlay');
+  const $questionOverlay = document.getElementById('question-overlay');
+  const $questionOverlayPreview = document.getElementById('question-overlay-preview');
+  const $btnOpenQuestions = document.getElementById('btn-open-questions');
   const $sheetNotify = document.getElementById('sheet-notify');
   const $notifyStatus = document.getElementById('notify-status');
   const $btnNotifyToggle = document.getElementById('btn-notify-toggle');
@@ -436,6 +439,18 @@
   $sheetOverlay.addEventListener('click', closeSheet);
   if ($finishedOverlay) {
     $finishedOverlay.addEventListener('click', hideFinishedBanner);
+  }
+  // Tapping anywhere on the question alert dismisses it; the "Open questions"
+  // button dismisses it and scrolls the answer card into view instead.
+  if ($questionOverlay) {
+    $questionOverlay.addEventListener('click', () => hideQuestionAlert());
+  }
+  if ($btnOpenQuestions) {
+    $btnOpenQuestions.addEventListener('click', (e) => {
+      e.stopPropagation();
+      hideQuestionAlert();
+      openQuestionCard();
+    });
   }
   $planModalClose.addEventListener('click', closePlanModal);
   $planModalOverlay.addEventListener('click', (e) => {
@@ -2017,7 +2032,11 @@
 
     if (hasQuestionnaire && !hadQuestionnaire) {
       hideFinishedBanner();
+      showQuestionAlert();
       fireNotification('Agent has a question for you', 'cursor-questionnaire');
+    } else if (!hasQuestionnaire && hadQuestionnaire) {
+      // Question answered/skipped: drop the alert (leave a real finish banner alone).
+      hideQuestionAlert();
     } else if (hasApproval && !hadApproval) {
       hideFinishedBanner();
       const approval = state.pendingApprovals[0];
@@ -2083,6 +2102,48 @@
   function hideFinishedBanner() {
     if (!$finishedOverlay) return;
     $finishedOverlay.classList.add('hidden');
+  }
+
+  /**
+   * Big visual "the agent asked a question" alert — the question counterpart to
+   * the finished banner. Shown the moment a question first appears so it is
+   * unmissable even without notification permission; tapping "Open questions"
+   * reveals the answer card, tapping elsewhere dismisses it.
+   */
+  function showQuestionAlert() {
+    if (!$questionOverlay) return;
+    const input = document.getElementById('message-input');
+    const typing = !!input
+      && (document.activeElement === input || (input.value || '').trim().length > 0);
+    if (typing) return;
+    if ($questionOverlayPreview) {
+      const q = state.questionnaire && state.questionnaire.questions
+        ? state.questionnaire.questions[state.questionnaire.activeIndex]
+          || state.questionnaire.questions[0]
+        : null;
+      const preview = (q && q.text) ? q.text : '';
+      $questionOverlayPreview.textContent = preview.length > 140
+        ? preview.slice(0, 139) + '…'
+        : preview;
+      $questionOverlayPreview.style.display = preview ? '' : 'none';
+    }
+    // Never show both the finished and question banners at once.
+    hideFinishedBanner();
+    $questionOverlay.classList.remove('hidden');
+  }
+
+  function hideQuestionAlert() {
+    if (!$questionOverlay) return;
+    $questionOverlay.classList.add('hidden');
+  }
+
+  /** Reveal the answer card and scroll it into view. */
+  function openQuestionCard() {
+    const bar = document.getElementById('questionnaire-bar');
+    if (bar) {
+      bar.classList.remove('hidden');
+      bar.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }
   }
 
   function fireNotification(text, tag) {

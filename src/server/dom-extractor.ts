@@ -1840,6 +1840,14 @@ export function extractionFunction(
     }
 
     // --- Questionnaire widget ---
+    // Cursor ships two shapes for the ask-question UI:
+    //   • New (2026+): a floating tray `.ui-tray.glass-questionnaire-tray` with
+    //     `.ui-tray-step` questions, `.ui-tray-option` rows (badge letter +
+    //     label), a freeform `questionnaire-freeform-option`, and a
+    //     `.ui-tray-footer__primary` Continue button. The transcript only shows
+    //     a generic "Asking questions" tool row, so this tray is the real UI.
+    //   • Legacy: an inline `.composer-questionnaire-toolbar` in the composer.
+    // Parse the new tray first, then fall back to the legacy toolbar.
     type QOption = { letter: string; label: string; isFreeform: boolean; selectorPath: string; freeformInputSelectorPath?: string };
     type QQuestion = { number: string; text: string; options: QOption[]; isActive: boolean };
     let questionnaire: {
@@ -1850,23 +1858,91 @@ export function extractionFunction(
       continueSelectorPath: string;
       continueDisabled: boolean;
     } | null = null;
-    const qToolbar = document.querySelector('.composer-questionnaire-toolbar');
+
+    // Anchored class-based paths, like the Skip/Continue actions below.
+    // buildSelectorPath's body-down tag chains go stale between poll and
+    // click, and they target the letter <button> whose text can never pass
+    // the resolver's label check (public#50). Target the option ROW instead:
+    // it carries role="button" and clicking it selects the option.
+    const nthOfType = (el: Element): number => {
+      const parent = el.parentElement;
+      if (!parent) return 1;
+      const sameTag = Array.from(parent.children).filter((c) => c.tagName === el.tagName);
+      return sameTag.indexOf(el) + 1;
+    };
+
+    const qTray = document.querySelector('.glass-questionnaire-tray')
+      ?? Array.from(document.querySelectorAll('.ui-tray')).find((t) => t.querySelector('.ui-tray-option'))
+      ?? null;
+    if (qTray) {
+      const steps = Array.from(qTray.querySelectorAll('.ui-tray-step'));
+      const questions: QQuestion[] = [];
+      let activeIdx = 0;
+      for (let qi = 0; qi < steps.length; qi++) {
+        const stepEl = steps[qi];
+        const isActive = stepEl.getAttribute('data-active') === 'true';
+        if (isActive) activeIdx = qi;
+        const num = (stepEl.querySelector('.ui-tray-step__number')?.textContent || '').trim();
+        const mdRoot = stepEl.querySelector('.ui-tray-step__title .markdown-root')
+          ?? stepEl.querySelector('.markdown-root');
+        const text = (mdRoot?.textContent || '').trim();
+        const optionEls = Array.from(stepEl.querySelectorAll('.ui-tray-option'));
+        const options: QOption[] = [];
+        for (const optEl of optionEls) {
+          const letter = (optEl.querySelector('.ui-tray-option__badge')?.textContent || '').trim();
+          const isFreeform = optEl.classList.contains('questionnaire-freeform-option')
+            || optEl.getAttribute('data-text-input') === 'true';
+          const label = isFreeform
+            ? 'Other'
+            : (optEl.querySelector('.ui-tray-option__label')?.textContent || '').trim();
+          const selectorPath =
+            `.glass-questionnaire-tray .ui-tray-step:nth-of-type(${nthOfType(stepEl)})` +
+            ` .ui-tray-option:nth-of-type(${nthOfType(optEl)})`;
+          // Freeform ("Other"): Cursor mounts its rich-text editor INSIDE the
+          // option row only AFTER the row is clicked, so it never exists at
+          // extraction time. Point the client at the stable option-row path and
+          // let the executor resolve the editor inside it when submitting
+          // (`setAnswerText`). A frozen buildSelectorPath input chain would go
+          // stale and miss the late-mounted ProseMirror element.
+          const freeformInputSelectorPath = isFreeform ? selectorPath : undefined;
+          options.push({ letter, label, isFreeform, selectorPath, ...(freeformInputSelectorPath ? { freeformInputSelectorPath } : {}) });
+        }
+        questions.push({ number: num, text, options, isActive });
+      }
+
+      let skipPath = '';
+      let continuePath = '';
+      let continueDisabled = false;
+      const footer = qTray.querySelector('.ui-tray-footer') ?? qTray;
+      const footerButtons = Array.from(footer.querySelectorAll('button'));
+      if (footerButtons.some((b) => /^skip\b/i.test((b.textContent || '').trim()))) {
+        skipPath = '.glass-questionnaire-tray button[data-variant="text"]';
+      }
+      const contBtn = footerButtons.find((b) => /^continue\b/i.test((b.textContent || '').trim()));
+      if (contBtn) {
+        continuePath = '.glass-questionnaire-tray .ui-tray-footer__primary button';
+        continueDisabled = contBtn.hasAttribute('disabled') || contBtn.getAttribute('data-disabled') !== null;
+      }
+
+      const headerTitle = (qTray.querySelector('[data-component="tray-header-title"]')?.textContent || '').trim();
+      const totalLabel = steps.length > 1 ? `${activeIdx + 1} / ${steps.length}` : headerTitle;
+
+      questionnaire = {
+        questions,
+        activeIndex: activeIdx,
+        totalLabel,
+        skipSelectorPath: skipPath,
+        continueSelectorPath: continuePath,
+        continueDisabled,
+      };
+    }
+
+    const qToolbar = questionnaire ? null : document.querySelector('.composer-questionnaire-toolbar');
     if (qToolbar) {
       const stepperLabel = (qToolbar.querySelector('.composer-questionnaire-toolbar-stepper-label')?.textContent || '').trim();
       const questionEls = Array.from(qToolbar.querySelectorAll('.composer-questionnaire-toolbar-question'));
       const questions: QQuestion[] = [];
       let activeIdx = 0;
-      // Anchored class-based paths, like the Skip/Continue actions below.
-      // buildSelectorPath's body-down tag chains go stale between poll and
-      // click, and they target the letter <button> whose text can never pass
-      // the resolver's label check (public#50). Target the option ROW instead:
-      // it carries role="button" and clicking it selects the option.
-      const nthOfType = (el: Element): number => {
-        const parent = el.parentElement;
-        if (!parent) return 1;
-        const sameTag = Array.from(parent.children).filter((c) => c.tagName === el.tagName);
-        return sameTag.indexOf(el) + 1;
-      };
       for (let qi = 0; qi < questionEls.length; qi++) {
         const qEl = questionEls[qi];
         const isActive = qEl.classList.contains('composer-questionnaire-toolbar-question-active');
@@ -1884,11 +1960,13 @@ export function extractionFunction(
           const selectorPath =
             `.composer-questionnaire-toolbar-question:nth-of-type(${nthOfType(qEl)})` +
             ` .composer-questionnaire-toolbar-option:nth-of-type(${nthOfType(optEl)})`;
-          let freeformInputSelectorPath: string | undefined;
-          if (isFreeform) {
-            const inputEl = optEl.querySelector('textarea, input, [contenteditable="true"], [role="textbox"]');
-            if (inputEl) freeformInputSelectorPath = buildSelectorPath(inputEl);
-          }
+          // Freeform ("Other"): Cursor mounts its rich-text editor INSIDE the
+          // option row only AFTER the row is clicked, so it never exists at
+          // extraction time. Point the client at the stable option-row path and
+          // let the executor resolve the editor inside it when submitting
+          // (`setAnswerText`). A frozen buildSelectorPath input chain would go
+          // stale and miss the late-mounted ProseMirror element.
+          const freeformInputSelectorPath = isFreeform ? selectorPath : undefined;
           options.push({ letter, label, isFreeform, selectorPath, ...(freeformInputSelectorPath ? { freeformInputSelectorPath } : {}) });
         }
         questions.push({ number: num, text, options, isActive });

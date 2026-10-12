@@ -1578,6 +1578,40 @@ header {
   opacity: 0.9;
 }
 
+/* --- Big "agent asked a question" alert --- */
+
+.question-overlay .question-card {
+  background: var(--accent-yellow, #d9a400);
+  color: #1a1a1a;
+  gap: 12px;
+}
+
+.question-card .finished-sub {
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.question-open-btn {
+  margin-top: 4px;
+  height: 44px;
+  padding: 0 22px;
+  border: none;
+  border-radius: 999px;
+  background: #1a1a1a;
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.question-open-btn:active { transform: scale(0.96); }
+
+.question-overlay-dismiss {
+  font-size: 12px;
+  opacity: 0.75;
+}
+
 @keyframes finishedFade {
   from { opacity: 0; }
   to { opacity: 1; }

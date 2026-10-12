@@ -144,6 +144,93 @@ describe('extractionFunction', () => {
     );
   });
 
+  it('parses Cursor\'s newer .ui-tray question widget (glass-questionnaire-tray)', () => {
+    // Structure captured from a live Cursor 2026 build: the ask-question UI is a
+    // floating tray, not the legacy inline `.composer-questionnaire-toolbar`.
+    const state = withDom(`
+      <main id="root"></main>
+      <div class="ui-tray glass-questionnaire-tray">
+        <div data-component="tray-header">
+          <span data-component="tray-header-title">Questions</span>
+        </div>
+        <div class="ui-tray__scroll-area">
+          <div class="ui-tray-step" data-active="true">
+            <div class="ui-tray-step__title">
+              <div class="markdown-root"><p>Which database should I use?</p></div>
+            </div>
+            <div class="ui-tray-step__options">
+              <button class="ui-tray-option" data-variant="badge">
+                <span class="ui-tray-option__badge">A</span>
+                <span class="ui-tray-option__label">SQLite</span>
+              </button>
+              <button class="ui-tray-option" data-variant="badge">
+                <span class="ui-tray-option__badge">B</span>
+                <span class="ui-tray-option__label">Postgres</span>
+              </button>
+              <button class="ui-tray-option questionnaire-freeform-option" data-text-input="true">
+                <span class="ui-tray-option__badge">C</span>
+                <span class="ui-tray-option__label" data-placeholder="true">Other...</span>
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="ui-tray-footer">
+          <button type="button" data-variant="text">Skip</button>
+          <div class="ui-tray-footer__primary">
+            <button type="button" data-variant="primary" data-disabled="" disabled>
+              <span>Continue</span><span class="ui-tray-footer__shortcut">⏎</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    `);
+
+    assert.ok(state.questionnaire, 'expected the new tray to be parsed');
+    assert.equal(state.questionnaire.questions.length, 1);
+    const [question] = state.questionnaire.questions;
+    assert.equal(question.text, 'Which database should I use?');
+    assert.equal(question.options.length, 3);
+    assert.equal(question.options[0].letter, 'A');
+    assert.equal(question.options[0].label, 'SQLite');
+    assert.equal(question.options[1].label, 'Postgres');
+    assert.equal(question.options[2].label, 'Other');
+    assert.equal(question.options[2].isFreeform, true);
+    assert.equal(
+      question.options[0].selectorPath,
+      '.glass-questionnaire-tray .ui-tray-step:nth-of-type(1) .ui-tray-option:nth-of-type(1)'
+    );
+    assert.equal(
+      state.questionnaire.continueSelectorPath,
+      '.glass-questionnaire-tray .ui-tray-footer__primary button'
+    );
+    assert.equal(state.questionnaire.continueDisabled, true);
+    assert.ok(state.questionnaire.skipSelectorPath.length > 0);
+  });
+
+  it('prefers the new tray over the legacy toolbar when both are present', () => {
+    const state = withDom(`
+      <main id="root"></main>
+      <div class="glass-questionnaire-tray ui-tray">
+        <div class="ui-tray-step" data-active="true">
+          <div class="ui-tray-step__title"><div class="markdown-root"><p>New tray question</p></div></div>
+          <div class="ui-tray-option"><span class="ui-tray-option__badge">A</span><span class="ui-tray-option__label">Yes</span></div>
+        </div>
+      </div>
+      <div class="composer-questionnaire-toolbar">
+        <div class="composer-questionnaire-toolbar-stepper-label">1 of 1</div>
+        <div class="composer-questionnaire-toolbar-questions">
+          <div class="composer-questionnaire-toolbar-question composer-questionnaire-toolbar-question-active">
+            <div class="markdown-root"><p>Legacy toolbar question</p></div>
+          </div>
+        </div>
+      </div>
+    `);
+
+    assert.ok(state.questionnaire);
+    const [question] = state.questionnaire.questions;
+    assert.equal(question.text, 'New tray question');
+  });
+
   it('keeps buildSelectorPath selectors for legacy questionnaire actions', () => {
     const state = withDom(`
       <main id="root"></main>

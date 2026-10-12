@@ -82,7 +82,12 @@ export interface QuestionnaireOption {
   label: string;
   isFreeform: boolean;
   selectorPath: string;
-  /** For freeform ("Other") rows: the text field revealed after selecting. */
+  /**
+   * For freeform ("Other") rows: a selector used to reach the inline answer
+   * editor. Cursor mounts that editor INSIDE the option row only after the row
+   * is clicked, so this is the stable OPTION ROW path; the executor resolves
+   * the text editor inside it at submit time.
+   */
   freeformInputSelectorPath?: string;
 }
 
