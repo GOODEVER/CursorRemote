@@ -343,35 +343,13 @@ describe('action click target resolution', () => {
     assert.equal(evaluateCalled, false);
   });
 
-  it('openFolderAgent opens a composer via the workbench command service', async () => {
+  it('openFolderAgent clicks the agent row first (reliable switch for existing agents)', async () => {
     const evaluations: string[] = [];
     const fakeClient = {
       isConnected: () => true,
       evaluate: async (expr: string) => {
         evaluations.push(expr);
-        return { ok: true };
-      },
-    } as unknown as CdpClient;
-    const executor = new CommandExecutor({} as SelectorConfig);
-    executor.setClient(fakeClient);
-
-    const result = await executor.openFolderAgent('cmd-open', 'composer-xyz', 'My agent');
-
-    assert.equal(result.ok, true);
-    assert.equal(evaluations.length, 1, 'should execute exactly one command-service call');
-    assert.match(evaluations[0], /composer\.openComposer/);
-    assert.match(evaluations[0], /composer-xyz/);
-    assert.match(evaluations[0], /__getCommandService/);
-  });
-
-  it('openFolderAgent falls back to a row click when the command service is unavailable', async () => {
-    const evaluations: string[] = [];
-    const fakeClient = {
-      isConnected: () => true,
-      evaluate: async (expr: string) => {
-        evaluations.push(expr);
-        // First call: command service lookup fails. Second: row click succeeds.
-        if (expr.includes('__getCommandService')) return { ok: false, error: 'command service not found' };
+        // Row click succeeds.
         return true;
       },
     } as unknown as CdpClient;
@@ -381,8 +359,34 @@ describe('action click target resolution', () => {
     const result = await executor.openFolderAgent('cmd-open', 'composer-xyz', 'My agent');
 
     assert.equal(result.ok, true);
-    assert.equal(evaluations.length, 2, 'command attempt then DOM fallback');
-    assert.match(evaluations[1], /glass-sidebar-agent-list-container/);
+    assert.equal(evaluations.length, 1, 'should stop at the successful row click');
+    assert.match(evaluations[0], /glass-sidebar-agent-list-container/);
+    // The row click must match by composer id (React fiber agentId).
+    assert.match(evaluations[0], /agentId/);
+    assert.match(evaluations[0], /composer-xyz/);
+  });
+
+  it('openFolderAgent falls back to the workbench command service when no row matches', async () => {
+    const evaluations: string[] = [];
+    const fakeClient = {
+      isConnected: () => true,
+      evaluate: async (expr: string) => {
+        evaluations.push(expr);
+        // First call: no matching row. Second: command service succeeds.
+        if (expr.includes('glass-sidebar-agent-list-container')) return false;
+        return { ok: true };
+      },
+    } as unknown as CdpClient;
+    const executor = new CommandExecutor({} as SelectorConfig);
+    executor.setClient(fakeClient);
+
+    const result = await executor.openFolderAgent('cmd-open', 'composer-xyz', 'My agent');
+
+    assert.equal(result.ok, true);
+    assert.equal(evaluations.length, 2, 'row click attempt then command fallback');
+    assert.match(evaluations[1], /__getCommandService/);
+    assert.match(evaluations[1], /composer\.openComposer/);
+    assert.match(evaluations[1], /composer-xyz/);
   });
 
   it('openFolderAgent resolves by title when no composerId is supplied', async () => {

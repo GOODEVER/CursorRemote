@@ -742,11 +742,11 @@ export class CommandExecutor {
 
   /**
    * Open/switch the workspace window to a specific agent chat by its composer
-   * id. Uses the workbench CommandService reachable from the renderer
-   * (`composer.openComposer`, <composerId>), which reliably switches the open
-   * chat even when the target agent belongs to a different workspace/folder.
-   * Falls back to clicking the folder-tree row by title when no composer id is
-   * available or the command fails.
+   * id. Clicking the agent's sidebar row is the reliable path: it switches the
+   * open chat even for existing agents that already have history. The workbench
+   * `composer.openComposer` command is only a fallback — from the renderer it
+   * can resolve successfully while silently doing nothing (observed live:
+   * returns ok:true but leaves the previously open composer active).
    */
   async openFolderAgent(
     commandId: string,
@@ -756,6 +756,16 @@ export class CommandExecutor {
   ): Promise<CommandResult> {
     return this.withRetry(commandId, async (client) => {
       const target = (composerId ?? '').trim();
+
+      // Preferred: click the matching sidebar row (by composer id, then title,
+      // then selector path). This is what actually switches existing agents.
+      const clicked = await this.clickFolderAgentRow(client, target, tabTitle, selectorPath);
+      if (clicked) {
+        console.log(`[command-executor] Opened composer via row click: ${tabTitle ?? target}`);
+        return;
+      }
+
+      // Fallback: ask the workbench command service to open it by id.
       if (target) {
         const result = await client.evaluate(`
           (() => {
@@ -778,47 +788,86 @@ export class CommandExecutor {
           console.log(`[command-executor] Opened composer via command: ${target.substring(0, 8)}`);
           return;
         }
-        console.warn(`[command-executor] composer.openComposer failed (${result?.error}); falling back to DOM click`);
+        console.warn(`[command-executor] composer.openComposer failed (${result?.error})`);
       }
 
-      // Fallback: click the matching row (works when the overview window DOM is
-      // the client target, e.g. no composer id was extracted for the row).
-      const clicked = await this.clickFolderAgentRow(client, tabTitle, selectorPath);
-      if (!clicked) {
-        throw new Error(`Agent not found: ${tabTitle ?? composerId ?? '(unknown)'}`);
-      }
-      console.log(`[command-executor] Opened composer via row click: ${tabTitle ?? composerId}`);
+      throw new Error(`Agent not found: ${tabTitle ?? composerId ?? '(unknown)'}`);
     });
   }
 
-  /** Click the agent sidebar row whose title (or selector path) matches. */
+  /**
+   * Click the agent sidebar row matching by composer id (React fiber `agentId`),
+   * then by exact title, then by selector path. Returns whether a row was
+   * clicked.
+   */
   private async clickFolderAgentRow(
     client: CdpClient,
+    composerId?: string,
     tabTitle?: string,
     selectorPath?: string
   ): Promise<boolean> {
     return await client.evaluate(`
       (() => {
+        const wantId = ${JSON.stringify((composerId ?? '').trim())};
         const title = ${JSON.stringify((tabTitle ?? '').trim())};
         const selectorPath = ${JSON.stringify(selectorPath ?? '')};
+        const norm = (s) => (s || '').trim().replace(/\\s+/g, ' ').toLowerCase();
+        const wantTitle = norm(title);
+
+        const agentIdFromRow = (li) => {
+          const attrId = li.getAttribute('data-composer-id')
+            || li.querySelector('[data-composer-id]')?.getAttribute('data-composer-id')
+            || '';
+          if (attrId) return attrId;
+          try {
+            const fiberKey = Object.keys(li).find((k) => k.startsWith('__reactFiber$'));
+            let fiber = fiberKey ? li[fiberKey] : null;
+            let depth = 0;
+            while (fiber && depth < 20) {
+              const p = fiber.memoizedProps;
+              if (p && typeof p.agentId === 'string' && p.agentId) return p.agentId;
+              fiber = fiber.return || null;
+              depth++;
+            }
+          } catch {}
+          return '';
+        };
+
+        const rowLabel = (li) => {
+          const el = li.querySelector('.ui-sidebar-menu-button-label');
+          return norm(el ? el.textContent : li.textContent);
+        };
+
+        const clickRow = (li) => {
+          const btn = li.querySelector('.ui-sidebar-menu-button')
+            || li.querySelector('[data-sidebar-menu-button]')
+            || li.querySelector('[role="button"]')
+            || li;
+          btn.scrollIntoView({ block: 'center', behavior: 'instant' });
+          btn.click();
+          return true;
+        };
+
+        const rows = Array.from(document.querySelectorAll('.glass-sidebar-agent-list-container li.ui-sidebar-menu-item'));
+
+        // 1) Match by composer id.
+        if (wantId) {
+          for (const li of rows) {
+            if (agentIdFromRow(li) === wantId) return clickRow(li);
+          }
+        }
+        // 2) Match by exact title.
+        if (wantTitle) {
+          for (const li of rows) {
+            if (rowLabel(li) === wantTitle) return clickRow(li);
+          }
+        }
+        // 3) Match by selector path.
         if (selectorPath) {
           try {
             const el = document.querySelector(selectorPath.split('>')[0].trim());
-            if (el) { el.scrollIntoView({ block: 'center', behavior: 'instant' }); (el.querySelector('[data-sidebar-menu-button], .ui-sidebar-menu-button') || el).click(); return true; }
+            if (el) return clickRow(el);
           } catch {}
-        }
-        if (!title) return false;
-        const norm = (s) => (s || '').trim().replace(/\\s+/g, ' ').toLowerCase();
-        const want = norm(title);
-        const rows = Array.from(document.querySelectorAll('.glass-sidebar-agent-list-container li.ui-sidebar-menu-item'));
-        for (const li of rows) {
-          const labelEl = li.querySelector('.ui-sidebar-menu-button-label');
-          if (norm(labelEl ? labelEl.textContent : li.textContent) === want) {
-            const btn = li.querySelector('.ui-sidebar-menu-button') || li.querySelector('[data-sidebar-menu-button]') || li;
-            btn.scrollIntoView({ block: 'center', behavior: 'instant' });
-            btn.click();
-            return true;
-          }
         }
         return false;
       })()
