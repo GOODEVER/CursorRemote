@@ -147,19 +147,47 @@
   // Composer we are expecting a history payload for / last asked the server for.
   let pendingHistoryComposerId = '';
   let lastRequestedHistoryComposerId = '';
+  // Composer the user explicitly picked (folder agent / tab). While set, the
+  // automatic "load the composer Cursor is showing" logic must NOT fire, or the
+  // stale `state.activeComposerId` (the server's DOM hasn't switched yet)
+  // instantly re-requests the previous chat and yanks the user back — the
+  // "switching folders instantly switches back" bug. Cleared once the server's
+  // active composer catches up to the selection.
+  let pinnedComposerId = '';
+  // Safety release: if the server never reports the pinned composer as active
+  // (e.g. it lives in another window), stop blocking auto-history after a while.
+  let pinnedComposerTimer = null;
+  const PINNED_COMPOSER_TIMEOUT_MS = 8000;
 
   function isNearMessagesBottom() {
     const threshold = 80;
     return $messages.scrollTop + $messages.clientHeight >= $messages.scrollHeight - threshold;
   }
 
-  function scheduleMessagesAutoScroll() {
+  // Scroll the transcript to the bottom, and keep it there while content grows.
+  // The synchronous apply matters: requestAnimationFrame does NOT run in a
+  // backgrounded tab, so a purely rAF-based scroll never happens while the user
+  // is away and they return to a view stuck at the top. We scroll immediately
+  // (layout is already up to date after the render), then re-pin on the next
+  // couple of frames to catch async content (HTML bodies, images, reflow).
+  function pinMessagesToBottom() {
     const jobId = ++autoScrollJob;
-    requestAnimationFrame(() => {
+    const apply = () => {
       if (jobId !== autoScrollJob) return;
       if (userScrolledUp) return;
-      $messages.scrollTop = $messages.scrollHeight;
-    });
+      if ($messages.scrollTop !== $messages.scrollHeight) {
+        $messages.scrollTop = $messages.scrollHeight;
+      }
+    };
+    apply();
+    requestAnimationFrame(() => { apply(); requestAnimationFrame(apply); });
+    // Timers run even when the tab is backgrounded (unlike rAF), and catch
+    // async content growth (HTML bodies, images) that lands after the frames.
+    for (const delay of [60, 250, 700]) setTimeout(apply, delay);
+  }
+
+  function scheduleMessagesAutoScroll() {
+    pinMessagesToBottom();
   }
 
   const $messages = document.getElementById('messages');
@@ -294,6 +322,7 @@
   socket.on('state:full', (newState) => {
     state = { ...defaultState, ...newState };
     homeQuestionnaire = newState.questionnaire || null;
+    noteActiveComposerChange(state.activeComposerId);
     recomputeQuestionnaire();
     renderAll();
   });
@@ -301,6 +330,7 @@
   socket.on('state:patch', (patch) => {
     Object.assign(state, patch);
     if ('questionnaire' in patch) homeQuestionnaire = patch.questionnaire || null;
+    if ('activeComposerId' in patch) noteActiveComposerChange(patch.activeComposerId);
     recomputeQuestionnaire();
     renderAll();
   });
@@ -313,6 +343,9 @@
     if (payload.composerId && pendingHistoryComposerId && payload.composerId !== pendingHistoryComposerId) return;
     fullHistory = { composerId: payload.composerId || '', messages: payload.messages };
     pendingHistoryComposerId = '';
+    // A freshly loaded transcript is (re)rendered from scratch — land on the
+    // newest message rather than wherever the previous chat was scrolled.
+    resetScrollForNewTranscript();
     renderAll();
   });
 
@@ -351,9 +384,21 @@
     if (!result.ok) showToast(result.error || 'Command failed', 'error');
   });
 
+  // Only treat a scroll as "the user scrolled away" when they are actually not
+  // near the bottom. Programmatic auto-scrolls also emit scroll events, so we
+  // must NOT bump the job counter here — doing so cancelled our own async
+  // re-pins and stranded the view part-way up a freshly grown transcript.
   $messages.addEventListener('scroll', () => {
-    autoScrollJob++;
     userScrolledUp = !isNearMessagesBottom();
+  });
+
+  // Returning to the tab: rAF was suspended while hidden, so re-pin to the
+  // bottom if the user hadn't deliberately scrolled away.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && !userScrolledUp) pinMessagesToBottom();
+  });
+  window.addEventListener('focus', () => {
+    if (!userScrolledUp) pinMessagesToBottom();
   });
 
   $input.addEventListener('input', () => {
@@ -517,7 +562,23 @@
    * rendered transcript by renderMessages().
    */
   function maybeRequestHistory() {
-    const composerId = state.activeComposerId || '';
+    const activeId = state.activeComposerId || '';
+
+    // A user selection is pending: wait for the server's active composer to
+    // catch up to it, then release the pin. Until then, ignore the stale
+    // activeComposerId so it can't override the chosen chat.
+    if (pinnedComposerId) {
+      if (activeId === pinnedComposerId) {
+        pinnedComposerId = '';
+        if (fullHistory.composerId === activeId) return;
+        if (pendingHistoryComposerId === activeId) return;
+        if (lastRequestedHistoryComposerId === activeId) return;
+        requestHistory(activeId);
+      }
+      return;
+    }
+
+    const composerId = activeId;
     if (!composerId) return;
     if (fullHistory.composerId === composerId) return;
     if (pendingHistoryComposerId === composerId) return;
@@ -530,6 +591,60 @@
     if (fullHistory.composerId === composerId) return; // already loaded
     // Clear any previous composer's transcript so we never show the wrong chat
     // while the new one loads.
+    fullHistory = { composerId: '', messages: [] };
+    pendingHistoryComposerId = composerId;
+    lastRequestedHistoryComposerId = composerId;
+    socket.emit('request:history', { composerId });
+  }
+
+  /**
+   * Switching chats should always land at the newest message. `userScrolledUp`
+   * is global and would otherwise persist from the previous chat (or from a
+   * deliberate scroll-up) and leave the fresh transcript pinned at its top.
+   */
+  // Remember which composer the transcript belongs to so a host-side switch
+  // (or the pinned-selection catching up on the server) also lands at the
+  // bottom instead of wherever the previous chat was scrolled.
+  let lastActiveComposerId = '';
+
+  function resetScrollForNewTranscript() {
+    userScrolledUp = false;
+    autoScrollJob++;
+    lastActiveComposerId = state.activeComposerId || '';
+    pinMessagesToBottom();
+  }
+
+  function noteActiveComposerChange(composerId) {
+    const next = composerId || '';
+    if (!lastActiveComposerId) { lastActiveComposerId = next; return; }
+    if (next !== lastActiveComposerId) {
+      lastActiveComposerId = next;
+      // A different chat is now open; drop the previous chat's scroll state so
+      // the new transcript renders at the newest message.
+      userScrolledUp = false;
+    }
+  }
+
+  /**
+   * Explicitly select a composer (folder agent / tab tap). Loads its transcript
+   * immediately and PINS it so the automatic "follow Cursor's active composer"
+   * logic can't immediately switch back to the previously-open chat while the
+   * server's DOM catches up.
+   */
+  function selectComposer(composerId) {
+    if (!composerId) return;
+    resetScrollForNewTranscript();
+    pinnedComposerId = composerId;
+    if (pinnedComposerTimer) clearTimeout(pinnedComposerTimer);
+    pinnedComposerTimer = setTimeout(() => {
+      pinnedComposerTimer = null;
+      pinnedComposerId = '';
+      // Consume whatever the server still reports as active so the next render
+      // doesn't immediately re-request the previous (stale) chat and yank the
+      // user back. A genuine later change still triggers a fresh load.
+      lastRequestedHistoryComposerId = state.activeComposerId || '';
+    }, PINNED_COMPOSER_TIMEOUT_MS);
+    // Bypass the "already loaded" guard: the user may re-pick the same chat.
     fullHistory = { composerId: '', messages: [] };
     pendingHistoryComposerId = composerId;
     lastRequestedHistoryComposerId = composerId;
@@ -589,6 +704,9 @@
       tabTitle: target.title,
       selectorPath: target.selectorPath,
     });
+    // Pin the target too: without it, the stale activeComposerId would request
+    // the previous chat and override the auto-opened one.
+    selectComposer(target.composerId);
 
     if (autoOpenTimer) clearTimeout(autoOpenTimer);
     autoOpenTimer = setTimeout(() => {
@@ -2354,7 +2472,7 @@
             selectorPath: tab.selectorPath,
             composerId: tab.composerId,
           });
-          requestHistory(tab.composerId);
+          selectComposer(tab.composerId);
         });
         $tabList.appendChild(btn);
       }
@@ -2719,7 +2837,7 @@
               tabTitle: agent.title,
               selectorPath: agent.selectorPath,
             });
-            requestHistory(agent.composerId);
+            selectComposer(agent.composerId);
             showToast(`Opening ${agent.title}...`, 'success');
             closeSheet();
           });

@@ -470,6 +470,61 @@ describe('web: folders drawer', () => {
     assert.equal(evt!.payload.tabTitle, 'Roblox factory game design');
     assert.equal(evt!.payload.type, 'open_folder_agent');
   });
+
+  it('does not switch back to the previous chat when a folder agent is picked', () => {
+    // Regression: tapping a folder agent loaded its history, then the very next
+    // render re-requested the stale `state.activeComposerId` (the server's DOM
+    // had not switched yet), yanking the user straight back.
+    const state = stateWithFolders();
+    state.activeComposerId = 'composer-old';
+    state.folders[0].agents[0].composerId = 'composer-new';
+    fireFullState(env.mockSocket, state);
+
+    // Drain any history requests made during the initial render.
+    env.mockSocket.sent.length = 0;
+
+    env.document.getElementById('btn-folders')!.click();
+    const list = env.document.getElementById('sheet-folders-list')!;
+    const agentBtn = list.querySelector('.folder-agent') as HTMLButtonElement;
+    agentBtn.click();
+
+    const requested = env.mockSocket.sent
+      .filter(s => s.event === 'request:history')
+      .map(s => s.payload.composerId);
+    assert.ok(requested.includes('composer-new'), 'should request the picked chat');
+    assert.ok(!requested.includes('composer-old'), 'must not request the previous chat');
+
+    // Even after a poll carrying the stale active composer, no switch-back.
+    env.mockSocket.sent.length = 0;
+    firePatch(env.mockSocket, { activeComposerId: 'composer-old' });
+    const after = env.mockSocket.sent.filter(s => s.event === 'request:history');
+    assert.equal(after.length, 0, 'stale active composer must not override the selection');
+  });
+
+  it('follows the server composer again once it catches up to the selection', () => {
+    const state = stateWithFolders();
+    state.activeComposerId = 'composer-old';
+    state.folders[0].agents[0].composerId = 'composer-new';
+    fireFullState(env.mockSocket, state);
+
+    env.document.getElementById('btn-folders')!.click();
+    const agentBtn = env.document.getElementById('sheet-folders-list')!.querySelector('.folder-agent') as HTMLButtonElement;
+    agentBtn.click();
+    env.mockSocket.sent.length = 0;
+
+    // Server catches up: active composer is now the picked one.
+    firePatch(env.mockSocket, { activeComposerId: 'composer-new' });
+
+    // No duplicate request (already loaded), and the pin is released.
+    const reqs = env.mockSocket.sent.filter(s => s.event === 'request:history');
+    assert.equal(reqs.length, 0, 'no redundant request once the server agrees');
+
+    // A genuine later switch still loads.
+    firePatch(env.mockSocket, { activeComposerId: 'composer-other' });
+    const later = env.mockSocket.sent.filter(s => s.event === 'request:history').pop();
+    assert.ok(later, 'a later composer change should still load');
+    assert.equal(later!.payload.composerId, 'composer-other');
+  });
 });
 
 // ─── Auto-open chat on load ───
@@ -1110,5 +1165,87 @@ describe('web: full history', () => {
     const els = env.document.querySelectorAll('#messages .chat-el');
     assert.equal(els.length, 1);
     assert.equal(els[0].getAttribute('data-id'), 'a-tail');
+  });
+});
+
+// ─── Transcript scroll position ───
+
+describe('web: transcript scroll', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+    // jsdom does not lay out, so fake a scrollable transcript: content is much
+    // taller than the viewport, and setting scrollTop is reflected in reads.
+    const msgs = env.document.getElementById('messages')! as unknown as HTMLElement & {
+      scrollHeight: number; clientHeight: number;
+    };
+    let top = 0;
+    Object.defineProperty(msgs, 'scrollHeight', { get: () => 4000, configurable: true });
+    Object.defineProperty(msgs, 'clientHeight', { get: () => 800, configurable: true });
+    Object.defineProperty(msgs, 'scrollTop', {
+      get: () => top,
+      // Browsers clamp scrollTop to [0, scrollHeight - clientHeight]; jsdom
+      // does not, so clamp here to model real scrolling behavior.
+      set: (v: number) => { top = Math.max(0, Math.min(v, 4000 - 800)); },
+      configurable: true,
+    });
+  });
+
+  function h(id: string, text: string) {
+    return { type: 'human', id, flatIndex: 0, text, mentions: [] };
+  }
+
+  function scrollableState(messages: unknown[], activeComposerId = 'comp-1'): CursorState {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    return {
+      ...fixture[0].state!,
+      connected: true,
+      messages: messages as CursorState['messages'],
+      activeComposerId,
+      chatTabs: [],
+      folders: [],
+    };
+  }
+
+  function bottomTop(): number {
+    const msgs = env.document.getElementById('messages')!;
+    return msgs.scrollHeight - msgs.clientHeight;
+  }
+
+  it('scrolls to the newest message after loading a fresh transcript', () => {
+    fireFullState(env.mockSocket, scrollableState([h('h1', 'old')], 'comp-1'));
+    const msgs = env.document.getElementById('messages')!;
+    // Long history arrives → transcript is (re)rendered from scratch.
+    fireHistory(env.mockSocket, {
+      composerId: 'comp-1',
+      messages: [h('h1', 'first'), h('h2', 'second'), h('h3', 'third')],
+    });
+    assert.equal(msgs.scrollTop, bottomTop(), 'should land at the bottom, not the top');
+  });
+
+  it('re-pins to the bottom after switching away and back', () => {
+    fireFullState(env.mockSocket, scrollableState([h('h1', 'old')], 'comp-1'));
+    const msgs = env.document.getElementById('messages')!;
+    msgs.scrollTop = 0;
+
+    // Server switches to a different composer (host-side) → new transcript.
+    firePatch(env.mockSocket, { activeComposerId: 'comp-2' });
+    assert.equal(msgs.scrollTop, bottomTop(), 'a host-side switch should re-pin to the bottom');
+  });
+
+  it('does not yank the user down after they scroll up to read', () => {
+    fireFullState(env.mockSocket, scrollableState([h('h1', 'old')], 'comp-1'));
+    const msgs = env.document.getElementById('messages')!;
+
+    // User scrolls up: the scroll handler flips userScrolledUp.
+    msgs.scrollTop = 0;
+    msgs.dispatchEvent(new (env.window as any).Event('scroll'));
+
+    // A streaming update arrives (same composer) — must not force them down.
+    firePatch(env.mockSocket, {
+      messages: [h('h1', 'old'), h('h2', 'streaming')] as CursorState['messages'],
+    });
+    assert.equal(msgs.scrollTop, 0, 'deliberate scroll position must be respected');
   });
 });
