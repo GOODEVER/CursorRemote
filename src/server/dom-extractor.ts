@@ -1812,31 +1812,74 @@ export function extractionFunction(
       orphanIndicators: _orphanIndicators,
     };
 
-    const queueItems: { id: string; text: string }[] = [];
+    // Queued (not-yet-sent) messages in the composer toolbar. Cursor renders
+    // each row as `.composer-toolbar-queue-item` (query in `data-queue-item-query`)
+    // with `[data-queue-action="send"|"steer"]` (Send now), `[data-queue-action="edit"]`
+    // and `[data-queue-action="remove"]` controls. The section lives in
+    // `#composer-toolbar-section`, whose header label reads "N Queued".
+    const queueItems: {
+      id: string;
+      text: string;
+      sendSelectorPath?: string;
+      removeSelectorPath?: string;
+    }[] = [];
     let queueLabel: string | undefined;
     const toolbarSection = document.querySelector('#composer-toolbar-section');
     if (toolbarSection) {
-      for (const lc of Array.from(toolbarSection.querySelectorAll('.opacity-80'))) {
-        const lt = (lc.textContent || '').trim();
-        if (lt && /queued/i.test(lt)) {
-          queueLabel = lt;
-          break;
-        }
-      }
+      const headerLabel = toolbarSection.querySelector('.composer-toolbar-section-header-label');
+      const headerText = (headerLabel?.textContent || '').trim();
+      if (headerText) queueLabel = headerText;
       if (!queueLabel) {
-        const fb = toolbarSection.querySelector('.group .opacity-80');
-        const t0 = (fb?.textContent || '').trim();
-        if (t0) queueLabel = t0;
-      }
-      for (const item of Array.from(toolbarSection.querySelectorAll('.composer-toolbar-queue-item'))) {
-        const qid = item.getAttribute('data-queue-item-id') || '';
-        let qtext = (item.getAttribute('data-queue-item-query') || '').trim();
-        if (!qtext) {
-          const ro = item.querySelector('.aislash-editor-input-readonly');
-          qtext = (ro?.textContent || '').trim();
+        for (const lc of Array.from(toolbarSection.querySelectorAll('*'))) {
+          const lt = (lc.textContent || '').trim();
+          if (lt && /queued/i.test(lt)) {
+            queueLabel = lt;
+            break;
+          }
         }
-        if (qid || qtext) queueItems.push({ id: qid || `qi-${queueItems.length}`, text: qtext });
       }
+    }
+    // Fall back to a global row query: the toolbar section may be unmounted
+    // while the rows remain (or live outside it) during transitions.
+    const queueRows = toolbarSection
+      ? Array.from(toolbarSection.querySelectorAll('.composer-toolbar-queue-item'))
+      : Array.from(document.querySelectorAll('.composer-toolbar-queue-item'));
+    for (const item of queueRows) {
+      const qid = item.getAttribute('data-queue-item-id') || '';
+      let qtext = (item.getAttribute('data-queue-item-query') || '').trim();
+      if (!qtext) {
+        const ro = item.querySelector('.aislash-editor-input-readonly');
+        qtext = (ro?.textContent || '').trim();
+      }
+      const row: {
+        id: string;
+        text: string;
+        sendSelectorPath?: string;
+        removeSelectorPath?: string;
+      } = { id: qid || `qi-${queueItems.length}`, text: qtext };
+      // Anchored selectors keyed on Cursor's own stable attributes
+      // (`data-queue-item-id`, `data-queue-action`) rather than the brittle
+      // body-down nth-of-type chain buildSelectorPath produces — those go stale
+      // between the poll that emitted them and the tap that clicks them. Cursor
+      // puts the click handler on the inner `.anysphere-icon-button`; the
+      // `data-queue-action` div is only a wrapper, so target the button but
+      // anchor it via the row+action attributes (which survive re-mounts).
+      const sendWrap = item.querySelector('[data-queue-action="send"], [data-queue-action="steer"]');
+      const sendBtn = sendWrap?.querySelector('.anysphere-icon-button') ?? sendWrap;
+      if (sendBtn) {
+        const action = sendWrap?.getAttribute('data-queue-action') ?? '';
+        row.sendSelectorPath = qid && (action === 'send' || action === 'steer')
+          ? `[data-queue-item-id="${CSS.escape(qid)}"] [data-queue-action="${action}"] .anysphere-icon-button`
+          : buildSelectorPath(sendBtn);
+      }
+      const removeWrap = item.querySelector('[data-queue-action="remove"]');
+      const removeBtn = removeWrap?.querySelector('.anysphere-icon-button') ?? removeWrap;
+      if (removeBtn) {
+        row.removeSelectorPath = qid
+          ? `[data-queue-item-id="${CSS.escape(qid)}"] [data-queue-action="remove"] .anysphere-icon-button`
+          : buildSelectorPath(removeBtn);
+      }
+      if (qid || qtext) queueItems.push(row);
     }
 
     // --- Questionnaire widget ---

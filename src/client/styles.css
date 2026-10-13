@@ -1111,6 +1111,48 @@ header {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
+  flex: 1;
+  min-width: 0;
+}
+
+.composer-queue-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.composer-queue-action {
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.composer-queue-action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.composer-queue-send:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--text-tertiary);
+}
+
+.composer-queue-remove {
+  padding: 4px 7px;
+  font-size: 12px;
+}
+
+.composer-queue-remove:hover:not(:disabled) {
+  color: #ff6b6b;
+  border-color: #ff6b6b;
 }
 
 /* --- Standalone todo list card --- */

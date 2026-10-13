@@ -873,6 +873,47 @@
       tx.textContent = it.text || '';
       row.appendChild(dot);
       row.appendChild(tx);
+
+      const actions = document.createElement('div');
+      actions.className = 'composer-queue-actions';
+
+      const send = document.createElement('button');
+      send.className = 'composer-queue-action composer-queue-send';
+      send.type = 'button';
+      send.textContent = 'Send now';
+      send.title = 'Send now';
+      send.disabled = !it.sendSelectorPath;
+      send.addEventListener('click', () => {
+        if (!it.sendSelectorPath) return;
+        // No actionLabel: these controls are icon-only, so click the selector
+        // directly rather than routing through the label resolver.
+        socket.emit('command:click_action', {
+          commandId: newCommandId(),
+          type: 'click_action',
+          selectorPath: it.sendSelectorPath,
+        });
+        showToast('Sending queued message…', 'success');
+      });
+      actions.appendChild(send);
+
+      const remove = document.createElement('button');
+      remove.className = 'composer-queue-action composer-queue-remove';
+      remove.type = 'button';
+      remove.textContent = '✕';
+      remove.title = 'Remove from queue';
+      remove.setAttribute('aria-label', 'Remove from queue');
+      remove.disabled = !it.removeSelectorPath;
+      remove.addEventListener('click', () => {
+        if (!it.removeSelectorPath) return;
+        socket.emit('command:click_action', {
+          commandId: newCommandId(),
+          type: 'click_action',
+          selectorPath: it.removeSelectorPath,
+        });
+      });
+      actions.appendChild(remove);
+
+      row.appendChild(actions);
       itemsEl.appendChild(row);
     });
   }

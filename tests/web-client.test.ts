@@ -1249,3 +1249,83 @@ describe('web: transcript scroll', () => {
     assert.equal(msgs.scrollTop, 0, 'deliberate scroll position must be respected');
   });
 });
+
+// ─── Composer (queued messages) ───
+
+describe('web: composer queue', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  function queueState(items: unknown[], queueLabel?: string): CursorState {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    return {
+      ...fixture[0].state!,
+      connected: true,
+      messages: [],
+      chatTabs: [],
+      folders: [],
+      composerQueue: { items: items as any, ...(queueLabel ? { queueLabel } : {}) },
+    };
+  }
+
+  it('shows queued messages with their text', () => {
+    fireFullState(env.mockSocket, queueState([
+      { id: 'q1', text: 'first queued message', sendSelectorPath: '#send-1', removeSelectorPath: '#rm-1' },
+      { id: 'q2', text: 'second queued message', sendSelectorPath: '#send-2', removeSelectorPath: '#rm-2' },
+    ], '2 Queued'));
+
+    const bar = env.document.getElementById('composer-queue-bar')!;
+    assert.ok(!bar.classList.contains('hidden'), 'queue bar should be visible');
+    const rows = bar.querySelectorAll('.composer-queue-row');
+    assert.equal(rows.length, 2, 'both queued messages rendered');
+    assert.match(bar.textContent!, /first queued message/);
+    assert.match(bar.textContent!, /second queued message/);
+    assert.match(env.document.getElementById('composer-queue-label')!.textContent!, /2 Queued/);
+  });
+
+  it('hides the queue bar when there are no queued messages', () => {
+    fireFullState(env.mockSocket, queueState([]));
+    const bar = env.document.getElementById('composer-queue-bar')!;
+    assert.ok(bar.classList.contains('hidden'), 'queue bar hidden when empty');
+  });
+
+  it('emits click_action with the row\'s send selector when Send now is tapped', () => {
+    fireFullState(env.mockSocket, queueState([
+      { id: 'q1', text: 'hi', sendSelectorPath: '#send-1', removeSelectorPath: '#rm-1' },
+    ]));
+    env.mockSocket.sent.length = 0;
+
+    const sendBtn = env.document.querySelector('.composer-queue-send') as HTMLButtonElement;
+    assert.ok(sendBtn, 'Send now button should render');
+    assert.equal(sendBtn.textContent, 'Send now');
+    sendBtn.click();
+
+    const evt = env.mockSocket.sent.filter(s => s.event === 'command:click_action').pop();
+    assert.ok(evt, 'click_action should be emitted');
+    assert.equal(evt!.payload.selectorPath, '#send-1');
+  });
+
+  it('emits click_action with the row\'s remove selector when ✕ is tapped', () => {
+    fireFullState(env.mockSocket, queueState([
+      { id: 'q1', text: 'hi', sendSelectorPath: '#send-1', removeSelectorPath: '#rm-1' },
+    ]));
+    env.mockSocket.sent.length = 0;
+
+    const removeBtn = env.document.querySelector('.composer-queue-remove') as HTMLButtonElement;
+    assert.ok(removeBtn, 'remove button should render');
+    removeBtn.click();
+
+    const evt = env.mockSocket.sent.filter(s => s.event === 'command:click_action').pop();
+    assert.ok(evt, 'click_action should be emitted');
+    assert.equal(evt!.payload.selectorPath, '#rm-1');
+  });
+
+  it('disables the send button when the row exposes no send selector', () => {
+    fireFullState(env.mockSocket, queueState([{ id: 'q1', text: 'hi' }]));
+    const sendBtn = env.document.querySelector('.composer-queue-send') as HTMLButtonElement;
+    assert.ok(sendBtn.disabled, 'Send now disabled without a selector');
+  });
+});

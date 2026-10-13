@@ -69,6 +69,14 @@ export interface RawSignals {
 export interface ComposerQueueItem {
   id: string;
   text: string;
+  /**
+   * Anchored selector for this row's "Send now" control
+   * (`[data-queue-action="send"|"steer"]` inside the row), used by the web
+   * client to submit the message immediately without waiting for the queue.
+   */
+  sendSelectorPath?: string;
+  /** Anchored selector for this row's remove (✕) control. */
+  removeSelectorPath?: string;
 }
 
 export interface ComposerQueueState {
