@@ -1259,7 +1259,7 @@ describe('web: composer queue', () => {
     env = createTestEnv();
   });
 
-  function queueState(items: unknown[], queueLabel?: string): CursorState {
+  function queueState(items: unknown[], queueLabel?: string, kind?: 'tray' | 'toolbar'): CursorState {
     const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
     return {
       ...fixture[0].state!,
@@ -1267,7 +1267,11 @@ describe('web: composer queue', () => {
       messages: [],
       chatTabs: [],
       folders: [],
-      composerQueue: { items: items as any, ...(queueLabel ? { queueLabel } : {}) },
+      composerQueue: {
+        items: items as any,
+        ...(queueLabel ? { queueLabel } : {}),
+        ...(kind ? { kind } : {}),
+      },
     };
   }
 
@@ -1327,5 +1331,46 @@ describe('web: composer queue', () => {
     fireFullState(env.mockSocket, queueState([{ id: 'q1', text: 'hi' }]));
     const sendBtn = env.document.querySelector('.composer-queue-send') as HTMLButtonElement;
     assert.ok(sendBtn.disabled, 'Send now disabled without a selector');
+  });
+
+  it('renders tray-kind rows with enabled Send now / remove buttons', () => {
+    fireFullState(env.mockSocket, queueState([
+      { id: 'row-1', text: 'queued via tray' },
+    ], '1 Queued', 'tray'));
+
+    const sendBtn = env.document.querySelector('.composer-queue-send') as HTMLButtonElement;
+    const removeBtn = env.document.querySelector('.composer-queue-remove') as HTMLButtonElement;
+    assert.ok(sendBtn && !sendBtn.disabled, 'Send now enabled for tray rows');
+    assert.ok(removeBtn && !removeBtn.disabled, 'remove enabled for tray rows');
+  });
+
+  it('emits queue_action(remove) with the row id when a tray ✕ is tapped', () => {
+    fireFullState(env.mockSocket, queueState([
+      { id: 'row-42', text: 'hi from tray' },
+    ], '1 Queued', 'tray'));
+    env.mockSocket.sent.length = 0;
+
+    const removeBtn = env.document.querySelector('.composer-queue-remove') as HTMLButtonElement;
+    removeBtn.click();
+
+    const evt = env.mockSocket.sent.filter(s => s.event === 'command:queue_action').pop();
+    assert.ok(evt, 'queue_action should be emitted');
+    assert.equal(evt!.payload.queueItemId, 'row-42');
+    assert.equal(evt!.payload.queueAction, 'remove');
+  });
+
+  it('emits queue_action(send) with the row id when a tray Send now is tapped', () => {
+    fireFullState(env.mockSocket, queueState([
+      { id: 'row-7', text: 'hi from tray' },
+    ], '1 Queued', 'tray'));
+    env.mockSocket.sent.length = 0;
+
+    const sendBtn = env.document.querySelector('.composer-queue-send') as HTMLButtonElement;
+    sendBtn.click();
+
+    const evt = env.mockSocket.sent.filter(s => s.event === 'command:queue_action').pop();
+    assert.ok(evt, 'queue_action should be emitted');
+    assert.equal(evt!.payload.queueItemId, 'row-7');
+    assert.equal(evt!.payload.queueAction, 'send');
   });
 });

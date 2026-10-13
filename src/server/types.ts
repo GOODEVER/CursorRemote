@@ -73,16 +73,29 @@ export interface ComposerQueueItem {
    * Anchored selector for this row's "Send now" control
    * (`[data-queue-action="send"|"steer"]` inside the row), used by the web
    * client to submit the message immediately without waiting for the queue.
+   * Only present for the older toolbar shape; newer builds hover the row and
+   * target the action by id/action instead (see ComposerQueueState.kind).
    */
   sendSelectorPath?: string;
   /** Anchored selector for this row's remove (✕) control. */
   removeSelectorPath?: string;
 }
 
+/**
+ * Which of Cursor's two queue UIs is present, so the client knows how to act:
+ *  - 'tray': newer `.ui-tray--queued` rows whose action buttons mount only on
+ *    hover; the client asks the server to hover+click by row id and action.
+ *  - 'toolbar': older `#composer-toolbar-section` rows with stable per-row
+ *    selector paths the client can click directly.
+ */
+export type ComposerQueueKind = 'tray' | 'toolbar';
+
 export interface ComposerQueueState {
   items: ComposerQueueItem[];
   /** e.g. "2 Queued" from toolbar header */
   queueLabel?: string;
+  /** Which queue UI is present; defaults to the legacy 'toolbar' shape. */
+  kind?: ComposerQueueKind;
 }
 
 export interface QuestionnaireOption {
@@ -400,7 +413,10 @@ export interface SelectorConfig {
 
 export interface CommandPayload {
   commandId: string;
-  type: 'send_message' | 'send_prompt' | 'approve' | 'reject' | 'approve_all' | 'switch_tab' | 'open_folder_agent' | 'create_folder_agent' | 'new_chat' | 'set_mode' | 'set_model' | 'click_action' | 'get_plan_full' | 'get_plan_model_options' | 'set_plan_model' | 'get_slash_menu' | 'click_slash_command' | 'cancel_slash_menu' | 'set_answer_text' | 'stop_generation';
+  type: 'send_message' | 'send_prompt' | 'approve' | 'reject' | 'approve_all' | 'switch_tab' | 'open_folder_agent' | 'create_folder_agent' | 'new_chat' | 'set_mode' | 'set_model' | 'click_action' | 'queue_action' | 'get_plan_full' | 'get_plan_model_options' | 'set_plan_model' | 'get_slash_menu' | 'click_slash_command' | 'cancel_slash_menu' | 'set_answer_text' | 'stop_generation';
+  /** For 'queue_action': the queued row id and the action to run on it. */
+  queueItemId?: string;
+  queueAction?: 'send' | 'remove';
   text?: string;
   approvalId?: string;
   actionType?: string;

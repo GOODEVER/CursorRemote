@@ -1038,6 +1038,74 @@ export class CommandExecutor {
   }
 
   /**
+   * Act on a queued (not-yet-sent) message in the newer `.ui-tray--queued` UI.
+   * Its per-row buttons ("Send now" = `data-queue-action="steer"`, Edit,
+   * Remove) are mounted only while the row is hovered/focused, so they cannot
+   * be clicked via a static selector. We read the row's live viewport box,
+   * move the real mouse pointer onto it to reveal the buttons, re-read the
+   * button's box, then click it natively.
+   */
+  async queueRowAction(
+    commandId: string,
+    queueItemId: string,
+    action: 'send' | 'remove',
+  ): Promise<CommandResult> {
+    return this.withRetry(commandId, async (client) => {
+      // Match the row by attribute value inside the page (CSS.escape is not
+      // available in Node), so ids with quotes/brackets are handled safely.
+      const findRowJs = `
+        (() => {
+          const id = ${JSON.stringify(queueItemId)};
+          const all = document.querySelectorAll('[data-queue-item-id]');
+          for (const el of all) {
+            if (el.getAttribute('data-queue-item-id') === id) return el;
+          }
+          return null;
+        })()
+      `;
+      const rowBox = await client.evaluate(`
+        (() => {
+          const row = ${findRowJs};
+          if (!row) return null;
+          row.scrollIntoView({ block: 'center', behavior: 'instant' });
+          const r = row.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) return null;
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        })()
+      `) as { x: number; y: number } | null;
+      if (!rowBox) throw new Error(`Queue row not found: ${queueItemId}`);
+
+      // Reveal the hover-mounted action buttons.
+      await client.hoverAtCoords(rowBox.x, rowBox.y);
+      await sleep(120);
+
+      const wanted = action === 'send' ? ['steer', 'send'] : ['remove'];
+      const btnBox = await client.evaluate(`
+        (() => {
+          const row = ${findRowJs};
+          if (!row) return { error: 'row disappeared' };
+          const wanted = ${JSON.stringify(wanted)};
+          for (const a of wanted) {
+            const btn = row.querySelector('[data-queue-action="' + a + '"]');
+            if (!btn) continue;
+            const r = btn.getBoundingClientRect();
+            if (r.width === 0 && r.height === 0) continue;
+            return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+          }
+          const present = Array.from(row.querySelectorAll('[data-queue-action]')).map(b => b.getAttribute('data-queue-action'));
+          return { error: 'action button not revealed', present };
+        })()
+      `) as { x?: number; y?: number; error?: string; present?: string[] } | null;
+      if (!btnBox || btnBox.x === undefined || btnBox.y === undefined) {
+        throw new Error(btnBox?.error ?? `Queue action button not found (${action})`);
+      }
+
+      await client.clickAtCoords(btnBox.x, btnBox.y);
+      console.log(`[command-executor] Queue ${action}: row ${queueItemId.substring(0, 8)}`);
+    });
+  }
+
+  /**
    * Focus the composer and open the `/` slash-command tray, then read its rows.
    * Used to mirror Cursor's slash menu on the phone. The menu stays open in the
    * host composer; the client either picks a row (clickSlashCommand) or cancels

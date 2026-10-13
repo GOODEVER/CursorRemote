@@ -241,11 +241,18 @@ export class CdpClient extends EventEmitter {
    */
   async clickAtCoords(x: number, y: number): Promise<void> {
     await this.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x,
+      y,
+      buttons: 0,
+    });
+    await this.send('Input.dispatchMouseEvent', {
       type: 'mousePressed',
       x,
       y,
       button: 'left',
       clickCount: 1,
+      buttons: 1,
     });
     await this.send('Input.dispatchMouseEvent', {
       type: 'mouseReleased',
@@ -253,6 +260,21 @@ export class CdpClient extends EventEmitter {
       y,
       button: 'left',
       clickCount: 1,
+      buttons: 0,
+    });
+  }
+
+  /**
+   * Move the native mouse pointer to a viewport coordinate (no click).
+   * Needed to reveal hover-mounted controls (e.g. composer queue row actions)
+   * that React only renders for the hovered/focused row.
+   */
+  async hoverAtCoords(x: number, y: number): Promise<void> {
+    await this.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x,
+      y,
+      buttons: 0,
     });
   }
 

@@ -453,6 +453,7 @@ export class Relay {
           isCurrent: f.isCurrent,
           agents: f.agents.map((a) => a.title),
         })),
+        composerQueue: state.composerQueue,
         messageCount: state.messages.length,
         lastMessages: state.messages.slice(-3).map((m) => ({
           type: m.type,
@@ -866,6 +867,26 @@ export class Relay {
           payload.commandId,
           payload.selectorPath,
           payload.actionLabel
+        );
+        socket.emit('command:result', result);
+      });
+
+      // --- Queued-message actions (newer hover-mounted tray rows) ---
+      socket.on('command:queue_action', async (payload: CommandPayload) => {
+        if (!payload.commandId || !payload.queueItemId || !payload.queueAction) {
+          socket.emit('command:result', {
+            commandId: payload.commandId ?? 'unknown',
+            ok: false,
+            error: 'Missing commandId, queueItemId, or queueAction',
+          } satisfies CommandResult);
+          return;
+        }
+        console.log(`[relay] Command: queue_action (${payload.queueAction}) from ${socket.id}`);
+        await this.ensureHomeWindow(payload.windowId);
+        const result = await this.commandExecutor.queueRowAction(
+          payload.commandId,
+          payload.queueItemId,
+          payload.queueAction
         );
         socket.emit('command:result', result);
       });

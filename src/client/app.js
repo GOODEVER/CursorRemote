@@ -862,6 +862,10 @@
     }
     bar.classList.remove('hidden');
     labelEl.textContent = q.queueLabel || `${q.items.length} queued`;
+    // 'tray' = newer Cursor UI whose row buttons mount only on hover; the
+    // server reveals+clicks them by id+action. 'toolbar' = older UI with stable
+    // per-row selector paths we can click directly.
+    const isTray = q.kind === 'tray';
     itemsEl.innerHTML = '';
     q.items.forEach((it) => {
       const row = document.createElement('div');
@@ -877,21 +881,33 @@
       const actions = document.createElement('div');
       actions.className = 'composer-queue-actions';
 
+      const sendVia = (action) => {
+        if (isTray) {
+          socket.emit('command:queue_action', {
+            commandId: newCommandId(),
+            type: 'queue_action',
+            queueItemId: it.id,
+            queueAction: action,
+          });
+        } else {
+          const selectorPath = action === 'send' ? it.sendSelectorPath : it.removeSelectorPath;
+          if (!selectorPath) return;
+          socket.emit('command:click_action', {
+            commandId: newCommandId(),
+            type: 'click_action',
+            selectorPath,
+          });
+        }
+      };
+
       const send = document.createElement('button');
       send.className = 'composer-queue-action composer-queue-send';
       send.type = 'button';
       send.textContent = 'Send now';
       send.title = 'Send now';
-      send.disabled = !it.sendSelectorPath;
+      send.disabled = !isTray && !it.sendSelectorPath;
       send.addEventListener('click', () => {
-        if (!it.sendSelectorPath) return;
-        // No actionLabel: these controls are icon-only, so click the selector
-        // directly rather than routing through the label resolver.
-        socket.emit('command:click_action', {
-          commandId: newCommandId(),
-          type: 'click_action',
-          selectorPath: it.sendSelectorPath,
-        });
+        sendVia('send');
         showToast('Sending queued message…', 'success');
       });
       actions.appendChild(send);
@@ -902,14 +918,9 @@
       remove.textContent = '✕';
       remove.title = 'Remove from queue';
       remove.setAttribute('aria-label', 'Remove from queue');
-      remove.disabled = !it.removeSelectorPath;
+      remove.disabled = !isTray && !it.removeSelectorPath;
       remove.addEventListener('click', () => {
-        if (!it.removeSelectorPath) return;
-        socket.emit('command:click_action', {
-          commandId: newCommandId(),
-          type: 'click_action',
-          selectorPath: it.removeSelectorPath,
-        });
+        sendVia('remove');
       });
       actions.appendChild(remove);
 
