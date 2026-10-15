@@ -2100,6 +2100,66 @@ header {
 }
 .header-notify-btn:active { background: var(--bg-hover); border-radius: 10px; }
 
+/* --- Refresh / stall nudge --- */
+
+.header-refresh-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 16px;
+  line-height: 1;
+  padding: 4px 6px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  min-width: 44px;
+  min-height: 44px;
+}
+.header-refresh-btn.hidden { display: none; }
+.header-refresh-btn:active { background: var(--bg-hover); border-radius: 10px; }
+/* Spin while a forced re-read is in flight so the tap feels acknowledged. */
+.header-refresh-btn.refreshing #refresh-icon { animation: refreshSpin 0.8s linear infinite; }
+
+@keyframes refreshSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.stall-nudge {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 6px 12px 0;
+  padding: 10px 12px;
+  background: var(--bg-surface);
+  border-left: 3px solid var(--accent-yellow);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.stall-nudge.hidden { display: none; }
+.stall-nudge-text { flex: 1; }
+
+.stall-nudge-btn {
+  flex-shrink: 0;
+  min-height: 36px;
+  padding: 6px 14px;
+  background: var(--accent-blue);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.stall-nudge-btn:active { background: var(--accent-yellow); }
+.stall-nudge-btn:disabled { opacity: 0.6; }
+
 .sheet-notify { max-height: 60vh; }
 
 .notify-status {

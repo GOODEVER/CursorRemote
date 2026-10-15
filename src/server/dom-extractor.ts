@@ -2136,6 +2136,8 @@ export function extractionFunction(
       agentActivityLive: false,
       agentActivitySource: 'none',
       canAbort,
+      agentStalled: false,
+      agentStalledSince: null,
       messages: elements,
       pendingApprovals,
       inputAvailable: inputEl !== null,
@@ -2215,6 +2217,32 @@ export class DOMExtractor {
     }
     this.currentPollIntervalMs = this.basePollIntervalMs;
     this.failureStreak = 0;
+  }
+
+  /**
+   * Force an immediate re-extraction, bypassing the normal poll delay, and
+   * reset the backoff so a previously failed poll does not keep us slow.
+   *
+   * When the phone reports the agent as "stalled" — the extracted DOM has
+   * stopped changing while the state still claims the agent is working — the
+   * user wants the relay to re-read Cursor *now* rather than wait up to a
+   * backed-off interval. This kicks a fresh `Runtime.evaluate` immediately and
+   * clears any failure backoff; if Cursor's renderer really has finished (or
+   * unblocked), the next snapshot reflects it and the mismatch resolves without
+   * the user reloading the page.
+   *
+   * Safe to call at any time; a no-op when not polling.
+   */
+  forceRefresh(): void {
+    if (!this.running) return;
+    this.failureStreak = 0;
+    this.currentPollIntervalMs = this.basePollIntervalMs;
+    this.pollInFlight = false;
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.scheduleNextPoll(0);
   }
 
   setClient(client: CdpClient | null): void {

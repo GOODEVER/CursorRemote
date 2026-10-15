@@ -223,6 +223,8 @@ describe('applyDerivedActivityToState', () => {
       agentActivityLive: false,
       agentActivitySource: 'none',
       canAbort: false,
+      agentStalled: false,
+      agentStalledSince: null,
       messages: [],
       pendingApprovals: [],
       inputAvailable: true,

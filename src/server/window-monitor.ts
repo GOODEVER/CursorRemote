@@ -207,6 +207,16 @@ export class WindowMonitor extends EventEmitter {
     return this.homeWindowId ?? this.cdpBridge.activeTargetId;
   }
 
+  /**
+   * Poll every window immediately instead of waiting for the next 10s cycle.
+   * Used when the phone requests a refresh so non-home windows (which are only
+   * surfaced via snapshots) also catch up, not just the relay's home window.
+   */
+  forceCycle(): void {
+    if (this._cycling) return;
+    void this.cycle();
+  }
+
   getSnapshot(windowId: string): WindowSnapshot | undefined {
     return this.snapshots.get(windowId);
   }

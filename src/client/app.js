@@ -15,6 +15,8 @@
     agentActivityLive: false,
     agentActivitySource: 'none',
     canAbort: false,
+    agentStalled: false,
+    agentStalledSince: null,
     messages: [],
     pendingApprovals: [],
     inputAvailable: false,
@@ -255,6 +257,10 @@
   const $foldersCount = document.getElementById('folders-count');
   const $btnNotify = document.getElementById('btn-notify');
   const $notifyIcon = document.getElementById('notify-icon');
+  const $btnRefresh = document.getElementById('btn-refresh');
+  const $stallNudge = document.getElementById('stall-nudge');
+  const $stallNudgeText = document.getElementById('stall-nudge-text');
+  const $btnStallRefresh = document.getElementById('btn-stall-refresh');
   const $finishedOverlay = document.getElementById('finished-overlay');
   const $finishedWhat = document.getElementById('finished-what');
   const $finishedWhere = document.getElementById('finished-where');
@@ -506,6 +512,12 @@
   $pillModel.addEventListener('click', () => openSheet('model'));
   $btnFolders.addEventListener('click', () => openSheet('folders'));
   $sheetOverlay.addEventListener('click', closeSheet);
+  if ($btnRefresh) {
+    $btnRefresh.addEventListener('click', () => { void requestStateRefresh(); });
+  }
+  if ($btnStallRefresh) {
+    $btnStallRefresh.addEventListener('click', () => { void requestStateRefresh(); });
+  }
   if ($finishedOverlay) {
     $finishedOverlay.addEventListener('click', hideFinishedBanner);
   }
@@ -559,10 +571,75 @@
     renderTabs();
     renderFoldersButton();
     renderModeModel();
+    renderStallNudge();
     syncPlanModalFromState();
     maybeRequestHistory();
     maybeNotifyTransitions();
     maybeAutoOpenChat();
+  }
+
+  /**
+   * Ask the relay to re-read Cursor right now. Used when the phone's view may
+   * be out of sync — the "Refresh" header button and the stall nudge — e.g. the
+   * remote still shows the agent working while Cursor has already finished.
+   * The relay replies with a `state:full`, so no local state is guessed here.
+   */
+  async function requestStateRefresh() {
+    if (!socket.connected) {
+      showToast('Not connected to relay', 'error');
+      return;
+    }
+    setRefreshBusy(true);
+    const result = await sendCommandAwaitResult('command:refresh_state', {
+      commandId: newCommandId(),
+      type: 'refresh_state',
+    });
+    setRefreshBusy(false);
+    if (!result.ok) {
+      showToast(result.error || 'Refresh failed', 'error');
+      return;
+    }
+    // The refresh clears the server-side stall flag; mirror that immediately so
+    // the nudge disappears even before the state:full lands.
+    hideStallNudge();
+    showToast('Refreshed', 'success');
+  }
+
+  function setRefreshBusy(busy) {
+    if ($btnRefresh) $btnRefresh.classList.toggle('refreshing', !!busy);
+    if ($btnStallRefresh) $btnStallRefresh.disabled = !!busy;
+  }
+
+  function hideStallNudge() {
+    if ($stallNudge) $stallNudge.classList.add('hidden');
+    if ($btnRefresh) $btnRefresh.classList.add('hidden');
+  }
+
+  /**
+   * Surface a nudge when the server reports the extracted state has frozen
+   * while it still claims the agent is working (agentStalled). This is the
+   * "Cursor actually finished but the phone doesn't know" case. Only shown
+   * while the relay believes work is in progress, so an idle session never
+   * nags. Tapping Refresh forces a fresh read.
+   */
+  function renderStallNudge() {
+    if (!$stallNudge) return;
+    const stalled = !!state.agentStalled && isAgentWorking();
+    $stallNudge.classList.toggle('hidden', !stalled);
+    if (stalled) {
+      const label = (state.agentActivityText || '').trim();
+      if ($stallNudgeText) {
+        $stallNudgeText.textContent = label
+          ? 'Still "' + label + '"? Cursor may have finished.'
+          : 'No updates from Cursor. It may have finished.';
+      }
+    }
+    // Offer a manual refresh whenever something looks off: the stall nudge is
+    // showing, or the extractor itself is failing/behind.
+    const extractorUnhealthy = state.connected && state.extractorStatus !== 'ok';
+    if ($btnRefresh) {
+      $btnRefresh.classList.toggle('hidden', !(stalled || extractorUnhealthy));
+    }
   }
 
   /**

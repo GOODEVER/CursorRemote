@@ -424,6 +424,7 @@ Represents the agent's multiple-choice questionnaire toolbar (`.composer-questio
 | `command:set_model`    | `{ commandId, modelId }`                      | Change model                   |
 | `command:switch_window`| `{ commandId, windowId }`                     | Switch to a different Cursor window |
 | `command:click_action` | `{ commandId, selectorPath }`                 | Click any action button by selector (Run, Skip, Allow, Build, View Plan) |
+| `command:refresh_state`| `{ commandId }`                               | Force an immediate re-read of Cursor and reply with a fresh `state:full` (recovers when the phone view is out of sync, e.g. Cursor finished but the remote still shows "working") |
 
 Every client command includes a `commandId` (UUID) that is echoed back in `command:result` for correlation.
 

@@ -172,6 +172,16 @@ export interface CursorState {
    * visible without flicker.
    */
   canAbort: boolean;
+  /**
+   * True when the extracted DOM has not changed for AGENT_STALL_MS even though
+   * the state still claims the agent is working. Surfaces the case where Cursor
+   * has actually finished (or frozen) while the phone still shows "working", so
+   * the client can nudge with a Refresh button and the server can self-heal by
+   * forcing a fresh extraction. Never claimed for an idle/blocked agent.
+   */
+  agentStalled: boolean;
+  /** Timestamp of the last content change (ms since epoch); drives agentStalled. */
+  agentStalledSince: number | null;
   messages: ChatElement[];
   pendingApprovals: Approval[];
   inputAvailable: boolean;
@@ -413,7 +423,7 @@ export interface SelectorConfig {
 
 export interface CommandPayload {
   commandId: string;
-  type: 'send_message' | 'send_prompt' | 'approve' | 'reject' | 'approve_all' | 'switch_tab' | 'open_folder_agent' | 'create_folder_agent' | 'new_chat' | 'set_mode' | 'set_model' | 'click_action' | 'queue_action' | 'get_plan_full' | 'get_plan_model_options' | 'set_plan_model' | 'get_slash_menu' | 'click_slash_command' | 'cancel_slash_menu' | 'set_answer_text' | 'stop_generation';
+  type: 'send_message' | 'send_prompt' | 'approve' | 'reject' | 'approve_all' | 'switch_tab' | 'open_folder_agent' | 'create_folder_agent' | 'new_chat' | 'set_mode' | 'set_model' | 'click_action' | 'queue_action' | 'get_plan_full' | 'get_plan_model_options' | 'set_plan_model' | 'get_slash_menu' | 'click_slash_command' | 'cancel_slash_menu' | 'set_answer_text' | 'stop_generation' | 'refresh_state';
   /** For 'queue_action': the queued row id and the action to run on it. */
   queueItemId?: string;
   queueAction?: 'send' | 'remove';

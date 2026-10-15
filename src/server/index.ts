@@ -134,6 +134,37 @@ async function main(): Promise<void> {
   // only Telegram ever saw non-home questionnaires (public#questionnaire).
   relay.setWindowMonitor(windowMonitor);
 
+  // Force an immediate re-read of Cursor when the phone taps Refresh or the
+  // server detects the "phone says working, Cursor is actually done" mismatch.
+  relay.setRefreshHandler(() => {
+    extractor.forceRefresh();
+    windowMonitor.forceCycle();
+  });
+
+  // Self-heal: when the DOM has frozen for AGENT_STALL_MS while still claiming
+  // work, quietly re-read Cursor once. If the agent really finished (or the
+  // renderer unblocked), the next extraction resolves the mismatch on its own
+  // with no user action. Rate-limited per stall episode so a genuinely long
+  // tool (a multi-minute build) cannot trigger a refresh storm.
+  const STALL_SELF_HEAL_INTERVAL_MS = 30_000;
+  let lastStallSelfHealAt = 0;
+  let wasStalled = false;
+  stateManager.on('state:patch', () => {
+    const s = stateManager.getCurrentState();
+    if (!s.agentStalled) {
+      wasStalled = false;
+      return;
+    }
+    if (wasStalled) return;
+    const now = Date.now();
+    if (now - lastStallSelfHealAt < STALL_SELF_HEAL_INTERVAL_MS) return;
+    wasStalled = true;
+    lastStallSelfHealAt = now;
+    console.log('[main] Agent appears stalled — forcing a fresh extraction');
+    extractor.forceRefresh();
+    windowMonitor.forceCycle();
+  });
+
   console.log('[main] Connecting to Cursor IDE...');
   await cdpBridge.connect();
 

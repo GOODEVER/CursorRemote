@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import type { CursorState, CursorWindow } from './types.js';
 import { AGENT_ACTIVITY_STALE_MS } from './activity-stale.js';
+import { detectStall, type StallTracker } from './stall-detector.js';
 
 function emptyState(): CursorState {
   return {
@@ -14,6 +15,8 @@ function emptyState(): CursorState {
     agentActivityLive: false,
     agentActivitySource: 'none',
     canAbort: false,
+    agentStalled: false,
+    agentStalledSince: null,
     messages: [],
     pendingApprovals: [],
     inputAvailable: false,
@@ -47,6 +50,8 @@ export class StateManager extends EventEmitter {
    * does not re-post activity when the snapshot is otherwise unchanged).
    */
   private activitySuppressedMatch: string | undefined = undefined;
+  /** Tracks whether the extracted DOM has stopped changing while still "working". */
+  private stallTracker: StallTracker | null = null;
 
   get generation(): number {
     return this._generation;
@@ -91,10 +96,23 @@ export class StateManager extends EventEmitter {
 
     const stateForApply = this.applyActivityStaleness(newState);
 
-    const patch = this.diff(this.currentState, stateForApply);
+    // Detect the "phone says working, Cursor actually finished/frozen" case: the
+    // content has not moved for AGENT_STALL_MS while the state still claims work.
+    // Measured against the RAW extraction (`newState`), not `stateForApply`: the
+    // activity-text staleness clear at 30s would otherwise reset the stall clock
+    // — a frozen agent would report "Thinking" for 30s, go idle, and silently
+    // re-arm without ever crossing the threshold.
+    this.stallTracker = detectStall(this.stallTracker, newState, now);
+    const stalledState: CursorState = {
+      ...stateForApply,
+      agentStalled: this.stallTracker.stalled,
+      agentStalledSince: this.stallTracker.stalled ? this.stallTracker.changedAt : null,
+    };
+
+    const patch = this.diff(this.currentState, stalledState);
     if (!patch) return;
 
-    this.currentState = stateForApply;
+    this.currentState = stalledState;
     this.schedulePatch(patch);
   }
 
@@ -114,6 +132,11 @@ export class StateManager extends EventEmitter {
         connected && this.currentState.lastExtractionAt != null ? 'stale' : connected ? 'waiting' : 'idle',
       consecutiveExtractionFailures: this.currentState.consecutiveExtractionFailures + 1,
       lastExtractionError: message,
+      // A failed extraction is not a stalled one — that signal needs a fresh
+      // reading. The failing extractor already drives its own "Cursor stalled"
+      // UI, so clear the content-stall flag to avoid two competing banners.
+      agentStalled: false,
+      agentStalledSince: null,
     };
 
     const patch = this.diff(this.currentState, nextState);
@@ -192,7 +215,31 @@ export class StateManager extends EventEmitter {
     return newState;
   }
 
+  /**
+   * Re-arm the stall detector after a forced/manual refresh.
+   *
+   * Clears `agentStalled` immediately (so the phone's "no updates" nudge
+   * disappears the moment the user taps Refresh) and restarts the content
+   * baseline, so the warning only returns if the DOM freezes *again* for a
+   * full AGENT_STALL_MS window.
+   */
+  resetStall(): void {
+    this.stallTracker = null;
+    if (!this.currentState.agentStalled && this.currentState.agentStalledSince === null) return;
+    const nextState: CursorState = {
+      ...this.currentState,
+      agentStalled: false,
+      agentStalledSince: null,
+    };
+    const patch = this.diff(this.currentState, nextState);
+    if (!patch) return;
+    this.currentState = nextState;
+    this.emit('state:patch', patch);
+  }
+
   onConnectionChanged(connected: boolean): void {
+    // A reconnect means the previous extraction baseline is no longer valid.
+    this.stallTracker = null;
     const nextState: CursorState = {
       ...this.currentState,
       connected,
@@ -200,6 +247,8 @@ export class StateManager extends EventEmitter {
       lastExtractionAt: null,
       consecutiveExtractionFailures: 0,
       lastExtractionError: null,
+      agentStalled: false,
+      agentStalledSince: null,
     };
     const patch = this.diff(this.currentState, nextState);
     if (!patch) return;
@@ -296,6 +345,16 @@ export class StateManager extends EventEmitter {
 
     if (prev.canAbort !== next.canAbort) {
       patch.canAbort = next.canAbort;
+      hasChange = true;
+    }
+
+    if (prev.agentStalled !== next.agentStalled) {
+      patch.agentStalled = next.agentStalled;
+      hasChange = true;
+    }
+
+    if (prev.agentStalledSince !== next.agentStalledSince) {
+      patch.agentStalledSince = next.agentStalledSince;
       hasChange = true;
     }
 

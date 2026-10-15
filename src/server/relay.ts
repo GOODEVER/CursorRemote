@@ -166,6 +166,14 @@ export class Relay {
   private static readonly PUSH_VIBRATE_NEEDS_YOU = [200, 100, 200, 100, 200];
   private static readonly PUSH_VIBRATE_FINISHED = [120];
 
+  /**
+   * Forces an immediate re-read of Cursor (wired by index.ts to the DOM
+   * extractor + window monitor). Lets the phone recover when the agent on
+   * screen is out of sync with Cursor — e.g. the remote still shows "working"
+   * while the real app has already finished.
+   */
+  private refreshHandler: (() => void) | null = null;
+
   /** Max-Age for session cookie (30 days), aligned with typical “stay signed in” expectation. */
   private static readonly SESSION_COOKIE_MAX_AGE_SEC = 30 * 24 * 60 * 60;
 
@@ -287,11 +295,32 @@ export class Relay {
     });
   }
 
+  /** Wire a callback that forces an immediate fresh extraction from Cursor.
+   *  Invoked by the web client's "Refresh" affordance and by the stall
+   *  self-heal in index.ts. */
+  setRefreshHandler(handler: () => void): void {
+    this.refreshHandler = handler;
+  }
+
   /** Wire the window monitor so the web client can be fed the state of the
    *  window it is viewing, not just the relay's CDP home window. */
   setWindowMonitor(windowMonitor: WindowMonitor): void {
     this.windowMonitor = windowMonitor;
     windowMonitor.on('window:update', this.onWindowUpdate);
+  }
+
+  /**
+   * Ask the extractor to re-read Cursor immediately and echo the resulting
+   * state back. Used by `command:refresh_state`; returns the newest snapshot
+   * so the client can render it without waiting for the debounced push.
+   */
+  private requestRefresh(): CursorState {
+    // Re-arm the stall baseline so the nudge clears at once and only returns
+    // if the DOM freezes again. Done before extraction so the fresh reading is
+    // measured against this moment.
+    this.stateManager.resetStall();
+    this.refreshHandler?.();
+    return this.stateManager.getCurrentState();
   }
 
   private onWindowUpdate = (windowId: string, snapshot: WindowSnapshot): void => {
@@ -483,6 +512,7 @@ export class Relay {
         lastExtractionError: state.lastExtractionError,
         agentStatus: state.agentStatus,
         canAbort: state.canAbort,
+        agentStalled: state.agentStalled,
         agentActivityText: state.agentActivityText,
         agentActivityLive: state.agentActivityLive,
         clients: this.io.engine.clientsCount,
@@ -508,6 +538,8 @@ export class Relay {
         activeWindowId: state.activeWindowId,
         agentStatus: state.agentStatus,
         canAbort: state.canAbort,
+        agentStalled: state.agentStalled,
+        agentStalledSince: state.agentStalledSince,
         agentActivityText: state.agentActivityText,
         agentActivityLive: state.agentActivityLive,
         pendingApprovals: state.pendingApprovals,
@@ -1047,6 +1079,17 @@ export class Relay {
         console.log(`[relay] Command: stop_generation from ${socket.id}`);
         const result = await this.commandExecutor.stopGeneration(payload.commandId);
         socket.emit('command:result', result);
+      });
+
+      // --- Force an immediate re-read of Cursor ("Refresh" / stall recovery) ---
+      // The phone uses this when it suspects its view is out of sync — e.g. the
+      // remote still shows the agent as working while Cursor has finished.
+      socket.on('command:refresh_state', (payload: CommandPayload) => {
+        const commandId = payload?.commandId ?? 'unknown';
+        console.log(`[relay] Command: refresh_state from ${socket.id}`);
+        const fresh = this.requestRefresh();
+        socket.emit('command:result', { commandId, ok: true } satisfies CommandResult);
+        socket.emit('state:full', fresh);
       });
 
       socket.on('command:switch_window', async (payload: CommandPayload) => {
