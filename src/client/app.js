@@ -3182,16 +3182,42 @@
     });
   }
 
-  /** Create a new agent in a folder via the host's section "+" button. */
-  function createFolderAgent(folder) {
-    socket.emit('command:create_folder_agent', {
+  /**
+   * Create a new agent in a folder via the host's section "+" button.
+   *
+   * When a transcript is already open, the previous chat's messages keep
+   * rendering until the relay reports the new composer — which made it look
+   * like nothing happened. Clear the transcript up front (and unpin any
+   * selection) so the UI reflects the fresh agent immediately, then refresh
+   * state so the new composer is picked up as soon as Cursor mounts it.
+   */
+  async function createFolderAgent(folder) {
+    // Drop the previous chat's full history so the populated transcript does
+    // not linger. The new agent has no history yet, so the merged render falls
+    // back to the live (empty) DOM tail until history arrives.
+    fullHistory = { composerId: '', messages: [] };
+    pendingHistoryComposerId = '';
+    pinnedComposerId = '';
+    if (pinnedComposerTimer) clearTimeout(pinnedComposerTimer);
+    resetScrollForNewTranscript();
+    renderAll();
+
+    closeSheet();
+    showToast(`Creating new agent in ${folder.name}...`, 'success');
+
+    const result = await sendCommandAwaitResult('command:create_folder_agent', {
       commandId: newCommandId(),
       type: 'create_folder_agent',
       sectionId: folder.sectionId,
       folderName: folder.name,
     });
-    showToast(`Creating new agent in ${folder.name}...`, 'success');
-    closeSheet();
+    if (!result || !result.ok) {
+      showToast(result?.error || `Could not create agent in ${folder.name}`, 'error');
+      return;
+    }
+    // Force a re-read so the newly-created composer/agent shows up without
+    // waiting for the next poll (and, on the relay side, so its history loads).
+    void requestStateRefresh();
   }
 
 

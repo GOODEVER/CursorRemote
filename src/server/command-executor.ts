@@ -903,11 +903,16 @@ export class CommandExecutor {
   }
 
   /**
-
    * Create a new agent inside a specific folder section of Cursor's agent
-   * overview. Clicks that section's "+" (New Agent) button. The "+" appears
-   * when the section is hovered/expanded; if it's not visible we hover the
-   * section header first so Cursor renders it, then retry.
+   * overview. Clicks that section's "+" (New Agent) button.
+   *
+   * The "+" is hover-mounted: it lives in a `.ui-sidebar-menu-button-actions`
+   * wrapper Cursor keeps at `display:none; opacity:0; pointer-events:none` until
+   * the section row is actually hovered. Synthetic `MouseEvent`s cannot turn on
+   * CSS `:hover`, so the old dispatchEvent + `.click()` approach left the button
+   * hidden and the click a no-op — creating an agent silently did nothing. We
+   * reveal it with a native CDP mouse move and click it with native CDP mouse
+   * events, mirroring the composer-queue action flow.
    */
   async createFolderAgent(
     commandId: string,
@@ -915,64 +920,89 @@ export class CommandExecutor {
     folderName: string
   ): Promise<CommandResult> {
     return this.withRetry(commandId, async (client) => {
-      const result = await client.evaluate(`
+      // Re-used by every pass so the section is re-resolved after any re-render
+      // caused by hovering.
+      const findSectionJs = `
         (() => {
           const sectionId = ${JSON.stringify(sectionId)};
           const folderName = ${JSON.stringify(folderName.trim().toLowerCase())};
           const norm = (s) => (s || '').trim().toLowerCase();
-
           // Locate the workspace section by drop-section id, falling back to
           // the section header title when the id is synthesized (folder:<name>).
-          let section = null;
           if (sectionId) {
-            section = document.querySelector('section[data-agent-drop-section-id="' + CSS.escape(sectionId) + '"]');
+            const byId = document.querySelector('section[data-agent-drop-section-id="' + CSS.escape(sectionId) + '"]');
+            if (byId) return byId;
           }
-          if (!section) {
-            for (const sec of document.querySelectorAll('section[data-sidebar-workspace-section-root]')) {
-              const head = sec.querySelector('.ui-sidebar-section-head .ui-sidebar-label-row-title');
-              if (head && norm(head.textContent) === folderName) { section = sec; break; }
-            }
+          for (const sec of document.querySelectorAll('section[data-sidebar-workspace-section-root]')) {
+            const head = sec.querySelector('.ui-sidebar-section-head .ui-sidebar-label-row-title');
+            if (head && norm(head.textContent) === folderName) return sec;
           }
-          if (!section) return { ok: false, error: 'folder not found' };
+          return null;
+        })()
+      `;
 
-          // Hover/expand the section so its "+" (New Agent) button renders.
-          const head = section.querySelector('.ui-sidebar-section-head');
-          const hoverTarget = head || section;
-          const fire = (el, type, opts) => {
-            try { el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, ...opts })); } catch {}
+      // The section head is both the hover target and the drop target. Its
+      // center reveals the actions; its far end is where they mount.
+      const headBox = await client.evaluate(`
+        (() => {
+          const section = ${findSectionJs};
+          if (!section) return null;
+          const head = section.querySelector('.ui-sidebar-section-head') || section;
+          head.scrollIntoView({ block: 'center', behavior: 'instant' });
+          const r = head.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) return null;
+          return {
+            x: Math.round(r.left + r.width / 2),
+            y: Math.round(r.top + r.height / 2),
+            endX: Math.round(r.right - 14),
           };
-          fire(hoverTarget, 'mouseover');
-          fire(hoverTarget, 'mouseenter');
-          fire(hoverTarget, 'mousemove', { clientX: 8, clientY: 8 });
+        })()
+      `) as { x: number; y: number; endX: number } | null;
+      if (!headBox) {
+        throw new Error(`Could not create agent in "${folderName}": folder not found`);
+      }
 
-          // Find the "+" button: prefer an explicit New Agent aria-label,
-          // otherwise any hover-revealed action button in the header.
-          let plus = null;
+      const findButtonJs = `
+        (() => {
+          const section = ${findSectionJs};
+          if (!section) return { error: 'section disappeared' };
+          let btn = null;
           for (const b of section.querySelectorAll('button, [role="button"], a')) {
             const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('data-state') || '')).trim();
-            const text = (b.textContent || '').trim();
-            if (/new agent|new task/i.test(label)) { plus = b; break; }
-            // Hover-only controls usually render as icon buttons; match by class
-            // since Cursor names them consistently across versions.
-            if (/(section-head|label-row).*action|plus|add/i.test(b.className || '')) { plus = b; plus.__byClass = true; }
+            if (/new agent|new task/i.test(label)) { btn = b; break; }
+            if (/(section-head|label-row).*action|plus|add/i.test(b.className || '')) { btn = b; }
           }
-          if (!plus) {
-            // Last resort: the last small icon button inside the header row.
-            const btns = Array.from(head ? head.querySelectorAll('button, [role="button"]') : []);
-            if (btns.length > 1) plus = btns[btns.length - 1];
+          if (!btn) {
+            const btns = Array.from(section.querySelectorAll('.ui-sidebar-section-head button, .ui-sidebar-section-head [role="button"]'));
+            if (btns.length > 0) btn = btns[btns.length - 1];
           }
-          if (!plus) return { ok: false, error: 'new agent button not found' };
-
-          try { plus.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch {}
-          (plus.querySelector('[data-sidebar-menu-button], .ui-sidebar-menu-button') || plus).click();
-          return { ok: true, byClass: !!plus.__byClass };
+          if (!btn) return { error: 'new agent button not found' };
+          const r = btn.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) return { error: 'new agent button not revealed' };
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
         })()
-      `) as { ok: boolean; error?: string; byClass?: boolean } | null;
+      `;
 
-      if (!result?.ok) {
-        throw new Error(`Could not create agent in "${folderName}": ${result?.error ?? 'unknown'}`);
+      // Reveal the hover-mounted "+" with a NATIVE mouse move. Synthetic
+      // MouseEvents cannot turn on CSS :hover, which is why the previous
+      // dispatchEvent + .click() approach was a silent no-op. Probe-verified:
+      // synthetic hover+click leaves the agent count unchanged; native
+      // hover+click adds a row. Try the head center, then its far end.
+      await client.hoverAtCoords(headBox.x, headBox.y);
+      await sleep(150);
+
+      let btnBox = await client.evaluate(findButtonJs) as { x?: number; y?: number; error?: string } | null;
+      if (!btnBox || btnBox.x === undefined) {
+        await client.hoverAtCoords(headBox.endX, headBox.y);
+        await sleep(150);
+        btnBox = await client.evaluate(findButtonJs) as { x?: number; y?: number; error?: string } | null;
       }
-      console.log(`[command-executor] New agent created in folder "${folderName}"${result.byClass ? ' (matched by class)' : ''}`);
+      if (!btnBox || btnBox.x === undefined || btnBox.y === undefined) {
+        throw new Error(`Could not create agent in "${folderName}": ${btnBox?.error ?? 'new agent button not revealed'}`);
+      }
+
+      await client.clickAtCoords(btnBox.x, btnBox.y);
+      console.log(`[command-executor] New agent created in folder "${folderName}"`);
     });
   }
 
