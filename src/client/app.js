@@ -140,6 +140,20 @@
   let composerPrefilledText = '';
   const pendingCommandResults = new Map();
 
+  /**
+   * composerIds the relay says are actively working, used to show a spinner in
+   * the folder menu. Seeded from the home window's live state and refreshed by
+   * each `window:snapshot` (which carries the ground-truth `canAbort` flag).
+   * Cursor's sidebar rows expose no per-agent status in the DOM (probed: no
+   * aria-busy, no status class), so this server signal is the only reliable
+   * source. `snapshotWorkingComposers` holds the non-home contribution keyed by
+   * window so a window flipping to idle clears its own entry. Each entry is
+   * timestamped so a window that stops reporting (closed) can be pruned rather
+   * than leaving a ghost spinner behind.
+   */
+  const snapshotWorkingComposers = new Map();
+  const WORKING_SNAPSHOT_TTL_MS = 30000;
+
   // Full transcript for the composer currently open, sourced from Cursor's
   // database (event `history:full`). Cursor virtualizes the transcript DOM and
   // only mounts the messages nearest its scroll position, so the live state
@@ -372,8 +386,25 @@
   // the answer can be routed back to it.
   socket.on('window:snapshot', (snapshot) => {
     if (!snapshot || !snapshot.windowId) return;
+    // Track which agent in each non-home window is actively working, so the
+    // folder menu can show a spinner. The snapshot carries the ground-truth
+    // `canAbort` flag; clear this window's entry when it is no longer working.
+    const working = !!snapshot.canAbort || !!snapshot.agentActivityLive
+      || (snapshot.agentStatus && snapshot.agentStatus !== 'idle'
+        && snapshot.agentStatus !== 'waiting_approval'
+        && snapshot.agentStatus !== 'error');
+    if (working && snapshot.activeComposerId) {
+      snapshotWorkingComposers.set(snapshot.windowId, {
+        composerId: snapshot.activeComposerId,
+        at: Date.now(),
+      });
+    } else {
+      snapshotWorkingComposers.delete(snapshot.windowId);
+    }
     // The home window's questionnaire already arrives via state:full/patch;
     // only track non-home windows here so the two paths don't fight/duplicate.
+    // (The working-composer bookkeeping above still runs for the home window so
+    // a window flipping to idle clears its entry.)
     if (snapshot.windowId === state.activeWindowId) return;
     const q = snapshot.questionnaire;
     if (q && q.questions && q.questions.length > 0) {
@@ -2974,6 +3005,28 @@
 
   // --- Folders drawer ---
 
+  /**
+   * composerIds the relay reports as actively working right now. Combines the
+   * home window's live state with the per-window snapshots (non-home windows).
+   * Used to mark the matching agent rows in the folder menu.
+   */
+  function workingComposerIds() {
+    const ids = new Set();
+    const now = Date.now();
+    for (const [windowId, entry] of snapshotWorkingComposers) {
+      // Prune a window that stopped reporting (closed) so its spinner doesn't
+      // linger forever: a live snapshot refreshes `at` on every window cycle.
+      if (now - entry.at > WORKING_SNAPSHOT_TTL_MS) {
+        snapshotWorkingComposers.delete(windowId);
+        continue;
+      }
+      ids.add(entry.composerId);
+    }
+    const homeComposerId = (state.activeComposerId || '').trim();
+    if (homeComposerId && isAgentWorking()) ids.add(homeComposerId);
+    return ids;
+  }
+
   function renderFoldersButton() {
     const folders = state.folders || [];
     if (folders.length === 0) {
@@ -3048,10 +3101,27 @@
         none.addEventListener('click', () => createFolderAgent(folder));
         section.appendChild(none);
       } else {
+        const workingIds = workingComposerIds();
         agents.forEach((agent) => {
+          const isWorking = !!(agent.composerId && workingIds.has(agent.composerId));
           const btn = document.createElement('button');
-          btn.className = 'folder-agent' + (agent.isActive ? ' active' : '');
-          btn.textContent = agent.title || 'Untitled';
+          btn.className = 'folder-agent'
+            + (agent.isActive ? ' active' : '')
+            + (isWorking ? ' working' : '');
+          const label = document.createElement('span');
+          label.className = 'folder-agent-title';
+          label.textContent = agent.title || 'Untitled';
+          btn.appendChild(label);
+          // Spinner shown only while this agent is working. aria-label keeps it
+          // discoverable for screen readers (the glyph itself is decorative).
+          if (isWorking) {
+            const spinner = document.createElement('span');
+            spinner.className = 'folder-agent-spinner';
+            spinner.setAttribute('aria-label', 'Agent is working');
+            spinner.setAttribute('role', 'status');
+            btn.appendChild(spinner);
+          }
+          btn.title = agent.title || 'Untitled';
           btn.addEventListener('click', () => {
             socket.emit('command:open_folder_agent', {
               commandId: newCommandId(),

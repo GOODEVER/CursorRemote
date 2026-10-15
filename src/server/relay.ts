@@ -358,6 +358,9 @@ export class Relay {
       agentActivityText: snapshot.agentActivityText,
       agentActivityLive: snapshot.agentActivityLive,
       agentActivitySource: snapshot.agentActivitySource,
+      // Ground-truth working flag, so the client can mark this window's agent
+      // as "working" in the folder menu even when it is not the home window.
+      canAbort: snapshot.canAbort,
       activeComposerId: snapshot.activeComposerId,
       folders: snapshot.folders,
       lastUpdated: snapshot.lastUpdated,

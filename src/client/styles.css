@@ -2263,7 +2263,9 @@ header {
 }
 
 .folder-agent {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
   text-align: left;
   background: none;
@@ -2274,12 +2276,38 @@ header {
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
   overflow: hidden;
+}
+
+/* Title truncates; the trailing spinner stays pinned at the end and never
+   shrinks, so a long chat name can't push it out of view. */
+.folder-agent-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .folder-agent:active { background: var(--bg-hover); }
 .folder-agent.active { color: var(--accent-blue); font-weight: 600; }
+
+/* Spinner marking an agent the relay reports as actively working. */
+.folder-agent-spinner {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-blue);
+  border-top-color: transparent;
+  animation: folderAgentSpin 0.7s linear infinite;
+}
+
+.folder-agent.working { color: var(--text-primary); }
+
+@keyframes folderAgentSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
 
 .folder-agent-empty {
   display: block;

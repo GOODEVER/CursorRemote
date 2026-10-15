@@ -711,6 +711,113 @@ describe('web: folders drawer', () => {
   });
 });
 
+// ─── Folders drawer: working indicator ───
+
+describe('web: folders working indicator', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  function stateWithFolders(): CursorState {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    return {
+      ...fixture[0].state!,
+      activeComposerId: '',
+      folders: [
+        {
+          name: 'FactoryTycoonGame',
+          sectionId: 'workspace:abc',
+          kind: 'workspace',
+          isCurrent: true,
+          agents: [
+            { title: 'Agent one', composerId: 'c1', sectionId: 'workspace:abc', isActive: false, selectorPath: '' },
+            { title: 'Agent two', composerId: 'c2', sectionId: 'workspace:abc', isActive: false, selectorPath: '' },
+          ],
+        },
+      ],
+    };
+  }
+
+  function openFolders() {
+    env.document.getElementById('btn-folders')!.click();
+    return env.document.getElementById('sheet-folders-list')!;
+  }
+
+  function agentRow(title: string): HTMLButtonElement | null {
+    const list = env.document.getElementById('sheet-folders-list')!;
+    const rows = Array.from(list.querySelectorAll('.folder-agent')) as HTMLButtonElement[];
+    return rows.find((r) => r.textContent!.includes(title)) ?? null;
+  }
+
+  it('shows a spinner on the agent the home window is working on', () => {
+    const state = stateWithFolders();
+    state.activeComposerId = 'c1';
+    // Ground truth: the agent is working.
+    fireFullState(env.mockSocket, { ...state, canAbort: true, agentActivityLive: true, agentStatus: 'running_tool' });
+
+    openFolders();
+    const one = agentRow('Agent one')!;
+    const two = agentRow('Agent two')!;
+    assert.ok(one.classList.contains('working'), 'working agent marked');
+    assert.ok(one.querySelector('.folder-agent-spinner'), 'working agent has a spinner');
+    assert.ok(!two.classList.contains('working'), 'idle agent not marked');
+    assert.ok(!two.querySelector('.folder-agent-spinner'), 'idle agent has no spinner');
+  });
+
+  it('shows no spinner when the agent is idle', () => {
+    const state = stateWithFolders();
+    state.activeComposerId = 'c1';
+    fireFullState(env.mockSocket, { ...state, canAbort: false, agentActivityLive: false, agentStatus: 'idle' });
+
+    openFolders();
+    assert.ok(!agentRow('Agent one')!.querySelector('.folder-agent-spinner'), 'no spinner when idle');
+  });
+
+  it('marks an agent working in a non-home window via window:snapshot', () => {
+    fireFullState(env.mockSocket, stateWithFolders());
+
+    // A different window reports c2 as actively working.
+    fireWindowSnapshot(env.mockSocket, {
+      windowId: 'w-other',
+      windowTitle: 'Other workspace',
+      activeComposerId: 'c2',
+      canAbort: true,
+      agentActivityLive: true,
+      agentStatus: 'running_tool',
+    });
+
+    openFolders();
+    assert.ok(agentRow('Agent two')!.classList.contains('working'), 'non-home working agent marked');
+    assert.ok(!agentRow('Agent one')!.classList.contains('working'), 'unrelated agent not marked');
+  });
+
+  it('clears the non-home spinner once that window reports idle', () => {
+    fireFullState(env.mockSocket, stateWithFolders());
+    fireWindowSnapshot(env.mockSocket, {
+      windowId: 'w-other',
+      activeComposerId: 'c2',
+      canAbort: true,
+      agentActivityLive: true,
+      agentStatus: 'running_tool',
+    });
+    openFolders();
+    assert.ok(agentRow('Agent two')!.classList.contains('working'));
+
+    // Same window now idle → its entry must clear.
+    fireWindowSnapshot(env.mockSocket, {
+      windowId: 'w-other',
+      activeComposerId: 'c2',
+      canAbort: false,
+      agentActivityLive: false,
+      agentStatus: 'idle',
+    });
+    openFolders();
+    assert.ok(!agentRow('Agent two')!.classList.contains('working'), 'spinner cleared when idle');
+  });
+});
+
 // ─── Auto-open chat on load ───
 
 describe('web: auto-open chat', () => {
