@@ -22,31 +22,46 @@ phone ──HTTPS──> Cloudflare edge ──tunnel──> cloudflared (Debian
 - **Debian ↔ Windows** is the "LAN hop" this doc is about, and it is encrypted with the
   self-signed cert in `data/certs/`.
 
-## Windows side (already done)
+## Windows side (automatic)
 
-1. A self-signed cert lives in `data/certs/` (gitignored), generated with SANs for the
-   LAN addresses the server may be reached at:
+`host-cursorremote.bat` is built for this path out of the box — double-clicking it is all
+that is needed:
+
+1. **The HTTPS cert is generated for you.** On first run the BAT writes
+   `data\certs\openssl.cnf` and calls Git's `openssl` to self-sign a 10-year cert with
+   SANs for the LAN addresses the server may be reached at:
 
    ```
-   subject = CN=192.168.1.9
+   subject = CN=CursorRemote
    SAN     = IP:192.168.1.9, IP:192.168.137.1, DNS:localhost
    ```
 
-   Valid 10 years. Because it is self-signed, the tunnel does **not** verify it
-   (`noTLSVerify`), so the LAN hop is encrypted but not authenticated — acceptable for a
-   direct home-LAN link.
+   `data/certs/` is gitignored, so this is per-machine and never committed. Because the
+   cert is self-signed, the tunnel does **not** verify it (`noTLSVerify`), so the LAN hop
+   is encrypted but not authenticated — acceptable for a direct home-LAN link. To
+   regenerate, delete `data\certs\` and run the BAT again.
 
-2. `host-cursorremote.bat` sets:
+   If `openssl` cannot be found the BAT falls back to plain HTTP and says so; the public
+   URL then returns 502 until a cert exists.
+
+2. **The BAT sets the required config:**
 
    ```bat
    set TLS_ENABLED=true
    set TLS_CERT_PATH=data\certs\cert.pem
    set TLS_KEY_PATH=data\certs\key.pem
    set TRUST_PROXY=true
+   set PUBLIC_URL=https://cursor.tarzi.be
    ```
 
    `TRUST_PROXY=true` makes the relay honour Cloudflare's `X-Forwarded-*` headers so the
    login rate limiter sees real client IPs and the session cookie is marked `Secure`.
+   `PUBLIC_URL` is shown in the startup banner and health-checked after launch.
+
+3. **Startup health check.** After the relay starts, the BAT launches
+   `scripts/public-health-check.ps1` hidden. It is silent when the public URL answers
+   `200` (the result is appended to `temp\public-health.log`); if the public path is
+   broken it pops a dialog naming the failing check and points back here.
 
 ## Cloudflare dashboard change (required once)
 
@@ -103,7 +118,15 @@ the signature of a TLS client hitting a non-TLS server.
 
 ## Regenerating the cert
 
-If this PC's LAN IP changes, regenerate (Git for Windows ships the needed `openssl`):
+The BAT creates the cert automatically. To force a fresh one (new LAN IP, or an expired
+cert), just delete the folder and run the launcher again:
+
+```powershell
+Remove-Item data\certs -Recurse -Force
+# double-click host-cursorremote.bat -> "[3/5] Generating self-signed HTTPS certificate..."
+```
+
+Or do it by hand (Git for Windows ships the needed `openssl`):
 
 ```powershell
 New-Item -ItemType Directory -Force -Path data\certs | Out-Null
@@ -113,7 +136,7 @@ distinguished_name = dn
 x509_extensions = v3
 prompt = no
 [dn]
-CN = 192.168.1.9
+CN = CursorRemote
 [v3]
 subjectAltName = IP:192.168.1.9, IP:192.168.137.1, DNS:localhost
 basicConstraints = critical, CA:FALSE
