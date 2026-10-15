@@ -472,12 +472,39 @@ export interface ServerConfig {
   historyMaxMessages: number;
   webPush: WebPushConfig;
   telegram: TelegramConfig;
+  /** Native TLS settings for the web server (https/wss). */
+  tls: TlsConfig;
+  /**
+   * Trust `X-Forwarded-*` headers from a fronting reverse proxy so client IPs
+   * and protocol detection are correct when TLS is terminated upstream.
+   */
+  trustProxy: boolean;
 }
 
 export interface WebPushConfig {
   enabled: boolean;
   /** VAPID contact (mailto: or https: URL) required by push services. */
   subject: string;
+}
+
+/**
+ * Native TLS termination for the relay's web server. When `enabled`, the server
+ * listens with https/wss using the PEM files named here instead of plain http.
+ * Leave disabled to terminate TLS at a reverse proxy instead (set trustProxy).
+ */
+export interface TlsConfig {
+  enabled: boolean;
+  /** Path to the PEM certificate (or full chain, e.g. Let's Encrypt fullchain.pem). */
+  certPath: string;
+  /** Path to the PEM private key (e.g. Let's Encrypt privkey.pem). */
+  keyPath: string;
+  /** Optional PEM CA chain appended to the served chain (rarely needed). */
+  caPath: string;
+  /**
+   * Passphrase for an encrypted private key, if any. Read from
+   * TLS_KEY_PASSPHRASE in the environment and never persisted to disk.
+   */
+  passphrase: string;
 }
 
 export interface TelegramConfig {

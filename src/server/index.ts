@@ -75,7 +75,13 @@ async function main(): Promise<void> {
   const selectors = loadSelectors(config);
 
   console.log(`[main] CDP URL: ${config.cdpUrl}`);
-  console.log(`[main] Server: http://${config.serverHost}:${config.serverPort}`);
+  const scheme = config.tls.enabled ? 'https' : 'http';
+  console.log(`[main] Server: ${scheme}://${config.serverHost}:${config.serverPort}`);
+  if (config.tls.enabled) {
+    console.log(`[main] TLS: enabled (cert ${config.tls.certPath})`);
+  } else if (config.trustProxy) {
+    console.log('[main] Behind a reverse proxy (trustProxy enabled)');
+  }
   console.log(`[main] Poll interval: ${config.pollIntervalMs}ms`);
   console.log(`[main] Debounce: ${config.debounceMs}ms`);
   console.log(`[main] Telegram: ${config.telegram.enabled ? 'enabled' : 'disabled'}`);

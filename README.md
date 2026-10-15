@@ -223,6 +223,25 @@ CursorRemote ships with secure defaults out of the box:
 
 Both options can be combined for defense in depth.
 
+### HTTPS (secure context)
+
+Serving over HTTPS unlocks browser features that require a **secure context** on phones — most notably Web Push notifications and "Add to Home Screen". There are two supported ways:
+
+**Option 1: Native TLS (built in).** Point the server at your own PEM files. Any certificate works; for a real subdomain use a Let's Encrypt `fullchain.pem` + `privkey.pem`.
+
+```env
+TLS_ENABLED=true
+TLS_CERT_PATH=C:\certs\fullchain.pem
+TLS_KEY_PATH=C:\certs\privkey.pem
+# optional:
+# TLS_CA_PATH=C:\certs\chain.pem
+# TLS_KEY_PASSPHRASE=
+```
+
+The server then listens on `https://` and the web client automatically uses `wss://` (socket.io follows the page scheme — no client config needed). The session cookie is marked `Secure` automatically. In the standalone `.bat`, set `TLS_ENABLED=true` and the two paths at the top; the launcher prints and opens the `https://` URL.
+
+**Option 2: Reverse proxy.** Terminate TLS at Caddy/nginx/Traefik and leave `TLS_ENABLED=false`. Set `TRUST_PROXY=true` so the relay honors `X-Forwarded-*` headers for client IPs (login rate limiting) and protocol detection.
+
 ## Privacy
 
 CursorRemote is **100% self-hosted**. There is no phone-home, no telemetry, no analytics, no usage tracking. The software never connects to our servers — not at startup, not during use, not ever. License validation happens entirely offline against your local key. Your code, your conversations, and your agent activity stay on your machine and your network. We don't see any of it.

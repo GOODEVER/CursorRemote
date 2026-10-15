@@ -13,6 +13,12 @@ export function loadConfig(): ServerConfig {
 
   const dataDir = process.env.DATA_DIR ?? resolve(process.cwd(), 'data');
 
+  const certPath = (process.env.TLS_CERT_PATH ?? '').trim();
+  const keyPath = (process.env.TLS_KEY_PATH ?? '').trim();
+  // TLS is on only when explicitly enabled AND both PEM files are configured;
+  // a half-configured pair would otherwise crash the server at startup.
+  const tlsEnabled = process.env.TLS_ENABLED === 'true' && !!certPath && !!keyPath;
+
   return {
     cdpUrl: process.env.CDP_URL ?? 'http://127.0.0.1:9222',
     serverPort: parseInt(process.env.SERVER_PORT ?? '3000', 10),
@@ -36,6 +42,14 @@ export function loadConfig(): ServerConfig {
       preRegisteredUsers,
       impl: (process.env.TELEGRAM_IMPL === 'raw' ? 'raw' : 'grammy') as 'grammy' | 'raw',
     },
+    tls: {
+      enabled: tlsEnabled,
+      certPath,
+      keyPath,
+      caPath: (process.env.TLS_CA_PATH ?? '').trim(),
+      passphrase: process.env.TLS_KEY_PASSPHRASE ?? '',
+    },
+    trustProxy: process.env.TRUST_PROXY === 'true',
   };
 }
 

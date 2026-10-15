@@ -1,5 +1,6 @@
 import express from 'express';
 import { createServer } from 'http';
+import { createServer as createHttpsServer } from 'https';
 import { Server as SocketServer, type Socket } from 'socket.io';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -117,7 +118,7 @@ const LOGIN_PAGE_HTML = `<!DOCTYPE html>
 export class Relay {
   private config: ServerConfig;
   private app: express.Application;
-  private httpServer: ReturnType<typeof createServer>;
+  private httpServer: ReturnType<typeof createServer> | ReturnType<typeof createHttpsServer>;
   private io: SocketServer;
   private stateManager: StateManager;
   private commandExecutor: CommandExecutor;
@@ -191,7 +192,12 @@ export class Relay {
     }
 
     this.app = express();
-    this.httpServer = createServer(this.app);
+    if (this.config.trustProxy) {
+      // Trust the fronting proxy's X-Forwarded-* headers so client IPs (used
+      // for login rate limiting) and req.protocol are correct behind TLS.
+      this.app.set('trust proxy', true);
+    }
+    this.httpServer = this.createWebServer();
     this.io = new SocketServer(this.httpServer, {
       serveClient: false,
       cors: {
@@ -210,11 +216,48 @@ export class Relay {
     }
   }
 
+  /**
+   * Create the HTTP or HTTPS server for the web client, depending on config.
+   * Native TLS (https/wss) is used when TLS_ENABLED is set with cert+key files;
+   * otherwise plain HTTP is used (optionally behind a TLS-terminating proxy).
+   */
+  private createWebServer(): ReturnType<typeof createServer> | ReturnType<typeof createHttpsServer> {
+    if (!this.config.tls.enabled) {
+      return createServer(this.app);
+    }
+    const { certPath, keyPath, caPath, passphrase } = this.config.tls;
+    try {
+      const cert = readFileSync(certPath);
+      const key = readFileSync(keyPath);
+      const ca = caPath ? readFileSync(caPath) : undefined;
+      console.log(`[relay] TLS enabled — cert: ${certPath}`);
+      return createHttpsServer(
+        {
+          cert,
+          key,
+          ...(ca ? { ca } : {}),
+          ...(passphrase ? { passphrase } : {}),
+        },
+        this.app
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `TLS is enabled but the certificate/key could not be read (${msg}). ` +
+          `Check TLS_CERT_PATH and TLS_KEY_PATH, or unset TLS_ENABLED to serve plain HTTP.`
+      );
+    }
+  }
+
+  private get scheme(): 'http' | 'https' {
+    return this.config.tls.enabled ? 'https' : 'http';
+  }
+
   start(): Promise<void> {
     return new Promise((resolve) => {
       this.httpServer.listen(this.config.serverPort, this.config.serverHost, () => {
         console.log(
-          `[relay] Server listening on http://${this.config.serverHost}:${this.config.serverPort}`
+          `[relay] Server listening on ${this.scheme}://${this.config.serverHost}:${this.config.serverPort}`
         );
         resolve();
       });
@@ -385,6 +428,10 @@ export class Relay {
       const token = randomBytes(32).toString('hex');
       this.sessionStore.add(token);
       console.log(`[relay] Successful login from ${ip}`);
+      // Mark the session cookie Secure whenever the connection is (or is
+      // proxied as) HTTPS so it is never sent over plaintext. `req.secure`
+      // honors X-Forwarded-Proto when trustProxy is set.
+      const isSecure = req.secure || req.protocol === 'https';
       res.setHeader(
         'Set-Cookie',
         [
@@ -392,6 +439,7 @@ export class Relay {
           'HttpOnly',
           'Path=/',
           'SameSite=Lax',
+          ...(isSecure ? ['Secure'] : []),
           `Max-Age=${Relay.SESSION_COOKIE_MAX_AGE_SEC}`,
         ].join('; ')
       );

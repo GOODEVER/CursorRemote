@@ -24,6 +24,17 @@ set WEBAPP_PASSWORD=123456
 set LOG_FORMAT=text
 set CURSOR_REMOTE_LICENSE_BYPASS=1
 set CURSOR_EXE=C:\Program Files\cursor\Cursor.exe
+
+REM --- HTTPS (optional) -------------------------------------------------
+REM Serve over https/wss with your own PEM files. Point these at a real
+REM certificate (e.g. Let's Encrypt fullchain.pem + privkey.pem) and set
+REM TLS_ENABLED=true. Leave false to keep serving plain HTTP.
+set TLS_ENABLED=false
+set TLS_CERT_PATH=
+set TLS_KEY_PATH=
+REM Set to true if you terminate TLS at a reverse proxy instead.
+set TRUST_PROXY=false
+REM ----------------------------------------------------------------------
 REM ----------------------------------------------------------
 
 if not exist "dist\server\index.js" goto NO_BUILD
@@ -106,19 +117,26 @@ taskkill /PID !OLD_PID! /F >nul 2>&1
 timeout /t 2 /nobreak >nul
 
 :LAUNCH
+set "URL_SCHEME=http"
+if /i "%TLS_ENABLED%"=="true" set "URL_SCHEME=https"
 echo.
 echo =====================================================================
 echo   CursorRemote is starting
 echo ---------------------------------------------------------------------
-echo   Local:    http://127.0.0.1:%SERVER_PORT%
-if defined LANIP echo   LAN:      http://!LANIP!:%SERVER_PORT%
+if /i "%TLS_ENABLED%"=="true" (
+  echo   TLS:      ENABLED ^(https/wss^)
+) else (
+  echo   TLS:      off ^(plain http^) - set TLS_ENABLED=true for https
+)
+echo   Local:    %URL_SCHEME%://127.0.0.1:%SERVER_PORT%
+if defined LANIP echo   LAN:      %URL_SCHEME%://!LANIP!:%SERVER_PORT%
 echo   Password: %WEBAPP_PASSWORD%
 echo.
 echo   Keep this window open. Press Ctrl+C or close it to stop.
 echo =====================================================================
 echo.
 
-start "" cmd /c "timeout /t 3 /nobreak >nul & start "" http://127.0.0.1:%SERVER_PORT%"
+start "" cmd /c "timeout /t 3 /nobreak >nul & start "" %URL_SCHEME%://127.0.0.1:%SERVER_PORT%"
 
 node --max-old-space-size=2048 dist\server\index.js
 
