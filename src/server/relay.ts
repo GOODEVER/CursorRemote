@@ -174,6 +174,13 @@ export class Relay {
    */
   private refreshHandler: (() => void) | null = null;
 
+  /**
+   * Nudge the DOM extractor out of the idle poll cadence (wired by index.ts).
+   * Fired on every inbound client command so a reply that lands while the phone
+   * was idle shows up immediately instead of waiting out the slow idle interval.
+   */
+  private wakeHandler: (() => void) | null = null;
+
   /** Max-Age for session cookie (30 days), aligned with typical “stay signed in” expectation. */
   private static readonly SESSION_COOKIE_MAX_AGE_SEC = 30 * 24 * 60 * 60;
 
@@ -300,6 +307,12 @@ export class Relay {
    *  self-heal in index.ts. */
   setRefreshHandler(handler: () => void): void {
     this.refreshHandler = handler;
+  }
+
+  /** Wire a callback that wakes the extractor from its idle poll cadence.
+   *  Invoked before running any inbound client command. */
+  setWakeHandler(handler: () => void): void {
+    this.wakeHandler = handler;
   }
 
   /** Wire the window monitor so the web client can be fed the state of the
@@ -679,6 +692,17 @@ export class Relay {
       console.log(`[relay] Client connected: ${socket.id}`);
 
       socket.emit('state:full', this.stateManager.getCurrentState());
+
+      // Any inbound command implies the DOM is about to change. If the extractor
+      // has parked at the slow idle cadence, wake it so the reply and its
+      // streaming tail appear immediately instead of up to one idle interval
+      // later. Restricted to command/request events so routine traffic (e.g.
+      // reconnects) never triggers extra polls.
+      socket.onAny((event: string) => {
+        if (event.startsWith('command:') || event.startsWith('request:')) {
+          this.wakeHandler?.();
+        }
+      });
 
       socket.on('command:send_message', async (payload: CommandPayload) => {
         if (!payload.commandId || !payload.text) {

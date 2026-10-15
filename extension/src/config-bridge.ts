@@ -13,6 +13,7 @@ export async function buildEnvFromConfig(
     SERVER_PORT: String(config.get<number>('serverPort', 3000)),
     SERVER_HOST: config.get<string>('serverHost', '127.0.0.1'),
     POLL_INTERVAL_MS: String(config.get<number>('pollIntervalMs', 500)),
+    IDLE_POLL_INTERVAL_MS: String(config.get<number>('idlePollIntervalMs', 2000)),
     DEBOUNCE_MS: String(config.get<number>('debounceMs', 300)),
     LOG_LEVEL: config.get<string>('logLevel', 'info'),
     WEBAPP_PASSWORD: config.get<string>('webappPassword', ''),

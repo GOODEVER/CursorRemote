@@ -94,7 +94,12 @@
         "cursorRemote.pollIntervalMs": {
           "type": "number",
           "default": 500,
-          "markdownDescription": "DOM polling frequency in milliseconds."
+          "markdownDescription": "DOM polling frequency in milliseconds while the agent is active."
+        },
+        "cursorRemote.idlePollIntervalMs": {
+          "type": "number",
+          "default": 2000,
+          "markdownDescription": "Slower DOM polling frequency (ms) used once the agent is idle and the transcript has settled. Set to a value less than or equal to `cursorRemote.pollIntervalMs` to always poll at full speed. Any activity or command snaps back to the active rate immediately."
         },
         "cursorRemote.debounceMs": {
           "type": "number",

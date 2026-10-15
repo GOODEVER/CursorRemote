@@ -24,6 +24,7 @@ export function loadConfig(): ServerConfig {
     serverPort: parseInt(process.env.SERVER_PORT ?? '3000', 10),
     serverHost: process.env.SERVER_HOST ?? '127.0.0.1',
     pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS ?? '300', 10),
+    idlePollIntervalMs: parseNonNegativeInt(process.env.IDLE_POLL_INTERVAL_MS, 2000),
     debounceMs: parseInt(process.env.DEBOUNCE_MS ?? '150', 10),
     selectorsPath: process.env.SELECTORS_PATH ?? './selectors.json',
     logLevel: (process.env.LOG_LEVEL as ServerConfig['logLevel']) ?? 'info',
@@ -51,6 +52,17 @@ export function loadConfig(): ServerConfig {
     },
     trustProxy: process.env.TRUST_PROXY === 'true',
   };
+}
+
+/**
+ * Parse an optional integer env var, falling back when unset or unparseable and
+ * clamping negatives to 0. Keeps a typo like `IDLE_POLL_INTERVAL_MS=abc` from
+ * silently disabling a feature (an unparsed value would otherwise become NaN).
+ */
+function parseNonNegativeInt(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
 /**

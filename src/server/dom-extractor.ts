@@ -12,6 +12,13 @@ import type {
   WorkspaceFolder,
 } from './types.js';
 import { applyDerivedActivityToState } from './activity-derive.js';
+import {
+  createPollPacing,
+  nextPollInterval,
+  pollContentKey,
+  type PollPacingState,
+} from './idle-poll.js';
+import { claimsWork } from './stall-detector.js';
 
 const EVALUATE_TIMEOUT_MS = 5000;
 const MAX_POLL_BACKOFF_MS = 5000;
@@ -2184,6 +2191,11 @@ export class DOMExtractor {
   private loggedFirstExtraction = false;
   private basePollIntervalMs = 300;
   private currentPollIntervalMs = 300;
+  /** Slower cadence used once the DOM settles and the agent is idle. */
+  private idlePollIntervalMs = 2000;
+  private pollPacing: PollPacingState = createPollPacing();
+  /** Content signature of the previous successful poll, for idle detection. */
+  private lastContentKey = '';
   private pollInFlight = false;
   private failureStreak = 0;
   private running = false;
@@ -2198,14 +2210,20 @@ export class DOMExtractor {
     this.getWindowTitle = getWindowTitle;
   }
 
-  start(client: CdpClient, intervalMs: number): void {
+  start(client: CdpClient, intervalMs: number, idleIntervalMs = intervalMs): void {
     this.client = client;
     this.stop();
     this.running = true;
     this.basePollIntervalMs = intervalMs;
     this.currentPollIntervalMs = intervalMs;
+    this.idlePollIntervalMs = idleIntervalMs;
+    this.pollPacing = createPollPacing();
+    this.lastContentKey = '';
     this.failureStreak = 0;
-    console.log(`[dom-extractor] Starting polling every ${intervalMs}ms`);
+    const idleNote = idleIntervalMs > intervalMs
+      ? `, idle ${idleIntervalMs}ms`
+      : ' (idle backoff disabled)';
+    console.log(`[dom-extractor] Starting polling every ${intervalMs}ms${idleNote}`);
     this.scheduleNextPoll(0);
   }
 
@@ -2216,7 +2234,28 @@ export class DOMExtractor {
       this.pollTimer = null;
     }
     this.currentPollIntervalMs = this.basePollIntervalMs;
+    this.pollPacing = createPollPacing();
+    this.lastContentKey = '';
     this.failureStreak = 0;
+  }
+
+  /**
+   * Re-read Cursor now and return to full-speed polling.
+   *
+   * Called when a user action proves the DOM is about to change but the idle
+   * backoff is currently parked at the slow cadence — e.g. a command from the
+   * phone (send message, approve, switch tab). Without this the reply and its
+   * streaming tail could take up to `idlePollIntervalMs` to appear.
+   */
+  wake(): void {
+    if (!this.running) return;
+    this.currentPollIntervalMs = this.basePollIntervalMs;
+    this.pollPacing = createPollPacing();
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+      this.scheduleNextPoll(0);
+    }
   }
 
   /**
@@ -2237,6 +2276,9 @@ export class DOMExtractor {
     if (!this.running) return;
     this.failureStreak = 0;
     this.currentPollIntervalMs = this.basePollIntervalMs;
+    // A manual/self-heal refresh means "read it now" — clear the idle backoff so
+    // the fresh reading is measured at full speed rather than the slow cadence.
+    this.pollPacing = createPollPacing();
     this.pollInFlight = false;
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
@@ -2311,7 +2353,23 @@ export class DOMExtractor {
 
       const derivedState = state ? applyDerivedActivityToState(state) : null;
       this.failureStreak = 0;
-      this.currentPollIntervalMs = this.basePollIntervalMs;
+
+      // Idle-aware pacing: only slow down once the content signature has been
+      // stable for several quiet, non-working polls. Any change, or an agent
+      // that still claims work, keeps full-speed polling.
+      if (derivedState) {
+        const contentKey = pollContentKey(derivedState);
+        const unchanged = contentKey === this.lastContentKey;
+        this.lastContentKey = contentKey;
+        this.currentPollIntervalMs = nextPollInterval(
+          this.pollPacing,
+          { unchanged, working: claimsWork(derivedState) },
+          this.basePollIntervalMs,
+          this.idlePollIntervalMs
+        );
+      } else {
+        this.currentPollIntervalMs = this.basePollIntervalMs;
+      }
 
       if (derivedState && !this.loggedFirstExtraction) {
         this.loggedFirstExtraction = true;

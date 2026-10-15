@@ -114,7 +114,8 @@ All settings are under the `cursorRemote` namespace. Each maps 1:1 to a server e
 | `cursorRemote.cdpUrl` | string | `http://127.0.0.1:9222` | `CDP_URL` | Cursor's CDP endpoint |
 | `cursorRemote.serverPort` | number | `3000` | `SERVER_PORT` | Web server port |
 | `cursorRemote.serverHost` | string | `127.0.0.1` | `SERVER_HOST` | Bind address (localhost-only by default) |
-| `cursorRemote.pollIntervalMs` | number | `500` | `POLL_INTERVAL_MS` | DOM polling frequency |
+| `cursorRemote.pollIntervalMs` | number | `500` | `POLL_INTERVAL_MS` | DOM polling frequency while active |
+| `cursorRemote.idlePollIntervalMs` | number | `2000` | `IDLE_POLL_INTERVAL_MS` | Slower polling cadence when idle |
 | `cursorRemote.debounceMs` | number | `300` | `DEBOUNCE_MS` | Broadcast debounce |
 | `cursorRemote.logLevel` | enum | `info` | `LOG_LEVEL` | Log level |
 | `cursorRemote.webappPassword` | string | *(auto-generated)* | `WEBAPP_PASSWORD` | Password for web client |

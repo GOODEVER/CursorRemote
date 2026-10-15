@@ -461,6 +461,15 @@ export interface ServerConfig {
   serverPort: number;
   serverHost: string;
   pollIntervalMs: number;
+  /**
+   * Poll interval used once the DOM has settled and the agent is idle. An idle
+   * Cursor is the common steady state, so dropping to this slower cadence cuts
+   * the CDP/DOM read cost dramatically without an idle session feeling laggy.
+   * Set <= `pollIntervalMs` to disable idle backoff (always poll at the base
+   * rate). Any content change, agent activity, or user command snaps back to
+   * `pollIntervalMs` immediately.
+   */
+  idlePollIntervalMs: number;
   debounceMs: number;
   selectorsPath: string;
   logLevel: 'debug' | 'info' | 'warn' | 'error';

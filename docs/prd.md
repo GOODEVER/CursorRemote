@@ -599,9 +599,13 @@ A CLI utility (`src/discovery/discover-dom.ts`, run via `npm run discover`) conn
 
 ### 7.4 Polling & Diffing
 
-- The extractor runs every `POLL_INTERVAL_MS` (default 500ms)
+- The extractor runs every `POLL_INTERVAL_MS` (default 500ms) while the agent is
+  active, and drops to `IDLE_POLL_INTERVAL_MS` (default 2000ms) once the DOM has
+  settled and no work is claimed. Any content change, command, or reconnect
+  snaps back to the active rate immediately.
 - A debounce of `DEBOUNCE_MS` (default 300ms) prevents broadcast storms during streaming
-- The State Manager deep-compares (JSON.stringify) each top-level field
+- The State Manager compares each top-level field, memoizing serialized values so
+  the transcript is never serialized twice for the same comparison
 - Only changed fields are included in the `state:patch` event
 
 ---
@@ -617,7 +621,8 @@ All configuration is via environment variables with sensible defaults:
 | `CDP_URL`          | `http://127.0.0.1:9222`   | Cursor's CDP endpoint                    |
 | `SERVER_PORT`      | `3000`                     | Port for the web client + socket.io      |
 | `SERVER_HOST`      | `0.0.0.0`                 | Bind address (0.0.0.0 for LAN access)   |
-| `POLL_INTERVAL_MS` | `500`                      | DOM polling frequency in ms              |
+| `POLL_INTERVAL_MS` | `500`                      | DOM polling frequency in ms (active)     |
+| `IDLE_POLL_INTERVAL_MS` | `2000`                 | Polling cadence in ms when idle          |
 | `DEBOUNCE_MS`      | `300`                      | Minimum broadcast interval in ms         |
 | `SELECTORS_PATH`   | `./selectors.json`         | Path to DOM selector configuration       |
 | `LOG_LEVEL`        | `info`                     | Logging verbosity (debug/info/warn/error)|

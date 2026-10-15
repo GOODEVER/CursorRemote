@@ -183,7 +183,8 @@ Edit `.env` to configure the server. For Telegram, set `TELEGRAM_ENABLED=true` a
 | `CDP_URL` | `http://127.0.0.1:9222` | Cursor's CDP endpoint |
 | `SERVER_PORT` | `3000` | Web server port |
 | `SERVER_HOST` | `127.0.0.1` | Bind address |
-| `POLL_INTERVAL_MS` | `500` | DOM polling frequency (ms) |
+| `POLL_INTERVAL_MS` | `500` | DOM polling frequency (ms) while active |
+| `IDLE_POLL_INTERVAL_MS` | `2000` | Slower polling cadence (ms) when the agent is idle |
 | `DEBOUNCE_MS` | `300` | Broadcast interval (ms) |
 | `LOG_LEVEL` | `info` | Log level |
 | `WEBAPP_PASSWORD` | -- | Password for the web UI |

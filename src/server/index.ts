@@ -82,7 +82,7 @@ async function main(): Promise<void> {
   } else if (config.trustProxy) {
     console.log('[main] Behind a reverse proxy (trustProxy enabled)');
   }
-  console.log(`[main] Poll interval: ${config.pollIntervalMs}ms`);
+  console.log(`[main] Poll interval: ${config.pollIntervalMs}ms (idle: ${config.idlePollIntervalMs}ms)`);
   console.log(`[main] Debounce: ${config.debounceMs}ms`);
   console.log(`[main] Telegram: ${config.telegram.enabled ? 'enabled' : 'disabled'}`);
   console.log();
@@ -109,7 +109,7 @@ async function main(): Promise<void> {
     stateManager.updateWindows(cdpBridge.windows, cdpBridge.activeTargetId);
     commandExecutor.setClient(client);
     if (client) {
-      extractor.start(client, config.pollIntervalMs);
+      extractor.start(client, config.pollIntervalMs, config.idlePollIntervalMs);
     }
   });
 
@@ -139,6 +139,13 @@ async function main(): Promise<void> {
   relay.setRefreshHandler(() => {
     extractor.forceRefresh();
     windowMonitor.forceCycle();
+  });
+
+  // Wake the extractor from the idle poll cadence when the phone sends any
+  // command, so its effect (and the streaming tail that follows) is picked up
+  // at full speed rather than after up to one idle interval.
+  relay.setWakeHandler(() => {
+    extractor.wake();
   });
 
   // Self-heal: when the DOM has frozen for AGENT_STALL_MS while still claiming

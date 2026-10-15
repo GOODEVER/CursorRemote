@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import type { CursorState, CursorWindow } from './types.js';
 import { AGENT_ACTIVITY_STALE_MS } from './activity-stale.js';
 import { detectStall, type StallTracker } from './stall-detector.js';
+import { SignatureCache } from './signature-cache.js';
 
 function emptyState(): CursorState {
   return {
@@ -52,6 +53,10 @@ export class StateManager extends EventEmitter {
   private activitySuppressedMatch: string | undefined = undefined;
   /** Tracks whether the extracted DOM has stopped changing while still "working". */
   private stallTracker: StallTracker | null = null;
+
+  /** Memoizes serialized state values so the diff never re-serializes the same
+   *  transcript/sub-object twice (see SignatureCache). */
+  private signatures = new SignatureCache();
 
   get generation(): number {
     return this._generation;
@@ -368,17 +373,17 @@ export class StateManager extends EventEmitter {
       hasChange = true;
     }
 
-    if (JSON.stringify(prev.messages) !== JSON.stringify(next.messages)) {
+    if (this.signatures.differs(prev.messages, next.messages)) {
       patch.messages = next.messages;
       hasChange = true;
     }
 
-    if (JSON.stringify(prev.pendingApprovals) !== JSON.stringify(next.pendingApprovals)) {
+    if (this.signatures.differs(prev.pendingApprovals, next.pendingApprovals)) {
       patch.pendingApprovals = next.pendingApprovals;
       hasChange = true;
     }
 
-    if (JSON.stringify(prev.chatTabs) !== JSON.stringify(next.chatTabs)) {
+    if (this.signatures.differs(prev.chatTabs, next.chatTabs)) {
       patch.chatTabs = next.chatTabs;
       hasChange = true;
     }
@@ -393,7 +398,7 @@ export class StateManager extends EventEmitter {
       hasChange = true;
     }
 
-    if (JSON.stringify(prev.windows) !== JSON.stringify(next.windows)) {
+    if (this.signatures.differs(prev.windows, next.windows)) {
       patch.windows = next.windows;
       hasChange = true;
     }
@@ -403,22 +408,22 @@ export class StateManager extends EventEmitter {
       hasChange = true;
     }
 
-    if (JSON.stringify(prev.composerQueue) !== JSON.stringify(next.composerQueue)) {
+    if (this.signatures.differs(prev.composerQueue, next.composerQueue)) {
       patch.composerQueue = next.composerQueue;
       hasChange = true;
     }
 
-    if (JSON.stringify(prev.questionnaire) !== JSON.stringify(next.questionnaire)) {
+    if (this.signatures.differs(prev.questionnaire, next.questionnaire)) {
       patch.questionnaire = next.questionnaire;
       hasChange = true;
     }
 
-    if (JSON.stringify(prev.slashCommands ?? []) !== JSON.stringify(next.slashCommands ?? [])) {
+    if (this.signatures.differs(prev.slashCommands ?? [], next.slashCommands ?? [])) {
       patch.slashCommands = next.slashCommands ?? [];
       hasChange = true;
     }
 
-    if (JSON.stringify(prev.folders ?? []) !== JSON.stringify(next.folders ?? [])) {
+    if (this.signatures.differs(prev.folders ?? [], next.folders ?? [])) {
       patch.folders = next.folders ?? [];
       hasChange = true;
     }
