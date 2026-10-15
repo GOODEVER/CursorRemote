@@ -31,6 +31,14 @@ self.addEventListener('push', (event) => {
     self.registration.showNotification(data.title || 'CursorRemote', {
       body: data.body || '',
       tag: data.tag || 'cursor-agent',
+      // Vibration is the only per-event alert we control on a web push (the OS
+      // owns the tone). Prefer the server-sent pattern; fall back to an
+      // insistent triple buzz when the agent needs the user, else a single tap.
+      vibrate: Array.isArray(data.vibrate)
+        ? data.vibrate
+        : (data.tag === 'cursor-questionnaire' || data.tag === 'cursor-approval'
+          ? [200, 100, 200, 100, 200]
+          : [120]),
       icon: 'favicon.png',
       badge: 'favicon.png',
       data: { url: '/' },

@@ -256,6 +256,9 @@
   const $btnNotify = document.getElementById('btn-notify');
   const $notifyIcon = document.getElementById('notify-icon');
   const $finishedOverlay = document.getElementById('finished-overlay');
+  const $finishedWhat = document.getElementById('finished-what');
+  const $finishedWhere = document.getElementById('finished-where');
+  const $finishedSnippet = document.getElementById('finished-snippet');
   const $questionOverlay = document.getElementById('question-overlay');
   const $questionOverlayPreview = document.getElementById('question-overlay-preview');
   const $btnOpenQuestions = document.getElementById('btn-open-questions');
@@ -2324,12 +2327,14 @@
     if (hasQuestionnaire && !hadQuestionnaire) {
       hideFinishedBanner();
       showQuestionAlert();
+      playAlertChime();
       fireNotification('Agent has a question for you', 'cursor-questionnaire');
     } else if (!hasQuestionnaire && hadQuestionnaire) {
       // Question answered/skipped: drop the alert (leave a real finish banner alone).
       hideQuestionAlert();
     } else if (hasApproval && !hadApproval) {
       hideFinishedBanner();
+      playAlertChime();
       const approval = state.pendingApprovals[0];
       fireNotification((approval && approval.description) || 'Agent needs approval', 'cursor-approval');
     }
@@ -2355,7 +2360,13 @@
                 && state.questionnaire.questions.length > 0);
         wasWorking = false;
         if (blocked) return;
-        fireNotification('Agent finished', 'cursor-finished');
+        playChime();
+        const finCtx = finishedContext();
+        fireNotification(
+          'Agent finished' + (finCtx.what ? ': ' + finCtx.what : '')
+            + (finCtx.where ? ' (' + finCtx.where + ')' : ''),
+          'cursor-finished'
+        );
         showFinishedBanner();
       }, FINISH_SETTLE_MS);
     }
@@ -2381,12 +2392,88 @@
    * unmissable), but it never interrupts active typing. Click anywhere to
    * dismiss.
    */
+  /**
+   * Identify which agent/chat finished and where, so a phone watching several
+   * agents at once can tell them apart. `what` prefers the active chat tab in
+   * the current window, then the active agent of the current workspace folder;
+   * `where` is the workspace folder (or window title when it isn't the generic
+   * "Cursor Agents" overview). Both fall back to each other so the banner always
+   * names something, and either may be '' when nothing is known.
+   */
+  function finishedContext() {
+    const windows = state.windows || [];
+    const activeWin = windows.find((w) => w.id === state.activeWindowId);
+    const winTitle = (activeWin && activeWin.title) || '';
+
+    const tabs = state.chatTabs || [];
+    const activeTab = tabs.find((t) => t.isActive)
+      || tabs.find((t) => t.composerId && t.composerId === state.activeComposerId);
+
+    const folders = state.folders || [];
+    const currentFolder = folders.find((f) => f.isCurrent);
+    // The agent currently open in the current folder, for when no tab list is
+    // mounted (plain workspace window rather than the unified overview).
+    const folderAgent = currentFolder
+      ? (currentFolder.agents || []).find((a) => a.isActive)
+      : null;
+
+    // The generic overview window title carries no identity; ignore it.
+    const winTitleUsable = winTitle && !/^cursor\s*agents$/i.test(winTitle) ? winTitle : '';
+
+    const folderName = (currentFolder && currentFolder.name) || '';
+    const what = (activeTab && activeTab.title)
+      || (folderAgent && folderAgent.title)
+      || winTitleUsable
+      || folderName;
+    const where = folderName || winTitleUsable;
+    return { what: what || '', where: where || '' };
+  }
+
+  /** One-line preview of the newest assistant/user content, for the banner. */
+  function finishedSnippet() {
+    let msgs = state.messages || [];
+    if (fullHistory.messages.length > 0) {
+      const matches = !fullHistory.composerId || !state.activeComposerId
+        || fullHistory.composerId === state.activeComposerId;
+      if (matches) msgs = mergeHistoryWithLive(fullHistory.messages, state.messages);
+    }
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (!m) continue;
+      let text = '';
+      if (m.type === 'assistant' || m.type === 'human') text = m.text || '';
+      else if (m.type === 'plan') text = m.title || m.label || '';
+      else if (m.type === 'tool') text = [m.action, m.details].filter(Boolean).join(' ');
+      if (!text) continue;
+      const clean = String(text).replace(/\s+/g, ' ').trim();
+      if (!clean) continue;
+      return clean.length > 120 ? clean.slice(0, 119) + '\u2026' : clean;
+    }
+    return '';
+  }
+
   function showFinishedBanner() {
     if (!$finishedOverlay) return;
     const input = document.getElementById('message-input');
     const typing = !!input
       && (document.activeElement === input || (input.value || '').trim().length > 0);
     if (typing) return;
+
+    const ctx = finishedContext();
+    const snippet = finishedSnippet();
+    if ($finishedWhat) {
+      $finishedWhat.textContent = ctx.what;
+      $finishedWhat.classList.toggle('hidden', !ctx.what);
+    }
+    if ($finishedWhere) {
+      $finishedWhere.textContent = ctx.where ? `in ${ctx.where}` : '';
+      $finishedWhere.classList.toggle('hidden', !ctx.where);
+    }
+    if ($finishedSnippet) {
+      $finishedSnippet.textContent = snippet;
+      $finishedSnippet.classList.toggle('hidden', !snippet);
+    }
+
     $finishedOverlay.classList.remove('hidden');
   }
 
@@ -2976,6 +3063,82 @@
   ['pointerdown', 'keydown'].forEach(function (evt) {
     window.addEventListener(evt, primeNotificationPermission, { once: true });
   });
+  // Same first-user-gesture hook unlocks the Web Audio context below, so the
+  // in-page chime can play later even though it fires without a gesture.
+  ['pointerdown', 'keydown'].forEach(function (evt) {
+    window.addEventListener(evt, unlockAudio, { once: true });
+  });
+
+  /**
+   * Short in-page sounds. Browsers cannot attach a custom sound to a push, and
+   * a service worker cannot play audio at all, so this is the only way to give
+   * an audible cue — and it works even while the app is focused (when the OS
+   * notification is suppressed). Synthesized with the Web Audio API rather than
+   * shipping an asset, and deliberately quiet (low gain).
+   *
+   * Autoplay policy requires a prior user gesture on the page, which the
+   * unlock listeners above provide; if that never happened, `state` stays
+   * 'suspended' and the sounds are silently skipped.
+   */
+  let audioContext = null;
+  function unlockAudio() {
+    if (typeof window === 'undefined' || (!window.AudioContext && !window.webkitAudioContext)) return;
+    try {
+      if (!audioContext) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        audioContext = new Ctx();
+      }
+      if (audioContext.state === 'suspended') void audioContext.resume();
+    } catch (_) { /* ignore */ }
+  }
+
+  /**
+   * Play a sequence of tones: [frequency, offsetSeconds, durationSeconds, peakGain].
+   * Shared by the finished and "needs you" motifs so they stay consistent and
+   * easy to retune.
+   */
+  function playTones(tones, type) {
+    if (!audioContext || audioContext.state !== 'running') return;
+    try {
+      const now = audioContext.currentTime;
+      tones.forEach(function (tone) {
+        const freq = tone[0];
+        const offset = tone[1] || 0;
+        const duration = tone[2] || 0.16;
+        const peak = tone[3] || 0.14;
+        const osc = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        osc.type = type || 'sine';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.0001, now + offset);
+        gain.gain.exponentialRampToValueAtTime(peak, now + offset + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + duration);
+        osc.connect(gain);
+        gain.connect(audioContext.destination);
+        osc.start(now + offset);
+        osc.stop(now + offset + duration + 0.04);
+      });
+    } catch (_) { /* ignore */ }
+  }
+
+  /** "The agent finished": two ascending sine blips. */
+  function playChime() {
+    playTones([[880, 0], [1174.66, 0.14]]);
+  }
+
+  /**
+   * "The agent needs you" (asked a question / wants approval): a rising
+   * three-note triangle motif. Deliberately distinct from the finished chime —
+   * different timbre and a longer, more insistent shape — so a glance-free
+   * listener can tell "it wants something" from "it's done".
+   */
+  function playAlertChime() {
+    playTones([
+      [659.25, 0, 0.14, 0.16],
+      [987.77, 0.16, 0.14, 0.16],
+      [1318.51, 0.32, 0.24, 0.16],
+    ], 'triangle');
+  }
 
   // --- Web Push (real notifications via service worker + VAPID) ---
   // Needed so notifications arrive when the page is backgrounded/closed,

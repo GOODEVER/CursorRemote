@@ -30,8 +30,11 @@ export interface WebPushManager {
   /**
    * Send a push to every stored subscription. Returns how many were delivered.
    * Subscriptions that the push service reports as gone (404/410) are pruned.
+   * `vibrate` is a per-event-type haptic pattern the service worker applies —
+   * the closest a web push can get to a distinct "sound" (platforms own the
+   * actual alert tone).
    */
-  send(payload: { title: string; body: string; tag?: string }): Promise<number>;
+  send(payload: { title: string; body: string; tag?: string; vibrate?: number[] }): Promise<number>;
 }
 
 const MAX_SUBSCRIPTIONS = 64;

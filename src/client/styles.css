@@ -1620,6 +1620,40 @@ header {
   opacity: 0.9;
 }
 
+/* Identity lines: which agent finished (#finished-what) and where it ran
+   (#finished-where). Shown only when the corresponding field is known. */
+.finished-what {
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.25;
+  word-break: break-word;
+}
+
+.finished-what.hidden { display: none; }
+
+.finished-where {
+  font-size: 13px;
+  font-weight: 500;
+  opacity: 0.85;
+  word-break: break-word;
+}
+.finished-where.hidden { display: none; }
+
+/* One-line preview of the agent's newest output, so the banner says what it
+   actually produced, not just that it stopped. Clamped to three lines. */
+.finished-snippet {
+  margin-top: 2px;
+  max-width: 100%;
+  font-size: 13px;
+  line-height: 1.4;
+  opacity: 0.92;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.finished-snippet.hidden { display: none; }
+
 /* --- Big "agent asked a question" alert --- */
 
 .question-overlay .question-card {

@@ -157,6 +157,14 @@ export class Relay {
   private pushFinishTimer: ReturnType<typeof setTimeout> | null = null;
   private pushPrimed = false;
   private static readonly PUSH_FINISH_SETTLE_MS = 5000;
+  /**
+   * Haptic patterns per push type. A web push cannot choose its alert sound
+   * (the OS owns that), so a distinct vibration is the most a background alert
+   * can do to signal "needs you" vs "finished". "Needs you" is a longer,
+   * insistent triple buzz; "finished" is a single short tap.
+   */
+  private static readonly PUSH_VIBRATE_NEEDS_YOU = [200, 100, 200, 100, 200];
+  private static readonly PUSH_VIBRATE_FINISHED = [120];
 
   /** Max-Age for session cookie (30 days), aligned with typical “stay signed in” expectation. */
   private static readonly SESSION_COOKIE_MAX_AGE_SEC = 30 * 24 * 60 * 60;
@@ -1166,13 +1174,15 @@ export class Relay {
       void this.push(
         'Agent has a question',
         questionText || 'The agent is asking you something.',
-        'cursor-questionnaire'
+        'cursor-questionnaire',
+        Relay.PUSH_VIBRATE_NEEDS_YOU
       );
     } else if (hasA && !this.pushHadApproval) {
       void this.push(
         'Agent needs approval',
         approvalDesc || 'The agent is waiting for your approval.',
-        'cursor-approval'
+        'cursor-approval',
+        Relay.PUSH_VIBRATE_NEEDS_YOU
       );
     }
 
@@ -1190,6 +1200,33 @@ export class Relay {
     this.pushHadApproval = hasA;
   }
 
+  /**
+   * Name the agent/chat that most likely just finished, for the background push
+   * body. Prefers the home window's active chat tab, then the current workspace
+   * folder's active agent, then the window title (ignoring the generic
+   * "Cursor Agents" overview), and appends the workspace it ran in. Returns ''
+   * when nothing is known, so the caller keeps its generic wording.
+   */
+  private finishedPushLabel(): string {
+    const state = this.stateManager.getCurrentState();
+    const tabs = state.chatTabs ?? [];
+    const activeTab = tabs.find((t) => t.isActive)
+      || tabs.find((t) => t.composerId && t.composerId === state.activeComposerId);
+
+    const folders = state.folders ?? [];
+    const current = folders.find((f) => f.isCurrent);
+    const folderAgent = current ? (current.agents ?? []).find((a) => a.isActive) : undefined;
+
+    const win = (state.windows ?? []).find((w) => w.id === state.activeWindowId);
+    const winTitle = win && win.title && !/^cursor\s*agents$/i.test(win.title) ? win.title : '';
+
+    const what = (activeTab && activeTab.title) || (folderAgent && folderAgent.title) || winTitle
+      || (current && current.name) || '';
+    const where = (current && current.name) || winTitle || '';
+    if (!what) return '';
+    return where && where !== what ? `${what} in ${where}` : what;
+  }
+
   private scheduleFinishCheck(): void {
     if (this.pushFinishTimer) return;
     this.pushFinishTimer = setTimeout(() => {
@@ -1205,12 +1242,18 @@ export class Relay {
         return;
       }
       this.pushWasWorking = false;
-      void this.push('Agent finished', 'The agent has finished working.', 'cursor-finished');
+      const label = this.finishedPushLabel();
+      void this.push(
+        'Agent finished',
+        label ? `${label} finished.` : 'The agent has finished working.',
+        'cursor-finished',
+        Relay.PUSH_VIBRATE_FINISHED
+      );
     }, Relay.PUSH_FINISH_SETTLE_MS);
   }
 
-  private async push(title: string, body: string, tag?: string): Promise<void> {
-    const delivered = await this.webPush.send({ title, body, tag });
+  private async push(title: string, body: string, tag?: string, vibrate?: number[]): Promise<void> {
+    const delivered = await this.webPush.send({ title, body, tag, vibrate });
     if (delivered > 0) {
       console.log(`[web-push] Sent "${title}" to ${delivered} subscription(s)`);
     }

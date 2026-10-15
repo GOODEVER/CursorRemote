@@ -82,6 +82,35 @@ function createTestEnv() {
       (window as any).__notifications = notifications;
       // fireNotification() bails when the document is focused; tests are headless.
       window.document.hasFocus = () => false;
+
+      // Web Audio stub so the in-page chimes can be asserted. Records every
+      // oscillator's frequency + type, and reports the context as 'running' so
+      // the code's autoplay gate passes without a real user gesture.
+      const tones: Array<{ freq: number; type: string }> = [];
+      class OscStub {
+        type = 'sine';
+        frequency = { value: 0 };
+        connect() { return this; }
+        start() { tones.push({ freq: this.frequency.value, type: this.type }); }
+        stop() { /* no-op */ }
+      }
+      class GainStub {
+        gain = {
+          setValueAtTime() { return this; },
+          exponentialRampToValueAtTime() { return this; },
+        };
+        connect() { return this; }
+      }
+      class AudioContextStub {
+        state = 'running';
+        currentTime = 0;
+        destination = {};
+        createOscillator() { return new OscStub(); }
+        createGain() { return new GainStub(); }
+        resume() { return Promise.resolve(); }
+      }
+      (window as any).AudioContext = AudioContextStub;
+      (window as any).__tones = tones;
     },
   });
 
@@ -234,6 +263,89 @@ describe('web: finished notification', () => {
 
     firePatch(env.mockSocket, { agentStatus: 'thinking', canAbort: true, agentActivityLive: true });
     assert.ok(overlay().classList.contains('hidden'), 'banner hidden once work resumes');
+  });
+
+  it('names which agent finished and where it ran', async () => {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    // Two agents under one workspace, with the second one active — the banner
+    // must name that one, not just say "Agent finished".
+    fireFullState(env.mockSocket, {
+      ...fixture[1].state!,
+      canAbort: true,
+      windows: [{ id: 'w1', title: 'Cursor Agents', url: '' }],
+      activeWindowId: 'w1',
+      chatTabs: [
+        { composerId: 'c1', title: 'Refactor auth flow', isActive: false, status: 'idle', selectorPath: '' },
+        { composerId: 'c2', title: 'Add dark mode', isActive: true, status: 'active', selectorPath: '' },
+      ],
+      folders: [
+        {
+          name: 'FactoryTycoonGame', sectionId: 'workspace:ft', kind: 'workspace', isCurrent: true,
+          agents: [
+            { title: 'Refactor auth flow', composerId: 'c1', sectionId: 'workspace:ft', isActive: false, selectorPath: '' },
+            { title: 'Add dark mode', composerId: 'c2', sectionId: 'workspace:ft', isActive: true, selectorPath: '' },
+          ],
+        },
+      ],
+    } as CursorState);
+
+    firePatch(env.mockSocket, { agentStatus: 'idle', canAbort: false, agentActivityLive: false, agentActivityText: null });
+    await new Promise((r) => setTimeout(r, 5200));
+
+    const what = env.document.getElementById('finished-what')!;
+    const where = env.document.getElementById('finished-where')!;
+    assert.equal(what.textContent, 'Add dark mode', 'banner names the finished agent');
+    assert.match(where.textContent!, /FactoryTycoonGame/, 'banner names the workspace');
+
+    // The OS/push notification body also carries the identity.
+    const finished = notifications().filter((n) => n.tag === 'cursor-finished');
+    assert.equal(finished.length, 1);
+    assert.match(finished[0].body || '', /Add dark mode/);
+  });
+
+  it('plays a distinct sound when the agent asks a question', async () => {
+    const tones = () => (env.window as any).__tones as Array<{ freq: number; type: string }>;
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+
+    // Working, then a questionnaire appears — the "needs you" transition.
+    fireFullState(env.mockSocket, { ...fixture[1].state!, canAbort: true });
+    assert.equal(tones().length, 0, 'no sound while working');
+    // Audio is unlocked on the first user gesture; simulate one so the chimes
+    // are allowed to play (mirrors a real tap before the agent asks anything).
+    env.window.dispatchEvent(new env.window.KeyboardEvent('keydown'));
+    firePatch(env.mockSocket, {
+      questionnaire: {
+        questions: [{ number: '1', text: 'Which approach?', options: [], isActive: true }],
+        activeIndex: 0,
+        totalLabel: '1 / 1',
+        skipSelectorPath: '',
+        continueSelectorPath: '',
+        continueDisabled: false,
+      },
+    });
+
+    const alert = tones().slice();
+    assert.ok(alert.length >= 3, 'alert motif uses three notes');
+    // The alert motif is triangle-wave (distinct timbre from the finished sine chime).
+    assert.ok(alert.every((t) => t.type === 'triangle'), 'alert uses a distinct timbre');
+    const alertFreqs = alert.map((t) => t.freq);
+
+    // Now finish and confirm the finished chime is a DIFFERENT motif.
+    tones().length = 0;
+    firePatch(env.mockSocket, {
+      questionnaire: null,
+      agentStatus: 'idle', canAbort: false, agentActivityLive: false, agentActivityText: null,
+    });
+    await new Promise((r) => setTimeout(r, 5200));
+    const finished = tones().slice();
+    assert.ok(finished.length >= 1, 'finished chime played');
+    assert.ok(finished.every((t) => t.type === 'sine'), 'finished uses the sine chime');
+
+    assert.notDeepEqual(
+      finished.map((t) => t.freq),
+      alertFreqs,
+      'question alert and finished chime are different sounds'
+    );
   });
 });
 

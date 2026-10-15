@@ -165,6 +165,13 @@
     <div class="finished-card">
       <div class="finished-icon" aria-hidden="true">&#10003;</div>
       <div class="finished-title">Agent finished</div>
+      <!-- With several agents running at once, name the chat that finished
+           (#finished-what) and the workspace it ran in (#finished-where), plus a
+           one-line preview of its last output (#finished-snippet). Populated by
+           showFinishedBanner(); each line hides itself when unknown. -->
+      <div class="finished-what" id="finished-what"></div>
+      <div class="finished-where" id="finished-where"></div>
+      <div class="finished-snippet" id="finished-snippet"></div>
       <div class="finished-sub">Tap anywhere to dismiss</div>
     </div>
   </div>
