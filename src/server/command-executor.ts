@@ -459,18 +459,20 @@ export class CommandExecutor {
       }
 
       console.log(`[command-executor] Focused: ${result.info}`);
+      // Focus settle: keep short — CDP input events arrive on an ordered
+      // channel, so only the renderer's focus handling needs this beat.
       await sleep(FOCUS_DELAY_MS);
 
       // Step 2: Clear any existing text via Ctrl+A then Delete (CDP Input domain)
       await client.pressKey('a', 'KeyA', 65, 2); // 2 = Ctrl modifier
-      await sleep(50);
+      await sleep(30);
       await client.pressKey('Backspace', 'Backspace', 8);
-      await sleep(50);
+      await sleep(30);
 
       // Step 3: Insert text via CDP Input.insertText (native Chromium input pipeline)
       await client.typeText(text);
       console.log(`[command-executor] Text inserted via Input.insertText (${text.length} chars)`);
-      await sleep(150);
+      await sleep(80);
 
       // Step 4: Submit with Enter via CDP Input.dispatchKeyEvent
       await client.pressKey('Enter', 'Enter', 13);
@@ -478,29 +480,34 @@ export class CommandExecutor {
 
       const trimmedText = text.trim();
       if (trimmedText.length > 0) {
-        await sleep(300);
-        const stillContainsTypedText = await client.evaluate(`
-          (() => {
-            const strategies = ${JSON.stringify(strategies)};
-            const typedText = ${JSON.stringify(trimmedText)};
-            let input = null;
-            for (const sel of strategies) {
-              try {
-                input = document.querySelector(sel);
-                if (input) break;
-              } catch {}
-            }
-            if (!input) return false;
-            const valueText = typeof input.value === 'string' ? input.value : '';
-            const contentText = input.textContent ?? input.innerText ?? '';
-            const currentText = (input.isContentEditable ? contentText : (valueText || contentText)).trim();
-            return currentText.length > 0 && currentText.includes(typedText);
-          })()
-        `) as boolean;
+        // Verify submission by waiting until the composer no longer holds the
+        // typed text (event-driven, with a cap) instead of a fixed 300ms sleep —
+        // Cursor usually clears the composer well before the cap.
+        await sleep(120);
+        for (let attempt = 0; attempt < 4; attempt++) {
+          const stillContainsTypedText = await client.evaluate(`
+            (() => {
+              const strategies = ${JSON.stringify(strategies)};
+              const typedText = ${JSON.stringify(trimmedText)};
+              let input = null;
+              for (const sel of strategies) {
+                try {
+                  input = document.querySelector(sel);
+                  if (input) break;
+                } catch {}
+              }
+              if (!input) return false;
+              const valueText = typeof input.value === 'string' ? input.value : '';
+              const contentText = input.textContent ?? input.innerText ?? '';
+              const currentText = (input.isContentEditable ? contentText : (valueText || contentText)).trim();
+              return currentText.length > 0 && currentText.includes(typedText);
+            })()
+          `) as boolean;
 
-        if (stillContainsTypedText) {
+          if (!stillContainsTypedText) break;
           const isMac = process.platform === 'darwin';
           await client.pressKey('Enter', 'Enter', 13, isMac ? 4 : 2);
+          await sleep(120);
           console.log(`[command-executor] ${isMac ? 'Cmd' : 'Ctrl'}+Enter retry fired because composer still contained typed text`);
         }
       }
@@ -522,24 +529,25 @@ export class CommandExecutor {
       const probe = (expectText ?? '').trim();
       if (probe.length === 0) return;
 
-      await sleep(300);
-      const stillContainsTypedText = await client.evaluate(`
-        (() => {
-          const strategies = ${JSON.stringify(strategies)};
-          const typedText = ${JSON.stringify(probe)};
-          let input = null;
-          for (const sel of strategies) {
-            try { input = document.querySelector(sel); if (input) break; } catch {}
-          }
-          if (!input) return false;
-          const valueText = typeof input.value === 'string' ? input.value : '';
-          const contentText = input.textContent ?? input.innerText ?? '';
-          const currentText = (input.isContentEditable ? contentText : (valueText || contentText)).trim();
-          return currentText.length > 0 && currentText.includes(typedText);
-        })()
-      `) as boolean;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        await sleep(150);
+        const stillContainsTypedText = await client.evaluate(`
+          (() => {
+            const strategies = ${JSON.stringify(strategies)};
+            const typedText = ${JSON.stringify(probe)};
+            let input = null;
+            for (const sel of strategies) {
+              try { input = document.querySelector(sel); if (input) break; } catch {}
+            }
+            if (!input) return false;
+            const valueText = typeof input.value === 'string' ? input.value : '';
+            const contentText = input.textContent ?? input.innerText ?? '';
+            const currentText = (input.isContentEditable ? contentText : (valueText || contentText)).trim();
+            return currentText.length > 0 && currentText.includes(typedText);
+          })()
+        `) as boolean;
 
-      if (stillContainsTypedText) {
+        if (!stillContainsTypedText) break;
         const isMac = process.platform === 'darwin';
         await client.pressKey('Enter', 'Enter', 13, isMac ? 4 : 2);
         console.log('[command-executor] submitComposer: Cmd/Ctrl+Enter retry fired');

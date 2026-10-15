@@ -205,6 +205,21 @@ export class Relay {
         methods: ['GET', 'POST'],
         credentials: true,
       },
+      // Latency tuning for the phone-over-Cloudflare-tunnel path:
+      // - pingTimeout 60s (default 20s): backgrounded mobile clients + tunnel
+      //   RTT caused constant "ping timeout" churn in the logs, and every
+      //   reconnect restarts from scratch. A wider window rides out stalls.
+      // - maxHttpBufferSize 8MB (default 1MB): history:full payloads can exceed
+      //   1MB and were chunked across multiple polling round trips through the
+      //   tunnel (each ~100-300ms RTT).
+      // - perMessageDeflate: state:patch carries the full messages array (incl.
+      //   HTML) on every streaming tick; HTML compresses ~10x, which dominates
+      //   perceived latency on constrained mobile links. Threshold keeps tiny
+      //   packets (pings/acks) uncompressed.
+      pingInterval: 25000,
+      pingTimeout: 60000,
+      maxHttpBufferSize: 8e6,
+      perMessageDeflate: { threshold: 1024 },
     });
 
     this.setupRoutes();

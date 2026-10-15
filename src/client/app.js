@@ -274,6 +274,13 @@
     reconnectionDelay: 1000,
     reconnectionDelayMax: 10000,
     withCredentials: true,
+    // Latency: skip the long-polling handshake phase. Over the Cloudflare
+    // tunnel each polling round trip costs ~100-300ms, so starting on polling
+    // and upgrading later made every command feel sluggish right after a
+    // reconnect. The tunnel advertises websocket upgrades, so connect
+    // WebSocket-first and fall back to polling only when WS is blocked.
+    transports: ['websocket'],
+    upgrade: false,
     auth: (cb) => {
       try {
         cb({ token: getAuthToken() || '' });
