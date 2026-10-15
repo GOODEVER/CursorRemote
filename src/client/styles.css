@@ -2092,6 +2092,11 @@ header {
   padding: 4px 6px;
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
+  /* Only ~23x23px before, which is under the 44px minimum touch target and is
+     why the bell was hard to hit on a phone. Grow the hit area while keeping
+     the glyph visually small. */
+  min-width: 44px;
+  min-height: 44px;
 }
 .header-notify-btn:active { background: var(--bg-hover); border-radius: 10px; }
 
@@ -2106,12 +2111,24 @@ header {
 .notify-toggle {
   margin: 4px 16px 0;
   width: calc(100% - 32px);
+  /* `.btn` alone supplies no padding, background or height, which left this
+     looking like plain text with a hairline tap target. Give it a real,
+     thumb-sized button. */
+  min-height: 44px;
+  padding: 12px 16px;
+  background: var(--accent-blue);
+  color: #fff;
+  font-size: 14px;
 }
+
+.notify-toggle:disabled { opacity: 0.5; }
 
 .notify-toggle.notify-toggle-off {
   background: var(--bg-hover);
   color: var(--text-primary);
 }
+
+.notify-toggle.notify-toggle-off:active { background: var(--border-color); }
 
 .notify-hint {
   padding: 10px 16px 16px;

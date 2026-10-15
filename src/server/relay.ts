@@ -574,7 +574,13 @@ export class Relay {
       const p256dh = body?.keys?.p256dh;
       const auth = body?.keys?.auth;
       if (typeof endpoint !== 'string' || !endpoint
-        || typeof p256dh !== 'string' || typeof auth !== 'string') {
+        || typeof p256dh !== 'string' || !auth
+        || typeof auth !== 'string') {
+        console.warn(
+          `[web-push] Rejected subscription: endpoint=${typeof endpoint} `
+          + `p256dh=${typeof p256dh} auth=${typeof auth} `
+          + `bodyKeys=${body ? Object.keys(body).join(',') : 'none'}`
+        );
         return res.status(400).json({ error: 'Invalid subscription' });
       }
       const label = typeof req.headers['user-agent'] === 'string'

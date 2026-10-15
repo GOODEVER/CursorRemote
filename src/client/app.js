@@ -3183,21 +3183,67 @@
       // Reflect an existing subscription (no prompt).
       var existing = await reg.pushManager.getSubscription();
       pushSubscribed = !!existing;
-      if (existing) await syncPushSubscription(existing);
+      if (existing) {
+        try {
+          await syncPushSubscription(existing);
+        } catch (e) {
+          // Browser holds a subscription the server does not (or cannot store).
+          // Reflect reality so the user can re-enable instead of being told "ON".
+          pushSubscribed = false;
+        }
+      }
     } catch (e) {
       // Push is optional; ignore failures (e.g. insecure origin).
     }
   }
 
+  // Encode a raw key buffer as base64url, the format the server expects.
+  function b64urlFromBuffer(buf) {
+    var bytes = new Uint8Array(buf);
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return window.btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  // Some Chromium builds expose `PushSubscription.toJSON()`, but not all of
+  // them (and Vanadium has been seen without it). Falling back to getKey() +
+  // base64url keeps subscription working instead of throwing into a silent
+  // catch that left the UI claiming "ON" while the server had nothing.
+  function subscriptionToPayload(sub) {
+    if (typeof sub.toJSON === 'function') {
+      try {
+        var j = sub.toJSON();
+        if (j && j.endpoint && j.keys && j.keys.p256dh && j.keys.auth) return j;
+      } catch (_) { /* fall through to getKey */ }
+    }
+    var p256dh = typeof sub.getKey === 'function' ? sub.getKey('p256dh') : null;
+    var auth = typeof sub.getKey === 'function' ? sub.getKey('auth') : null;
+    return {
+      endpoint: sub.endpoint,
+      keys: {
+        p256dh: p256dh ? b64urlFromBuffer(p256dh) : '',
+        auth: auth ? b64urlFromBuffer(auth) : '',
+      },
+    };
+  }
+
   async function syncPushSubscription(sub) {
-    try {
-      var json = sub.toJSON();
-      await fetch('/api/push/subscribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ endpoint: json.endpoint, keys: json.keys }),
-      });
-    } catch (_) { /* ignore */ }
+    var json = subscriptionToPayload(sub);
+    if (!json.endpoint || !json.keys || !json.keys.p256dh || !json.keys.auth) {
+      throw new Error('could not read push keys from this browser');
+    }
+    var res = await fetch('/api/push/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpoint: json.endpoint, keys: json.keys }),
+    });
+    // Surface server-side rejection instead of silently pretending to be
+    // subscribed (the UI used to claim "ON" even when the POST failed).
+    if (!res.ok) {
+      var detail = '';
+      try { detail = (await res.json()).error || ''; } catch (_) { /* ignore */ }
+      throw new Error('server rejected subscription' + (detail ? ': ' + detail : ''));
+    }
   }
 
   async function enablePush() {
