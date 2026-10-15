@@ -29,11 +29,18 @@ REM --- HTTPS (optional) -------------------------------------------------
 REM Serve over https/wss with your own PEM files. Point these at a real
 REM certificate (e.g. Let's Encrypt fullchain.pem + privkey.pem) and set
 REM TLS_ENABLED=true. Leave false to keep serving plain HTTP.
-set TLS_ENABLED=false
-set TLS_CERT_PATH=
-set TLS_KEY_PATH=
-REM Set to true if you terminate TLS at a reverse proxy instead.
-set TRUST_PROXY=false
+REM
+REM NOTE: the Cloudflare tunnel on the Debian server targets this PC as
+REM   https://192.168.1.9:9301
+REM so TLS must stay enabled for cursor.tarzi.be to work. The self-signed
+REM cert in data\certs\ is generated for the LAN IPs; the tunnel accepts it
+REM because its origin rule sets noTLSVerify. Regenerate (see docs\https.md)
+REM if this PC's LAN IP changes.
+set TLS_ENABLED=true
+set TLS_CERT_PATH=data\certs\cert.pem
+set TLS_KEY_PATH=data\certs\key.pem
+REM Trust the fronting proxy/tunnel (Cloudflare) for X-Forwarded-* headers.
+set TRUST_PROXY=true
 REM ----------------------------------------------------------------------
 REM ----------------------------------------------------------
 
