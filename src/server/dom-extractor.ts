@@ -1642,6 +1642,40 @@ export function extractionFunction(
       } catch { /* skip */ }
       return false;
     };
+    // Per-row working-state glyph. Cursor renders one status icon per sidebar row
+    // (the SAME widgets it uses inside a chat): an animated dot-grid loader while
+    // the agent works, otherwise a `ui-agent-status-dot` carrying a data-variant
+    // and an aria-label. Reading this per row is what lets the remote show EVERY
+    // agent that is working, not just the active one of each window. Works
+    // regardless of theme (classes, not colors).
+    const agentStatusFromRow = (li: Element): FolderAgent['agentStatus'] => {
+      const statusIcon = li.querySelector('.ui-sidebar-menu-button-status-icon')
+        || li.querySelector('.composer-subagent-status-indicator');
+      if (!statusIcon) return null;
+      // Any animated dot-grid loader = the agent is actively working.
+      if (statusIcon.querySelector('.ui-dot-grid-loader, [data-shape="sine_3x3"], .ui-dot-grid-animator')) {
+        return 'working';
+      }
+      const labelled = statusIcon.querySelector('[aria-label]');
+      const label = (labelled?.getAttribute('aria-label') || statusIcon.getAttribute('aria-label') || '').trim();
+      const dot = statusIcon.querySelector('.ui-agent-status-dot');
+      const variant = (dot?.getAttribute('data-variant') || '').trim();
+      switch (label.toLowerCase()) {
+        case 'needs attention': return 'needs_attention';
+        case 'error': return 'error';
+        case 'completed': return 'completed';
+        case 'draft': return 'draft';
+        default: break;
+      }
+      switch (variant) {
+        case 'needs-attention': return 'needs_attention';
+        case 'error': return 'error';
+        case 'done-seen':
+        case 'done-unseen': return 'completed';
+        case 'draft': return 'draft';
+        default: return null;
+      }
+    };
     try {
       const sectionEls = document.querySelectorAll('section[data-sidebar-workspace-section-root]');
       for (const section of Array.from(sectionEls)) {
@@ -1684,6 +1718,7 @@ export function extractionFunction(
             composerId,
             sectionId,
             isActive,
+            agentStatus: agentStatusFromRow(li),
             selectorPath: buildSelectorPath(li),
           });
         }

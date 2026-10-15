@@ -2078,6 +2078,14 @@ header {
 .header-folders-btn:active { background: var(--bg-hover); }
 .header-folders-icon { font-size: 12px; }
 
+/* A "needs you" pulse on the Folders button when an agent in any folder is
+   blocked on a question/approval, so the drawer isn't a blind tap. */
+.header-folders-btn.needs-input {
+  border-color: var(--accent-yellow);
+  color: var(--accent-yellow);
+  animation: folderAgentPulse 1.1s ease-in-out infinite;
+}
+
 /* --- Notifications (web push) --- */
 
 .header-notify-btn {
@@ -2300,6 +2308,33 @@ header {
 }
 
 .folder-agent.working { color: var(--text-primary); }
+
+/* Agent blocked waiting on the user: a "?" (question) or "!" (approval) badge,
+   pinned to the end of the row like the spinner. Coloured yellow so it stands
+   apart from the blue "working" spinner, and pulsing so it reads as an action
+   the user needs to take. */
+.folder-agent-needs {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent-yellow);
+  color: #181818;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  animation: folderAgentPulse 1.1s ease-in-out infinite;
+}
+
+.folder-agent.needs-input { color: var(--text-primary); }
+
+@keyframes folderAgentPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.88); }
+}
 
 @keyframes folderAgentSpin {
   from { transform: rotate(0deg); }

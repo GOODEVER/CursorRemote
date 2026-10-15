@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { randomBytes, timingSafeEqual } from 'crypto';
 import { readFileSync } from 'fs';
-import type { ServerConfig, CursorState, CommandPayload, CommandResult } from './types.js';
+import type { ServerConfig, CursorState, FolderAgent, CommandPayload, CommandResult } from './types.js';
 import type { StateManager } from './state-manager.js';
 import type { CommandExecutor } from './command-executor.js';
 import type { CDPBridge } from './cdp-bridge.js';
@@ -1278,10 +1278,10 @@ export class Relay {
 
   /**
    * Name the agent/chat that most likely just finished, for the background push
-   * body. Prefers the home window's active chat tab, then the current workspace
-   * folder's active agent, then the window title (ignoring the generic
-   * "Cursor Agents" overview), and appends the workspace it ran in. Returns ''
-   * when nothing is known, so the caller keeps its generic wording.
+   * body. Prefers the home window's active chat tab, then the active agent of
+   * the finished agent's workspace folder, then the window title (ignoring the
+   * generic "Cursor Agents" overview), and appends the workspace it ran in.
+   * Returns '' when nothing is known, so the caller keeps its generic wording.
    */
   private finishedPushLabel(): string {
     const state = this.stateManager.getCurrentState();
@@ -1290,15 +1290,27 @@ export class Relay {
       || tabs.find((t) => t.composerId && t.composerId === state.activeComposerId);
 
     const folders = state.folders ?? [];
-    const current = folders.find((f) => f.isCurrent);
-    const folderAgent = current ? (current.agents ?? []).find((a) => a.isActive) : undefined;
+    // Identify the folder by the finished agent's composer id rather than
+    // `isCurrent`: when the relay is homed on the "Cursor Agents" overview no
+    // folder is marked current, so the push would otherwise omit the folder.
+    const targetComposerId = (activeTab && activeTab.composerId) || state.activeComposerId || '';
+    let owner: CursorState['folders'][number] | undefined;
+    let ownerAgent: FolderAgent | undefined;
+    if (targetComposerId) {
+      for (const f of folders) {
+        const a = (f.agents ?? []).find((x) => x.composerId && x.composerId === targetComposerId);
+        if (a) { owner = f; ownerAgent = a; break; }
+      }
+    }
+    if (!owner) owner = folders.find((f) => f.isCurrent);
+    const folderAgent = ownerAgent || (owner ? (owner.agents ?? []).find((a) => a.isActive) : undefined);
 
     const win = (state.windows ?? []).find((w) => w.id === state.activeWindowId);
     const winTitle = win && win.title && !/^cursor\s*agents$/i.test(win.title) ? win.title : '';
 
     const what = (activeTab && activeTab.title) || (folderAgent && folderAgent.title) || winTitle
-      || (current && current.name) || '';
-    const where = (current && current.name) || winTitle || '';
+      || (owner && owner.name) || '';
+    const where = (owner && owner.name) || winTitle || '';
     if (!what) return '';
     return where && where !== what ? `${what} in ${where}` : what;
   }

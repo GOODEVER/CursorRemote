@@ -317,6 +317,47 @@ describe('web: finished notification', () => {
     assert.match(finished[0].body || '', /Add dark mode/);
   });
 
+  it('names the folder that finished even when no folder is marked current', async () => {
+    // Regression: when the relay is homed on the "Cursor Agents" overview window,
+    // Cursor marks no folder `isCurrent`. The banner must still resolve the
+    // finished agent's folder by composer id, not fall back to a blank name.
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    fireFullState(env.mockSocket, {
+      ...fixture[1].state!,
+      canAbort: true,
+      windows: [{ id: 'w1', title: 'Cursor Agents', url: '' }],
+      activeWindowId: 'w1',
+      activeComposerId: 'c2',
+      chatTabs: [],
+      folders: [
+        {
+          name: 'FactoryTycoonGame', sectionId: 'workspace:ft', kind: 'workspace', isCurrent: false,
+          agents: [
+            { title: 'Refactor auth flow', composerId: 'c1', sectionId: 'workspace:ft', isActive: false, selectorPath: '' },
+            { title: 'Add dark mode', composerId: 'c2', sectionId: 'workspace:ft', isActive: false, selectorPath: '' },
+          ],
+        },
+        {
+          name: 'OtherRepo', sectionId: 'repo:other', kind: 'repo', isCurrent: false,
+          agents: [
+            { title: 'Unrelated work', composerId: 'c9', sectionId: 'repo:other', isActive: false, selectorPath: '' },
+          ],
+        },
+      ],
+    } as CursorState);
+
+    firePatch(env.mockSocket, { agentStatus: 'idle', canAbort: false, agentActivityLive: false, agentActivityText: null });
+    await new Promise((r) => setTimeout(r, 5200));
+
+    const where = env.document.getElementById('finished-where')!;
+    assert.match(where.textContent!, /FactoryTycoonGame/, 'banner names the finished agent\'s folder');
+    assert.doesNotMatch(where.textContent!, /OtherRepo/, 'banner does not name an unrelated folder');
+
+    const finished = notifications().filter((n) => n.tag === 'cursor-finished');
+    assert.equal(finished.length, 1);
+    assert.match(finished[0].body || '', /FactoryTycoonGame/);
+  });
+
   it('plays a distinct sound when the agent asks a question', async () => {
     const tones = () => (env.window as any).__tones as Array<{ freq: number; type: string }>;
     const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
@@ -837,6 +878,52 @@ describe('web: folders working indicator', () => {
     });
     openFolders();
     assert.ok(!agentRow('Agent two')!.classList.contains('working'), 'spinner cleared when idle');
+  });
+
+  it('shows a spinner on EVERY agent Cursor flags working, not just one', () => {
+    // Regression: the folder menu used to key status by WINDOW, so only the
+    // active agent of each window ever got a glyph. Cursor renders a per-row
+    // status on every sidebar agent, so several agents working at once must each
+    // show their own spinner.
+    const state = stateWithFolders();
+    state.folders[0].agents[0].agentStatus = 'working';
+    state.folders[0].agents[1].agentStatus = 'working';
+    fireFullState(env.mockSocket, state);
+
+    openFolders();
+    const one = agentRow('Agent one')!;
+    const two = agentRow('Agent two')!;
+    assert.ok(one.classList.contains('working'), 'first working agent marked');
+    assert.ok(two.classList.contains('working'), 'second working agent marked');
+    assert.ok(one.querySelector('.folder-agent-spinner'), 'first agent has a spinner');
+    assert.ok(two.querySelector('.folder-agent-spinner'), 'second agent has a spinner');
+  });
+
+  it('shows no spinner for an agent Cursor marks completed', () => {
+    const state = stateWithFolders();
+    state.folders[0].agents[0].agentStatus = 'completed';
+    fireFullState(env.mockSocket, state);
+    openFolders();
+    assert.ok(!agentRow('Agent one')!.querySelector('.folder-agent-spinner'), 'completed agent is not spinning');
+  });
+
+  it('shows a needs-you badge when Cursor flags a row needs-attention', () => {
+    const state = stateWithFolders();
+    state.folders[0].agents[0].agentStatus = 'needs_attention';
+    fireFullState(env.mockSocket, state);
+    openFolders();
+    const one = agentRow('Agent one')!;
+    assert.ok(one.classList.contains('needs-input'), 'needs-input class set');
+    assert.ok(one.querySelector('.folder-agent-needs'), 'needs badge rendered');
+    assert.ok(!one.querySelector('.folder-agent-spinner'), 'a needs-you agent shows no spinner');
+  });
+
+  it('flags the header Folders button when any agent needs attention', () => {
+    const state = stateWithFolders();
+    state.folders[0].agents[1].agentStatus = 'needs_attention';
+    fireFullState(env.mockSocket, state);
+    const btn = env.document.getElementById('btn-folders')!;
+    assert.ok(btn.classList.contains('needs-input'), 'header button flagged for needs-attention');
   });
 });
 

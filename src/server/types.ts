@@ -7,6 +7,20 @@ export interface CursorWindow {
 }
 
 /**
+ * Working-state glyph Cursor renders on an agent's sidebar row, read straight
+ * from its status icon. `working` = the animated dot-grid loader is present;
+ * the rest come from the row's `ui-agent-status-dot` / aria-label. Null when the
+ * row exposes no status glyph (e.g. "No agents yet").
+ */
+export type FolderAgentStatus =
+  | 'working'
+  | 'needs_attention'
+  | 'error'
+  | 'completed'
+  | 'draft'
+  | null;
+
+/**
  * A chat/agent entry listed under a workspace folder.
  * Mirrors the sidebar rows in Cursor's "Cursor Agents" overview window.
  */
@@ -19,6 +33,13 @@ export interface FolderAgent {
   sectionId: string;
   /** True for the agent currently open in this window. */
   isActive: boolean;
+  /**
+   * Per-agent working state straight from Cursor's own status glyph. This is the
+   * authoritative source: unlike the per-window snapshot (which only knows the
+   * active agent of each window), Cursor renders a status on EVERY sidebar row,
+   * so multiple agents working at once each show their own loader.
+   */
+  agentStatus?: FolderAgentStatus;
   /** DOM selector path for the row, used as a switch fallback. */
   selectorPath: string;
 }

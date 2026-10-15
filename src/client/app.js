@@ -141,15 +141,16 @@
   const pendingCommandResults = new Map();
 
   /**
-   * composerIds the relay says are actively working, used to show a spinner in
-   * the folder menu. Seeded from the home window's live state and refreshed by
-   * each `window:snapshot` (which carries the ground-truth `canAbort` flag).
+   * Per-window status for the agent open in each window, used to render a glyph
+   * in the folder menu: a spinner while it is working, a "?" while it waits on a
+   * question, and a "!" while it waits on an approval. Seeded from the home
+   * window's live state and refreshed by each `window:snapshot` (which carries
+   * the ground-truth `canAbort` flag plus the questionnaire/approval widgets).
    * Cursor's sidebar rows expose no per-agent status in the DOM (probed: no
    * aria-busy, no status class), so this server signal is the only reliable
-   * source. `snapshotWorkingComposers` holds the non-home contribution keyed by
-   * window so a window flipping to idle clears its own entry. Each entry is
-   * timestamped so a window that stops reporting (closed) can be pruned rather
-   * than leaving a ghost spinner behind.
+   * source. Keyed by window so a window flipping to idle clears its own entry.
+   * Each entry is timestamped so a window that stops reporting (closed) can be
+   * pruned rather than leaving a ghost glyph behind.
    */
   const snapshotWorkingComposers = new Map();
   const WORKING_SNAPSHOT_TTL_MS = 30000;
@@ -426,16 +427,26 @@
   // the answer can be routed back to it.
   socket.on('window:snapshot', (snapshot) => {
     if (!snapshot || !snapshot.windowId) return;
-    // Track which agent in each non-home window is actively working, so the
-    // folder menu can show a spinner. The snapshot carries the ground-truth
-    // `canAbort` flag; clear this window's entry when it is no longer working.
-    const working = !!snapshot.canAbort || !!snapshot.agentActivityLive
-      || (snapshot.agentStatus && snapshot.agentStatus !== 'idle'
-        && snapshot.agentStatus !== 'waiting_approval'
-        && snapshot.agentStatus !== 'error');
-    if (working && snapshot.activeComposerId) {
+    // Track what each non-home window's open agent is doing so the folder menu
+    // can show a status glyph: a spinner while it is working, a "?" while it is
+    // blocked on a question, and a "!" while it waits on an approval. The
+    // snapshot carries the ground-truth `canAbort` flag plus the questionnaire /
+    // approval widgets. One entry per window (keyed by window) so a window that
+    // stops reporting (closed) can be pruned instead of leaving a ghost glyph.
+    const canAbort = !!snapshot.canAbort;
+    const live = !!snapshot.agentActivityLive;
+    const statusWorking = snapshot.agentStatus && snapshot.agentStatus !== 'idle'
+      && snapshot.agentStatus !== 'waiting_approval'
+      && snapshot.agentStatus !== 'error';
+    const hasQ = !!(snapshot.questionnaire && snapshot.questionnaire.questions
+      && snapshot.questionnaire.questions.length > 0);
+    const hasA = !!(snapshot.pendingApprovals && snapshot.pendingApprovals.length > 0);
+    if (snapshot.activeComposerId && (canAbort || live || statusWorking || hasQ || hasA)) {
       snapshotWorkingComposers.set(snapshot.windowId, {
         composerId: snapshot.activeComposerId,
+        working: canAbort || live || statusWorking,
+        question: hasQ,
+        approval: hasA,
         at: Date.now(),
       });
     } else {
@@ -2544,10 +2555,11 @@
   /**
    * Identify which agent/chat finished and where, so a phone watching several
    * agents at once can tell them apart. `what` prefers the active chat tab in
-   * the current window, then the active agent of the current workspace folder;
-   * `where` is the workspace folder (or window title when it isn't the generic
-   * "Cursor Agents" overview). Both fall back to each other so the banner always
-   * names something, and either may be '' when nothing is known.
+   * the current window, then the active agent of the finished agent's folder;
+   * `where` is the workspace folder the finished agent belongs to (or the window
+   * title when it isn't the generic "Cursor Agents" overview). Both fall back to
+   * each other so the banner always names something, and either may be '' when
+   * nothing is known.
    */
   function finishedContext() {
     const windows = state.windows || [];
@@ -2560,16 +2572,33 @@
 
     const folders = state.folders || [];
     const currentFolder = folders.find((f) => f.isCurrent);
-    // The agent currently open in the current folder, for when no tab list is
-    // mounted (plain workspace window rather than the unified overview).
-    const folderAgent = currentFolder
-      ? (currentFolder.agents || []).find((a) => a.isActive)
-      : null;
+
+    // Which agent most likely just finished: the active tab's composer, then the
+    // relay's active composer. Resolve its FOLDER by scanning every folder's
+    // agents — when the relay is homed on the "Cursor Agents" overview window,
+    // Cursor marks no folder `isCurrent` (its title is the generic "Cursor
+    // Agents"), so relying on isCurrent alone would leave the banner unable to
+    // name the folder that finished.
+    const targetComposerId = (activeTab && activeTab.composerId) || state.activeComposerId || '';
+    let ownerFolder = null;
+    let ownerAgent = null;
+    if (targetComposerId) {
+      for (const f of folders) {
+        const a = (f.agents || []).find((x) => x.composerId && x.composerId === targetComposerId);
+        if (a) { ownerFolder = f; ownerAgent = a; break; }
+      }
+    }
+    if (!ownerFolder) ownerFolder = currentFolder || null;
+
+    // The agent currently open in the finished agent's folder, for when no tab
+    // list is mounted (plain workspace window rather than the unified overview).
+    const folderAgent = ownerAgent
+      || (ownerFolder ? (ownerFolder.agents || []).find((a) => a.isActive) : null);
 
     // The generic overview window title carries no identity; ignore it.
     const winTitleUsable = winTitle && !/^cursor\s*agents$/i.test(winTitle) ? winTitle : '';
 
-    const folderName = (currentFolder && currentFolder.name) || '';
+    const folderName = (ownerFolder && ownerFolder.name) || '';
     const what = (activeTab && activeTab.title)
       || (folderAgent && folderAgent.title)
       || winTitleUsable
@@ -3047,25 +3076,76 @@
   // --- Folders drawer ---
 
   /**
-   * composerIds the relay reports as actively working right now. Combines the
-   * home window's live state with the per-window snapshots (non-home windows).
-   * Used to mark the matching agent rows in the folder menu.
+   * Per-composer status for the folder menu, combining the home window's live
+   * state with the per-window snapshots (non-home windows). Each entry says
+   * whether that agent is working and/or blocked waiting on the user (a
+   * multiple-choice question or a tool approval), so `renderFoldersSheet` can
+   * pick the right glyph. Precedence for the single-slot glyph is decided by the
+   * caller: waiting-on-you outranks working.
    */
-  function workingComposerIds() {
-    const ids = new Set();
+  function composerStatusMap() {
+    const map = new Map();
     const now = Date.now();
     for (const [windowId, entry] of snapshotWorkingComposers) {
-      // Prune a window that stopped reporting (closed) so its spinner doesn't
+      // Prune a window that stopped reporting (closed) so its glyph doesn't
       // linger forever: a live snapshot refreshes `at` on every window cycle.
       if (now - entry.at > WORKING_SNAPSHOT_TTL_MS) {
         snapshotWorkingComposers.delete(windowId);
         continue;
       }
-      ids.add(entry.composerId);
+      map.set(entry.composerId, {
+        working: !!entry.working,
+        question: !!entry.question,
+        approval: !!entry.approval,
+      });
     }
     const homeComposerId = (state.activeComposerId || '').trim();
-    if (homeComposerId && isAgentWorking()) ids.add(homeComposerId);
-    return ids;
+    if (homeComposerId) {
+      // The home window's questionnaire is mirrored in `state.questionnaire`
+      // and its approvals in `state.pendingApprovals`; the working flag uses the
+      // ground-truth state. OR with whatever the home window's own snapshot put
+      // here so a transient null on one path can't mask a real pending question.
+      const prev = map.get(homeComposerId);
+      const homeQuestion = !!(homeQuestionnaire && homeQuestionnaire.questions
+        && homeQuestionnaire.questions.length > 0);
+      const homeApproval = (state.pendingApprovals || []).length > 0;
+      map.set(homeComposerId, {
+        working: isAgentWorking() || !!(prev && prev.working),
+        question: homeQuestion || !!(prev && prev.question),
+        approval: homeApproval || !!(prev && prev.approval),
+      });
+    }
+    return map;
+  }
+
+  /**
+   * Status glyph for a single folder-menu row, from BOTH sources:
+   *  - Cursor's own per-row status (`agent.agentStatus`, read from the sidebar
+   *    status icon) — the authoritative source, present on every agent row, so
+   *    several agents working at once EACH get their own spinner. This is why
+   *    the folder menu previously showed only one: the window-snapshot path below
+   *    knows only the active agent of each window.
+   *  - the per-window snapshot / home state (`statusById`) as a secondary signal
+   *    for question/approval routing (which Cursor's status icon doesn't expose).
+   * Waiting on the user outranks working. Returns null when there is nothing to
+   * show.
+   */
+  function folderRowStatus(agent, statusById) {
+    const s = agent && agent.composerId ? statusById.get(agent.composerId) : null;
+    const dot = agent ? agent.agentStatus : null;
+    const working = dot === 'working' || !!(s && s.working);
+    const question = !!(s && s.question);
+    const approval = !!(s && s.approval);
+    // Cursor only flags needs-attention as one state; treat it as "waiting for
+    // your input" so it reads like the question/approval badges.
+    const needsAttention = dot === 'needs_attention';
+    return {
+      working,
+      question,
+      approval,
+      needsAttention,
+      needsYou: question || approval || needsAttention,
+    };
   }
 
   function renderFoldersButton() {
@@ -3078,6 +3158,24 @@
     let agentCount = 0;
     for (const f of folders) agentCount += (f.agents || []).length;
     $foldersCount.textContent = agentCount > 0 ? `/ ${folders.length}` : `${folders.length}`;
+    // Surface a "needs you" dot on the header button when any agent is blocked
+    // on a question/approval (or Cursor flags needs-attention), so the banner in
+    // the folder menu is discoverable without opening the drawer first.
+    const statusById = composerStatusMap();
+    let needsInput = 0;
+    for (const f of folders) {
+      for (const a of (f.agents || [])) {
+        if (folderRowStatus(a, statusById).needsYou) needsInput++;
+      }
+    }
+    $btnFolders.classList.toggle('needs-input', needsInput > 0);
+    if (needsInput > 0) {
+      $btnFolders.title = needsInput === 1
+        ? '1 agent is waiting for you'
+        : `${needsInput} agents are waiting for you`;
+    } else {
+      $btnFolders.removeAttribute('title');
+    }
     if (activeSheet === 'folders') renderFoldersSheet();
   }
 
@@ -3142,20 +3240,41 @@
         none.addEventListener('click', () => createFolderAgent(folder));
         section.appendChild(none);
       } else {
-        const workingIds = workingComposerIds();
+        const statusById = composerStatusMap();
         agents.forEach((agent) => {
-          const isWorking = !!(agent.composerId && workingIds.has(agent.composerId));
+          const st = folderRowStatus(agent, statusById);
+          // Waiting on the user outranks "working": a blocked agent is not
+          // making progress, so the "needs you" glyph is the useful signal.
+          const isWorking = st.working && !st.needsYou;
+          const isQuestion = st.needsYou;
           const btn = document.createElement('button');
           btn.className = 'folder-agent'
             + (agent.isActive ? ' active' : '')
-            + (isWorking ? ' working' : '');
+            + (isWorking ? ' working' : '')
+            + (isQuestion ? ' needs-input' : '');
           const label = document.createElement('span');
           label.className = 'folder-agent-title';
           label.textContent = agent.title || 'Untitled';
           btn.appendChild(label);
-          // Spinner shown only while this agent is working. aria-label keeps it
-          // discoverable for screen readers (the glyph itself is decorative).
-          if (isWorking) {
+          // Status glyph, pinned to the end of the row. A "?" for a pending
+          // question, "!" for a pending approval, and a "!" for Cursor's own
+          // "needs attention" flag (all mean the agent is blocked on you);
+          // otherwise a spinner while it is working. The aria-label/role keep it
+          // discoverable for screen readers.
+          if (isQuestion) {
+            const badge = document.createElement('span');
+            badge.className = 'folder-agent-needs';
+            // "!" for an approval or Cursor's needs-attention; "?" for a
+            // question. If it's both, the question glyph wins (the more common
+            // "needs you" case).
+            const isApprovalOnly = (st.approval || st.needsAttention) && !st.question;
+            badge.textContent = isApprovalOnly ? '!' : '?';
+            badge.setAttribute('role', 'status');
+            badge.setAttribute('aria-label',
+              isApprovalOnly ? 'Waiting for your approval' : 'Waiting for your answer');
+            badge.title = isApprovalOnly ? 'Waiting for your approval' : 'Waiting for your answer';
+            btn.appendChild(badge);
+          } else if (isWorking) {
             const spinner = document.createElement('span');
             spinner.className = 'folder-agent-spinner';
             spinner.setAttribute('aria-label', 'Agent is working');
