@@ -351,26 +351,32 @@ describe('web: finished notification', () => {
 
 // ─── Stall nudge / forced refresh ───
 
-describe('web: stall nudge and refresh', () => {
+describe('web: no-updates indicator and refresh', () => {
   let env: ReturnType<typeof createTestEnv>;
 
   beforeEach(() => {
     env = createTestEnv();
   });
 
-  it('shows the nudge only when the state reports a stall while working', () => {
+  // The "no updates" hint is no longer a full-width banner — it is the small
+  // header refresh button, which swaps to a spinner (`.stalled`) on a stall.
+  const indicator = () => env.document.getElementById('btn-refresh')!;
+  const spinner = () => indicator().querySelector('.header-refresh-spinner')!;
+
+  it('marks the small refresh button only when a stall is reported while working', () => {
     const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
-    const nudge = () => env.document.getElementById('stall-nudge')!;
     fireFullState(env.mockSocket, { ...fixture[1].state!, canAbort: true, agentStalled: false });
-    assert.ok(nudge().classList.contains('hidden'), 'no nudge while progressing');
+    assert.ok(indicator().classList.contains('hidden'), 'hidden while progressing');
+    assert.ok(!indicator().classList.contains('stalled'), 'not stalled while progressing');
 
     firePatch(env.mockSocket, { agentStalled: true });
-    assert.ok(!nudge().classList.contains('hidden'), 'nudge appears on a stall');
+    assert.ok(!indicator().classList.contains('hidden'), 'button appears on a stall');
+    assert.ok(indicator().classList.contains('stalled'), 'shows the spinner state');
+    assert.ok(spinner(), 'the inline spinner exists');
   });
 
-  it('does not nag with the nudge for an idle agent', () => {
+  it('does not nag for an idle agent', () => {
     const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
-    const nudge = () => env.document.getElementById('stall-nudge')!;
     fireFullState(env.mockSocket, {
       ...fixture[4].state!,
       agentStalled: true,
@@ -378,15 +384,15 @@ describe('web: stall nudge and refresh', () => {
       canAbort: false,
       agentActivityLive: false,
     });
-    assert.ok(nudge().classList.contains('hidden'), 'idle frozen state is not a stall');
+    assert.ok(indicator().classList.contains('hidden'), 'idle frozen state is not a stall');
+    assert.ok(!indicator().classList.contains('stalled'), 'no spinner for an idle agent');
   });
 
-  it('tapping Refresh sends command:refresh_state to the relay', async () => {
+  it('tapping the small button sends command:refresh_state to the relay', async () => {
     const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
     fireFullState(env.mockSocket, { ...fixture[1].state!, canAbort: true, agentStalled: true });
 
-    const btn = env.document.getElementById('btn-stall-refresh') as HTMLButtonElement;
-    btn.click();
+    indicator().click();
 
     const sent = env.mockSocket.sent.find((s) => s.event === 'command:refresh_state');
     assert.ok(sent, 'emits command:refresh_state');
@@ -394,30 +400,32 @@ describe('web: stall nudge and refresh', () => {
     assert.ok(sent!.payload.commandId, 'carries a commandId');
   });
 
-  it('hides the nudge as soon as a refresh is requested', async () => {
+  it('hides the indicator as soon as a refresh is requested', async () => {
     const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
-    const nudge = () => env.document.getElementById('stall-nudge')!;
     fireFullState(env.mockSocket, { ...fixture[1].state!, canAbort: true, agentStalled: true });
-    assert.ok(!nudge().classList.contains('hidden'));
+    assert.ok(!indicator().classList.contains('hidden'));
 
-    const btn = env.document.getElementById('btn-stall-refresh') as HTMLButtonElement;
-    btn.click();
+    indicator().click();
     // Resolve the pending command so the await returns.
     const sent = env.mockSocket.sent.find((s) => s.event === 'command:refresh_state')!;
     env.mockSocket.fire('command:result', { commandId: sent.payload.commandId, ok: true });
     await new Promise((r) => setTimeout(r, 0));
 
-    assert.ok(nudge().classList.contains('hidden'), 'nudge cleared after a refresh');
+    assert.ok(indicator().classList.contains('hidden'), 'cleared after a refresh');
   });
 
-  it('clears the nudge when the relay returns a fresh non-stalled state', () => {
+  it('clears the indicator when the relay returns a fresh non-stalled state', () => {
     const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
-    const nudge = () => env.document.getElementById('stall-nudge')!;
     fireFullState(env.mockSocket, { ...fixture[1].state!, canAbort: true, agentStalled: true });
-    assert.ok(!nudge().classList.contains('hidden'));
+    assert.ok(!indicator().classList.contains('hidden'));
 
     fireFullState(env.mockSocket, { ...fixture[4].state!, agentStalled: false });
-    assert.ok(nudge().classList.contains('hidden'), 'fresh state hides the nudge');
+    assert.ok(indicator().classList.contains('hidden'), 'fresh state hides the indicator');
+  });
+
+  it('no longer renders the oversized banner', () => {
+    assert.equal(env.document.getElementById('stall-nudge'), null, 'banner markup removed');
+    assert.equal(env.document.getElementById('btn-stall-refresh'), null, 'banner button removed');
   });
 });
 

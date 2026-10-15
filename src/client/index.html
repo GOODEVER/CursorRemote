@@ -25,6 +25,12 @@
       <div class="header-right">
         <button id="btn-refresh" class="header-refresh-btn hidden" aria-label="Refresh state" title="Refresh state">
           <span id="refresh-icon" aria-hidden="true">&#8635;</span>
+          <span id="refresh-spinner" class="header-refresh-spinner" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="16" height="16" focusable="false">
+              <circle class="header-refresh-spinner-track" cx="12" cy="12" r="9" />
+              <circle class="header-refresh-spinner-arc" cx="12" cy="12" r="9" />
+            </svg>
+          </span>
         </button>
         <button id="btn-notify" class="header-notify-btn" aria-label="Notifications" title="Notifications">
           <span id="notify-icon" aria-hidden="true">&#128276;</span>
@@ -34,14 +40,11 @@
       </div>
     </header>
 
-    <!-- "No updates" nudge. Shown when the extracted state has frozen while it
-         still claims the agent is working — the phone may be out of sync with
-         Cursor (e.g. the agent finished but the view is stuck on "working").
-         Refresh re-reads Cursor immediately. -->
-    <div id="stall-nudge" class="stall-nudge hidden" role="status" aria-live="polite">
-      <span class="stall-nudge-text" id="stall-nudge-text">No updates from Cursor. It may have finished.</span>
-      <button id="btn-stall-refresh" class="stall-nudge-btn">Refresh</button>
-    </div>
+    <!-- The "no updates" nudge is intentionally just the small spinning header
+         button (see .header-refresh-btn / .header-refresh-spinner): a
+         full-width banner was too large and covered the transcript on a phone.
+         The button carries the same meaning via tooltip/aria-label and forces a
+         fresh read of Cursor when tapped. -->
 
     <div id="composer-queue-bar" class="composer-queue-bar hidden" aria-live="polite">
       <div class="composer-queue-header">

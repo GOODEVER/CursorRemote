@@ -272,9 +272,6 @@
   const $btnNotify = document.getElementById('btn-notify');
   const $notifyIcon = document.getElementById('notify-icon');
   const $btnRefresh = document.getElementById('btn-refresh');
-  const $stallNudge = document.getElementById('stall-nudge');
-  const $stallNudgeText = document.getElementById('stall-nudge-text');
-  const $btnStallRefresh = document.getElementById('btn-stall-refresh');
   const $finishedOverlay = document.getElementById('finished-overlay');
   const $finishedWhat = document.getElementById('finished-what');
   const $finishedWhere = document.getElementById('finished-where');
@@ -546,9 +543,6 @@
   if ($btnRefresh) {
     $btnRefresh.addEventListener('click', () => { void requestStateRefresh(); });
   }
-  if ($btnStallRefresh) {
-    $btnStallRefresh.addEventListener('click', () => { void requestStateRefresh(); });
-  }
   if ($finishedOverlay) {
     $finishedOverlay.addEventListener('click', hideFinishedBanner);
   }
@@ -638,39 +632,43 @@
 
   function setRefreshBusy(busy) {
     if ($btnRefresh) $btnRefresh.classList.toggle('refreshing', !!busy);
-    if ($btnStallRefresh) $btnStallRefresh.disabled = !!busy;
   }
 
   function hideStallNudge() {
-    if ($stallNudge) $stallNudge.classList.add('hidden');
-    if ($btnRefresh) $btnRefresh.classList.add('hidden');
+    if ($btnRefresh) {
+      $btnRefresh.classList.remove('stalled');
+      $btnRefresh.classList.add('hidden');
+    }
   }
 
   /**
-   * Surface a nudge when the server reports the extracted state has frozen
-   * while it still claims the agent is working (agentStalled). This is the
-   * "Cursor actually finished but the phone doesn't know" case. Only shown
-   * while the relay believes work is in progress, so an idle session never
-   * nags. Tapping Refresh forces a fresh read.
+   * Surface the "no updates" state as a compact indicator: the small header
+   * refresh button swaps its glyph for a spinner while the server reports the
+   * extracted state has frozen (agentStalled) and still claims the agent is
+   * working. This is the "Cursor actually finished but the phone doesn't know"
+   * case. The previous full-width banner was too large and covered the
+   * transcript, so all its meaning now lives in this one tappable button —
+   * which re-reads Cursor on tap. It is hidden for an idle session (no nagging).
    */
   function renderStallNudge() {
-    if (!$stallNudge) return;
+    if (!$btnRefresh) return;
     const stalled = !!state.agentStalled && isAgentWorking();
-    $stallNudge.classList.toggle('hidden', !stalled);
-    if (stalled) {
-      const label = (state.agentActivityText || '').trim();
-      if ($stallNudgeText) {
-        $stallNudgeText.textContent = label
-          ? 'Still "' + label + '"? Cursor may have finished.'
-          : 'No updates from Cursor. It may have finished.';
-      }
-    }
-    // Offer a manual refresh whenever something looks off: the stall nudge is
-    // showing, or the extractor itself is failing/behind.
+    // Offer a manual refresh whenever something looks off: the stall flag is
+    // set, or the extractor itself is failing/behind.
     const extractorUnhealthy = state.connected && state.extractorStatus !== 'ok';
-    if ($btnRefresh) {
-      $btnRefresh.classList.toggle('hidden', !(stalled || extractorUnhealthy));
-    }
+    const show = stalled || extractorUnhealthy;
+
+    $btnRefresh.classList.toggle('hidden', !show);
+    $btnRefresh.classList.toggle('stalled', stalled);
+
+    const label = (state.agentActivityText || '').trim();
+    const title = stalled
+      ? (label
+        ? 'Still "' + label + '"? Cursor may have finished — tap to refresh.'
+        : 'No updates from Cursor. It may have finished — tap to refresh.')
+      : 'Refresh state';
+    $btnRefresh.title = title;
+    $btnRefresh.setAttribute('aria-label', title);
   }
 
   /**

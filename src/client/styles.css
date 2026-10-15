@@ -2122,43 +2122,40 @@ header {
 /* Spin while a forced re-read is in flight so the tap feels acknowledged. */
 .header-refresh-btn.refreshing #refresh-icon { animation: refreshSpin 0.8s linear infinite; }
 
+/* Small inline "no updates" indicator: a ring spinner replacing the glyph while
+   the relay reports the extracted state has frozen. This is all the old
+   full-width banner became, so it no longer covers the transcript. */
+.header-refresh-spinner {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+.header-refresh-btn.stalled #refresh-icon { display: none; }
+.header-refresh-btn.stalled .header-refresh-spinner { display: flex; }
+.header-refresh-spinner svg {
+  transform-origin: 50% 50%;
+  animation: refreshSpin 0.9s linear infinite;
+}
+.header-refresh-spinner-track {
+  fill: none;
+  stroke: var(--text-secondary);
+  stroke-width: 2.5;
+  opacity: 0.25;
+}
+.header-refresh-spinner-arc {
+  fill: none;
+  stroke: var(--accent-yellow);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  /* A quarter arc reads clearly as a spinner at this small size. */
+  stroke-dasharray: 14 43;
+}
+
 @keyframes refreshSpin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
 }
-
-.stall-nudge {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin: 6px 12px 0;
-  padding: 10px 12px;
-  background: var(--bg-surface);
-  border-left: 3px solid var(--accent-yellow);
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-  color: var(--text-primary);
-}
-
-.stall-nudge.hidden { display: none; }
-.stall-nudge-text { flex: 1; }
-
-.stall-nudge-btn {
-  flex-shrink: 0;
-  min-height: 36px;
-  padding: 6px 14px;
-  background: var(--accent-blue);
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
-}
-.stall-nudge-btn:active { background: var(--accent-yellow); }
-.stall-nudge-btn:disabled { opacity: 0.6; }
 
 .sheet-notify { max-height: 60vh; }
 
