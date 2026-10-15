@@ -327,8 +327,51 @@
     });
   }
 
+  let loggingOutForAuth = false;
+
+  /**
+   * Sign out ONLY when the server explicitly rejects our credentials.
+   *
+   * The old code also logged out after 5 cumulative connect errors and never
+   * reset the counter on a successful reconnect. On a flaky phone connection
+   * (weak cell signal, Cloudflare-tunnel reconnects) ordinary socket handshake
+   * failures — "timeout", "websocket error", "xhr poll error" — are routine, so
+   * five blips across a whole day silently signed the user out and killed
+   * notifications until they logged back in. Network errors are now retried by
+   * socket.io's reconnect loop instead.
+   *
+   * Even an explicit "Unauthorized" is confirmed against /health before wiping
+   * the token, so a single transient rejection during a server restart cannot
+   * throw away a perfectly valid session.
+   */
+  async function handlePossibleAuthFailure() {
+    if (loggingOutForAuth) return;
+    loggingOutForAuth = true;
+    try {
+      const res = await fetch('/health', {
+        credentials: 'same-origin',
+        headers: getAuthHeaders(),
+      });
+      if (!res.ok) {
+        // Server unreachable/erroring — treat as transient, keep the session.
+        loggingOutForAuth = false;
+        return;
+      }
+      const data = await res.json();
+      if (data.authRequired && data.sessionValid === false) {
+        localStorage.removeItem(AUTH_TOKEN_KEY);
+        window.location.href = '/login';
+        return;
+      }
+    } catch {
+      // Network error — transient. Keep the session and let socket.io retry.
+    }
+    loggingOutForAuth = false;
+  }
+
   socket.on('connect', () => {
     // Fresh connection: allow auto-open to run again.
+    loggingOutForAuth = false;
     autoOpenDone = false;
     autoOpenAttempts = 0;
     autoOpenPending = false;
@@ -337,13 +380,13 @@
   });
   socket.on('disconnect', () => renderAll());
 
-  let connectFailCount = 0;
   socket.on('connect_error', (err) => {
-    connectFailCount++;
-    if (err.message === 'Unauthorized' || connectFailCount >= 5) {
-      localStorage.removeItem(AUTH_TOKEN_KEY);
-      window.location.href = '/login';
+    // A genuine rejection of our credentials. Anything else is a transport
+    // problem and must never sign the user out.
+    if (err && err.message === 'Unauthorized') {
+      void handlePossibleAuthFailure();
     }
+    renderAll();
   });
 
   socket.on('state:full', (newState) => {

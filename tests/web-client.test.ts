@@ -83,6 +83,20 @@ function createTestEnv() {
       // fireNotification() bails when the document is focused; tests are headless.
       window.document.hasFocus = () => false;
 
+      // Configurable /health stub. The client confirms a socket rejection
+      // against /health before wiping the session token, so tests drive this
+      // to model a genuinely-invalid session vs. a transient network glitch.
+      const health = { ok: true, authRequired: true, sessionValid: true };
+      (window as any).__health = health;
+      (window as any).fetch = () => Promise.resolve({
+        ok: health.ok,
+        status: health.ok ? 200 : 500,
+        json: () => Promise.resolve({
+          authRequired: health.authRequired,
+          sessionValid: health.sessionValid,
+        }),
+      });
+
       // Web Audio stub so the in-page chimes can be asserted. Records every
       // oscillator's frequency + type, and reports the context as 'running' so
       // the code's autoplay gate passes without a real user gesture.
@@ -1673,5 +1687,75 @@ describe('web: composer queue', () => {
     assert.ok(evt, 'queue_action should be emitted');
     assert.equal(evt!.payload.queueItemId, 'row-7');
     assert.equal(evt!.payload.queueAction, 'send');
+  });
+});
+
+// ─── Session persistence / unexpected logout ───
+
+describe('web: session persistence', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+    env.window.localStorage.setItem('cursor-remote-token', 'valid-token');
+  });
+
+  const health = () => (env.window as any).__health as {
+    ok: boolean; authRequired: boolean; sessionValid: boolean;
+  };
+
+  it('does NOT log out on a burst of transient connect errors', async () => {
+    // Plain network failures: no "Unauthorized" message.
+    for (let i = 0; i < 12; i++) {
+      env.mockSocket.fire('connect_error', new Error('websocket error'));
+    }
+    await new Promise((r) => setTimeout(r, 5));
+
+    assert.equal(
+      env.window.localStorage.getItem('cursor-remote-token'),
+      'valid-token',
+      'token must survive transport failures'
+    );
+  });
+
+  it('does not log out when an Unauthorized blip is followed by a healthy /health', async () => {
+    // Server restart mid-handshake: one rejection, session still valid.
+    health().sessionValid = true;
+    env.mockSocket.fire('connect_error', new Error('Unauthorized'));
+    await new Promise((r) => setTimeout(r, 5));
+
+    assert.equal(env.window.localStorage.getItem('cursor-remote-token'), 'valid-token');
+  });
+
+  it('logs out when the server confirms the session is invalid', async () => {
+    health().sessionValid = false;
+    env.mockSocket.fire('connect_error', new Error('Unauthorized'));
+    await new Promise((r) => setTimeout(r, 5));
+
+    assert.equal(env.window.localStorage.getItem('cursor-remote-token'), null);
+  });
+
+  it('keeps the session when /health is unreachable during an Unauthorized blip', async () => {
+    health().ok = false; // e.g. 502 from the tunnel
+    env.mockSocket.fire('connect_error', new Error('Unauthorized'));
+    await new Promise((r) => setTimeout(r, 5));
+
+    assert.equal(
+      env.window.localStorage.getItem('cursor-remote-token'),
+      'valid-token',
+      'unreachable server must not sign the user out'
+    );
+  });
+
+  it('resets the failure tracking after a successful reconnect', async () => {
+    for (let i = 0; i < 6; i++) {
+      env.mockSocket.fire('connect_error', new Error('websocket error'));
+    }
+    env.mockSocket.fire('connect');
+    // Reconnecting then losing the link again must still not log out.
+    env.mockSocket.fire('connect_error', new Error('timeout'));
+    await new Promise((r) => setTimeout(r, 5));
+
+    assert.equal(env.window.localStorage.getItem('cursor-remote-token'), 'valid-token');
   });
 });
