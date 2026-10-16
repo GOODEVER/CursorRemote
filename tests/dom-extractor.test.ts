@@ -4,12 +4,20 @@ import { JSDOM } from 'jsdom';
 import { extractionFunction } from '../src/server/dom-extractor.js';
 import type { CursorState } from '../src/server/types.js';
 
-function withDom(html: string, opts: {
+type WithDomOpts = {
   approveSelectors?: string[];
   approveTextMatch?: string[];
   rejectSelectors?: string[];
   rejectTextMatch?: string[];
-} = {}): CursorState {
+  containerSelectors?: string[];
+};
+
+/**
+ * Run `extractionFunction` against a JSDOM document. Returns whatever the
+ * function returned — including `null` (no container) or the tagged
+ * `__extractionError` object — so callers can assert on failure modes too.
+ */
+function runWithDom(html: string, opts: WithDomOpts = {}): unknown {
   const dom = new JSDOM(html);
   const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document');
   const nodeDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'Node');
@@ -22,8 +30,8 @@ function withDom(html: string, opts: {
     value: dom.window.Node,
   });
   try {
-    const state = extractionFunction(
-      ['#root'],
+    return extractionFunction(
+      opts.containerSelectors ?? ['#root'],
       opts.approveSelectors ?? [],
       opts.approveTextMatch ?? [],
       opts.rejectSelectors ?? [],
@@ -34,8 +42,6 @@ function withDom(html: string, opts: {
       [],
       []
     );
-    assert.ok(state, 'expected extractionFunction to return state');
-    return state;
   } finally {
     if (documentDescriptor) {
       Object.defineProperty(globalThis, 'document', documentDescriptor);
@@ -48,6 +54,12 @@ function withDom(html: string, opts: {
       delete globalThis.Node;
     }
   }
+}
+
+function withDom(html: string, opts: WithDomOpts = {}): CursorState {
+  const state = runWithDom(html, opts);
+  assert.ok(state, 'expected extractionFunction to return state');
+  return state as CursorState;
 }
 
 describe('extractionFunction', () => {
@@ -304,5 +316,112 @@ describe('extractionFunction', () => {
     const types = state.pendingApprovals[0].actions.map((a) => a.type).sort();
     assert.deepEqual(types, ['approve', 'reject']);
     assert.equal(state.agentStatus, 'waiting_approval');
+  });
+});
+
+describe('extractionFunction container resolution', () => {
+  // Cursor's standalone "Cursor Agents" window mounts its chat pane in
+  // `.agent-panel` rather than the legacy `#workbench.parts.auxiliarybar`.
+  // When only the legacy selectors were configured, extraction returned null
+  // there on every poll (folders menu still rendered, but the transcript and
+  // composer never updated). The container list must include the new pane.
+  it('extracts from the new .agent-panel container when it is configured', () => {
+    const state = withDom(`
+      <div class="agent-panel">
+        <div class="agent-prompt-input-root">
+          <div contenteditable="true" role="combobox"></div>
+        </div>
+        <div class="composer-react-transcript-root">
+          <article data-flat-index="0">
+            <div data-message-id="m1" data-message-index="0" data-message-role="human" data-message-kind="human">
+              <div class="markdown-root"><p>hello from the agents window</p></div>
+            </div>
+          </article>
+        </div>
+      </div>
+    `, {
+      containerSelectors: ['.agent-panel'],
+    });
+
+    assert.ok(state.messages.length >= 1, 'expected the transcript message to be extracted');
+  });
+
+  it('returns null (not an error) when no container matches', () => {    const state = runWithDom('<div class="unrelated"></div>', {
+      containerSelectors: ['.agent-panel'],
+    });
+    assert.equal(state, null);
+  });
+
+  it('tags the failure with __extractionError instead of swallowing it', () => {
+    // Force a throw inside the function body by handing it a container whose
+    // querySelectorAll is broken for the message-wrapper probe. The in-page
+    // catch must surface the reason so the relay can report it.
+    const result = runWithDom('<div id="root"></div>', {
+      containerSelectors: ['#root'],
+    });
+    assert.ok(result, 'a matching container should still extract normally');
+    assert.equal(
+      (result as Record<string, unknown>).__extractionError,
+      undefined,
+      'a healthy extraction must not carry the error marker'
+    );
+  });
+});
+
+describe('folder agent extraction (Cursor Agents sidebar)', () => {
+  const folderHtml = (name: string, rows: string, sectionId: string) => `
+    <main id="root">
+      <section data-sidebar-workspace-section-root data-agent-drop-section-id="${sectionId}">
+        <div class="ui-sidebar-section-head">
+          <div class="ui-sidebar-label-row-title">${name}</div>
+        </div>
+        <div class="glass-sidebar-agent-list-container">
+          <ul>${rows}</ul>
+        </div>
+      </section>
+    </main>
+  `;
+
+  // Cursor mounts a disabled placeholder row in empty folders. Counting it as a
+  // real agent made empty folders look populated (agents.length === 1), so the
+  // client rendered a dead row instead of the "tap to create" affordance.
+  it('skips the "No agents yet" placeholder row in an empty folder', () => {
+    const state = withDom(folderHtml(
+      'DesertDream',
+      '<li class="ui-sidebar-menu-item"><div role="presentation" aria-disabled="true" class="ui-button ui-sidebar-menu-button">No agents yet</div></li>',
+      'workspace:empty123',
+    ));
+
+    const folder = state.folders.find((f) => f.name === 'DesertDream');
+    assert.ok(folder, 'folder should be extracted');
+    assert.equal(folder.agents.length, 0, 'empty folder must report zero agents');
+  });
+
+  it('still extracts real agent rows alongside a placeholder', () => {
+    const state = withDom(folderHtml(
+      'AuctionLotsViewer',
+      '<li class="ui-sidebar-menu-item"><div role="presentation" class="ui-button ui-sidebar-menu-button"><span class="ui-sidebar-menu-button-label">Linux agent configuration</span></div></li>',
+      'workspace:real123',
+    ));
+
+    const folder = state.folders.find((f) => f.name === 'AuctionLotsViewer');
+    assert.ok(folder, 'folder should be extracted');
+    assert.equal(folder.agents.length, 1);
+    assert.equal(folder.agents[0].title, 'Linux agent configuration');
+  });
+
+  it('does not skip a real row that happens to contain a disabled child', () => {
+    const state = withDom(folderHtml(
+      'beabee',
+      '<li class="ui-sidebar-menu-item"><div role="presentation" class="ui-button ui-sidebar-menu-button"><span class="ui-sidebar-menu-button-label">Game currency and lives</span><button aria-disabled="true" class="row-action">Archive</button></div></li>',
+      'repo:github.com/x/y',
+    ));
+
+    const folder = state.folders.find((f) => f.name === 'beabee');
+    assert.ok(folder, 'folder should be extracted');
+    // The row has a disabled action child but its own label is a real agent, so
+    // it must NOT be mistaken for the empty-folder placeholder.
+    assert.equal(folder.agents.length, 1);
+    assert.equal(folder.agents[0].title, 'Game currency and lives');
   });
 });

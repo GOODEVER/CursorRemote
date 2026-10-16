@@ -7,7 +7,7 @@ dist/
 
 data/
 releases/
-temp/server.log
+temp/
 tmp/
 scripts/generate-keys.ts
 azure_token

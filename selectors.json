@@ -5,7 +5,9 @@
       "div.composer-bar.editor",
       "[class*='composer-bar']",
       "[class*='composer-panel']",
-      "[class*='chat-widget']"
+      "[class*='chat-widget']",
+      ".agent-panel",
+      "[class*='agent-panel']"
     ]
   },
   "approveButton": {

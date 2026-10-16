@@ -1706,12 +1706,24 @@ export function extractionFunction(
             (labelEl?.textContent || li.textContent || '').trim()
           );
           if (!title) continue;
+          // Cursor mounts a placeholder row in EMPTY folders: a disabled
+          // `li.ui-sidebar-menu-item` whose primary button carries
+          // aria-disabled="true" and whose only text is "No agents yet" (no
+          // composer id, no status). It is not a real agent — counting it made
+          // empty folders look populated (agents.length === 1), so the client's
+          // "tap to create" affordance never rendered and create appeared
+          // broken. A disabled button is only a placeholder when the row also
+          // has no composer id; real rows may contain a disabled child action
+          // (e.g. Archive while running) and must still be listed.
+          const placeholderBtn = btn?.getAttribute('aria-disabled') === 'true';
+          if (/^no agents yet\b/i.test(title) || /^no (?:tasks|chats)\b/i.test(title)) continue;
           const composerId =
             composerIdFromRow(li)
             || btn?.getAttribute('data-composer-id')
             || li.getAttribute('data-composer-id')
             || (btn?.closest('[data-composer-id]')?.getAttribute('data-composer-id'))
             || '';
+          if (placeholderBtn && !composerId) continue;
           const isActive = isActiveFromRow(li, btn);
           agents.push({
             title,
@@ -2212,8 +2224,13 @@ export function extractionFunction(
       folders,
       _rawSignals,
     };
-  } catch {
-    return null;
+  } catch (err) {
+    // Surface WHY the extraction failed instead of collapsing every throw into a
+    // bare null. The relay reports this string as `lastExtractionError`, so
+    // without it a broken selector or DOM change is indistinguishable from "no
+    // chat open" and the whole remote silently goes stale.
+    const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    return { __extractionError: message } as unknown as CursorState;
   }
 }
 
@@ -2384,7 +2401,16 @@ export class DOMExtractor {
           this.getWindowTitle(),
         ],
         EVALUATE_TIMEOUT_MS
-      ) as CursorState | null;
+      ) as (CursorState & { __extractionError?: string }) | null;
+
+      // The in-page function catches its own throws and tags the reason so we
+      // can report a real error here instead of mistaking it for "no chat open".
+      // `null` still means "container missing" (a legitimately empty overview).
+      const thrown = state?.__extractionError;
+      if (thrown) {
+        this.handleFailure(`Extraction threw: ${thrown}`);
+        return;
+      }
 
       const derivedState = state ? applyDerivedActivityToState(state) : null;
       this.failureStreak = 0;
