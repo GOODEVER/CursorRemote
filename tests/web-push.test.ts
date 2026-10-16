@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { createWebPushManager } from '../src/server/web-push.js';
+import { createWebPushManager, DEFAULT_PUSH_TTL_SEC } from '../src/server/web-push.js';
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), 'cr-webpush-'));
@@ -76,5 +76,13 @@ describe('web push manager (enabled)', () => {
     writeFileSync(join(dir, 'push-subscriptions.json'), '{ not json', 'utf-8');
     const b = createWebPushManager(dir, 'mailto:test@example.com', true);
     assert.equal(b.getSubscriptionCount(), 0);
+  });
+
+  it('uses a short default TTL (not the library four-week default)', () => {
+    // Regression: the web-push library defaults to TTL=2419200 (4 weeks), so a
+    // "finished" push queued while the phone was asleep could surface hours or
+    // days later. We deliberately cap the default to a couple of minutes.
+    assert.ok(DEFAULT_PUSH_TTL_SEC > 0);
+    assert.ok(DEFAULT_PUSH_TTL_SEC <= 300, 'default TTL must be minutes, not weeks');
   });
 });

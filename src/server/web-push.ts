@@ -33,9 +33,24 @@ export interface WebPushManager {
    * `vibrate` is a per-event-type haptic pattern the service worker applies —
    * the closest a web push can get to a distinct "sound" (platforms own the
    * actual alert tone).
+   * `ttl` is the HTTP TTL in seconds (how long the push service may hold the
+   * message). Defaults to a short window — the library's 4-week default was
+   * delivering hours-old "Agent finished" alerts when a phone woke up.
+   * `ts` is epoch-ms stamped into the payload so the service worker can also
+   * drop a late delivery client-side.
    */
-  send(payload: { title: string; body: string; tag?: string; vibrate?: number[] }): Promise<number>;
+  send(payload: {
+    title: string;
+    body: string;
+    tag?: string;
+    vibrate?: number[];
+    ttl?: number;
+    ts?: number;
+  }): Promise<number>;
 }
+
+/** Default TTL when the caller does not specify one (2 minutes). */
+export const DEFAULT_PUSH_TTL_SEC = 120;
 
 const MAX_SUBSCRIPTIONS = 64;
 
@@ -145,13 +160,25 @@ export function createWebPushManager(dataDir: string, subject: string, enabled: 
 
     async send(payload): Promise<number> {
       if (!enabled || subscriptions.size === 0) return 0;
-      const body = JSON.stringify(payload);
+      const ttl = typeof payload.ttl === 'number' && payload.ttl >= 0
+        ? payload.ttl
+        : DEFAULT_PUSH_TTL_SEC;
+      // Stamp a send time when the caller didn't, so the service worker can
+      // reject a push that sat in a delivery queue past its usefulness.
+      const body = JSON.stringify({
+        title: payload.title,
+        body: payload.body,
+        tag: payload.tag,
+        vibrate: payload.vibrate,
+        ts: typeof payload.ts === 'number' ? payload.ts : Date.now(),
+      });
       let delivered = 0;
       for (const sub of [...subscriptions.values()]) {
         try {
           await sendNotification(
             { endpoint: sub.endpoint, keys: sub.keys },
-            body
+            body,
+            { TTL: ttl, urgency: ttl <= 120 ? 'high' : 'normal' }
           );
           delivered++;
         } catch (err) {

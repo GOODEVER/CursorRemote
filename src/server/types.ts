@@ -444,7 +444,7 @@ export interface SelectorConfig {
 
 export interface CommandPayload {
   commandId: string;
-  type: 'send_message' | 'send_prompt' | 'approve' | 'reject' | 'approve_all' | 'switch_tab' | 'open_folder_agent' | 'create_folder_agent' | 'new_chat' | 'set_mode' | 'set_model' | 'click_action' | 'queue_action' | 'get_plan_full' | 'get_plan_model_options' | 'set_plan_model' | 'get_slash_menu' | 'click_slash_command' | 'cancel_slash_menu' | 'set_answer_text' | 'stop_generation' | 'refresh_state';
+  type: 'send_message' | 'send_prompt' | 'approve' | 'reject' | 'approve_all' | 'switch_tab' | 'open_folder_agent' | 'create_folder_agent' | 'archive_folder_agent' | 'new_chat' | 'set_mode' | 'set_model' | 'click_action' | 'queue_action' | 'get_plan_full' | 'get_plan_model_options' | 'set_plan_model' | 'get_slash_menu' | 'click_slash_command' | 'cancel_slash_menu' | 'set_answer_text' | 'stop_generation' | 'refresh_state';
   /** For 'queue_action': the queued row id and the action to run on it. */
   queueItemId?: string;
   queueAction?: 'send' | 'remove';
@@ -464,10 +464,22 @@ export interface CommandPayload {
   sectionId?: string;
   /** Folder display name, fallback when sectionId lookup fails. */
   folderName?: string;
+  /**
+   * Archive action for 'archive_folder_agent': 'archive' hides the row from the
+   * sidebar, 'unarchive' brings it back.
+   */
+  archiveAction?: 'archive' | 'unarchive';
   /** Slash token (without leading "/") targeted by click_slash_command. */
   slashId?: string;
   /** 1-based index of the slash row, fallback when slashId is ambiguous. */
   slashIndex?: number;
+  /**
+   * Free-text filter for get_slash_menu / click_slash_command. Mirrors typing
+   * after the "/" in Cursor: the tray only renders the first ~14 rows and never
+   * scrolls, so filtering is the only way to reach the rest of the commands.
+   * Click commands pass the active filter so the same list is re-opened and hit.
+   */
+  slashQuery?: string;
 }
 
 export interface CommandResult {

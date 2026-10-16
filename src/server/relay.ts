@@ -156,7 +156,17 @@ export class Relay {
   private pushWasWorking = false;
   private pushFinishTimer: ReturnType<typeof setTimeout> | null = null;
   private pushPrimed = false;
+  /** Composer the push edge-state belongs to — switch re-primes (see evaluatePushTransition). */
+  private pushComposerId = '';
   private static readonly PUSH_FINISH_SETTLE_MS = 5000;
+  /**
+   * How long a push may sit in the delivery queue. The web-push library
+   * defaults to four weeks, which is why locking the phone and unlocking
+   * later could surface a "finished" alert from hours/days ago. Finished
+   * alerts are only useful when fresh; "needs you" stays a bit longer.
+   */
+  private static readonly PUSH_TTL_FINISHED_SEC = 60;
+  private static readonly PUSH_TTL_NEEDS_YOU_SEC = 3600;
   /**
    * Haptic patterns per push type. A web push cannot choose its alert sound
    * (the OS owns that), so a distinct vibration is the most a background alert
@@ -847,15 +857,72 @@ export class Relay {
         // the new agent's composerId and pushes a fresh snapshot. Nudge the
         // client so the UI switches over without waiting for the poll cycle.
         if (result.ok) {
-          setTimeout(async () => {
-            const state = this.stateManager.getCurrentState();
-            const composerId = state.activeComposerId || '';
-            if (composerId) {
+          // Poll for the composer to actually CHANGE rather than grabbing
+          // whatever is active after a fixed delay: the 1.2s timer used to fire
+          // while `activeComposerId` still pointed at the PREVIOUS folder's
+          // agent, so the relay loaded (and pushed) the wrong transcript. We
+          // capture the pre-create id and only load once it differs.
+          const before = this.stateManager.getCurrentState().activeComposerId || '';
+          let waited = 0;
+          const step = 400;
+          const attempt = (): void => {
+            waited += step;
+            const composerId = this.stateManager.getCurrentState().activeComposerId || '';
+            const changed = !!composerId && composerId !== before;
+            if (!changed && waited < 6000) {
+              setTimeout(attempt, step);
+              return;
+            }
+            // Only load once the composer is known to have changed; if it never
+            // did, skip (the client pins the new agent and requests its history).
+            if (changed) {
               this.historyComposerId = composerId;
               this.composerHistory.invalidate(composerId);
-              await this.loadComposerHistory(composerId, socket);
+              void this.loadComposerHistory(composerId, socket);
             }
-          }, 1200);
+          };
+          setTimeout(attempt, step);
+        }
+      });
+
+      socket.on('command:archive_folder_agent', async (payload: CommandPayload) => {
+        const composerId = (payload.composerId || '').trim();
+        const tabTitle = (payload.tabTitle || '').trim();
+        if (!payload.commandId || (!composerId && !tabTitle)) {
+          socket.emit('command:result', {
+            commandId: payload.commandId ?? 'unknown',
+            ok: false,
+            error: 'Missing commandId and agent target',
+          } satisfies CommandResult);
+          return;
+        }
+        const action = payload.archiveAction === 'unarchive' ? 'unarchive' : 'archive';
+        console.log(`[relay] Command: archive_folder_agent ${action} "${tabTitle || composerId}" from ${socket.id}`);
+        const result = await this.commandExecutor.archiveFolderAgent(
+          payload.commandId,
+          composerId,
+          tabTitle,
+          action
+        );
+        socket.emit('command:result', result);
+        if (result.ok) {
+          // Best-effort: the archive already happened, so a refresh/history
+          // hiccup must not surface as a command failure.
+          try {
+            // The sidebar row list is the only thing that changed; push a fresh
+            // snapshot so the drawer drops/restores the row immediately instead
+            // of waiting for the next poll.
+            socket.emit('state:full', this.requestRefresh());
+            // If the archived agent was the open chat, its history is no longer
+            // relevant. Only reload when the active composer actually moved on.
+            const nowActive = this.stateManager.getCurrentState().activeComposerId || '';
+            if (action === 'archive' && composerId && nowActive && nowActive !== composerId) {
+              this.historyComposerId = nowActive;
+              void this.loadComposerHistory(nowActive, socket);
+            }
+          } catch (err) {
+            console.warn(`[relay] Post-archive refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
       });
 
@@ -1064,8 +1131,8 @@ export class Relay {
           socket.emit('command:result', { commandId: 'unknown', ok: false, error: 'Missing commandId' } satisfies CommandResult);
           return;
         }
-        console.log(`[relay] Command: get_slash_menu from ${socket.id}`);
-        const result = await this.commandExecutor.getSlashMenu(payload.commandId);
+        console.log(`[relay] Command: get_slash_menu${payload.slashQuery ? ` (q="${payload.slashQuery}")` : ''} from ${socket.id}`);
+        const result = await this.commandExecutor.getSlashMenu(payload.commandId, payload.slashQuery ?? '');
         socket.emit('command:result', result);
       });
 
@@ -1082,7 +1149,8 @@ export class Relay {
         const result = await this.commandExecutor.clickSlashCommand(
           payload.commandId,
           payload.slashId,
-          payload.slashIndex
+          payload.slashIndex,
+          payload.slashQuery ?? ''
         );
         socket.emit('command:result', result);
       });
@@ -1233,16 +1301,48 @@ export class Relay {
    * Edge-triggered web push. Mirrors the client's notification logic: push only
    * when the agent NEWLY asks a question / needs approval, or when it has
    * genuinely finished (working -> idle, debounced so mid-run gaps don't fire).
+   *
+   * Guards against two false positives the phone was seeing:
+   *   - CDP/home disconnect looks idle (`isWorkingState` is false) — must not
+   *     schedule a finish alert; cancel any in-flight settle timer instead.
+   *   - Switching the home composer (folder navigation) re-primes so the
+   *     previous agent's "was working" bit is not attributed to the new one.
    */
   private evaluatePushTransition(): void {
     if (!this.webPush.enabled) return;
+    const state = this.stateManager.getCurrentState();
+    const composerId = state.activeComposerId || '';
     const { hasQ, hasA, working, questionText, approvalDesc } = this.aggregatePushSignals();
 
     if (!this.pushPrimed) {
       this.pushPrimed = true;
+      this.pushComposerId = composerId;
       this.pushHadQuestionnaire = hasQ;
       this.pushHadApproval = hasA;
       this.pushWasWorking = working;
+      return;
+    }
+
+    if (composerId !== this.pushComposerId) {
+      if (this.pushFinishTimer) {
+        clearTimeout(this.pushFinishTimer);
+        this.pushFinishTimer = null;
+      }
+      this.pushComposerId = composerId;
+      this.pushHadQuestionnaire = hasQ;
+      this.pushHadApproval = hasA;
+      this.pushWasWorking = working;
+      return;
+    }
+
+    // Home CDP drop: don't treat "not connected" as a finish. Keep the
+    // was-working bit so a real finish that landed while CDP was down is still
+    // announced once we reconnect to a settled idle state for this composer.
+    if (!state.connected) {
+      if (this.pushFinishTimer) {
+        clearTimeout(this.pushFinishTimer);
+        this.pushFinishTimer = null;
+      }
       return;
     }
 
@@ -1251,14 +1351,16 @@ export class Relay {
         'Agent has a question',
         questionText || 'The agent is asking you something.',
         'cursor-questionnaire',
-        Relay.PUSH_VIBRATE_NEEDS_YOU
+        Relay.PUSH_VIBRATE_NEEDS_YOU,
+        Relay.PUSH_TTL_NEEDS_YOU_SEC
       );
     } else if (hasA && !this.pushHadApproval) {
       void this.push(
         'Agent needs approval',
         approvalDesc || 'The agent is waiting for your approval.',
         'cursor-approval',
-        Relay.PUSH_VIBRATE_NEEDS_YOU
+        Relay.PUSH_VIBRATE_NEEDS_YOU,
+        Relay.PUSH_TTL_NEEDS_YOU_SEC
       );
     }
 
@@ -1317,8 +1419,15 @@ export class Relay {
 
   private scheduleFinishCheck(): void {
     if (this.pushFinishTimer) return;
+    const finishForComposer = this.pushComposerId;
     this.pushFinishTimer = setTimeout(() => {
       this.pushFinishTimer = null;
+      const state = this.stateManager.getCurrentState();
+      if (!state.connected) return;
+      if ((state.activeComposerId || '') !== finishForComposer) {
+        this.pushWasWorking = this.aggregatePushSignals().working;
+        return;
+      }
       const { hasQ, hasA, working } = this.aggregatePushSignals();
       if (working) {
         this.pushWasWorking = true;
@@ -1335,13 +1444,29 @@ export class Relay {
         'Agent finished',
         label ? `${label} finished.` : 'The agent has finished working.',
         'cursor-finished',
-        Relay.PUSH_VIBRATE_FINISHED
+        Relay.PUSH_VIBRATE_FINISHED,
+        Relay.PUSH_TTL_FINISHED_SEC
       );
     }, Relay.PUSH_FINISH_SETTLE_MS);
   }
 
-  private async push(title: string, body: string, tag?: string, vibrate?: number[]): Promise<void> {
-    const delivered = await this.webPush.send({ title, body, tag, vibrate });
+  private async push(
+    title: string,
+    body: string,
+    tag?: string,
+    vibrate?: number[],
+    ttlSec?: number
+  ): Promise<void> {
+    const delivered = await this.webPush.send({
+      title,
+      body,
+      tag,
+      vibrate,
+      ttl: ttlSec,
+      // Epoch ms so the service worker can drop a push that sat in a queue
+      // longer than its usefulness (defense in depth beyond the HTTP TTL).
+      ts: Date.now(),
+    });
     if (delivered > 0) {
       console.log(`[web-push] Sent "${title}" to ${delivered} subscription(s)`);
     }

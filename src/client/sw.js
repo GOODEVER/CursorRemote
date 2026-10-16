@@ -76,6 +76,16 @@ self.addEventListener('pushsubscriptionchange', (event) => {
   })());
 });
 
+/*
+ * How old a push may be (wall-clock) before we silently drop it. Defense in
+ * depth against the HTTP TTL: some push services still deliver a queued
+ * message after the phone wakes, even when the event is hours stale — which
+ * is exactly the "finished after I turn my phone dark" false ping. Finished
+ * alerts are only useful when fresh; "needs you" stays longer.
+ */
+const STALE_FINISHED_MS = 2 * 60 * 1000;
+const STALE_NEEDS_YOU_MS = 60 * 60 * 1000;
+
 self.addEventListener('push', (event) => {
   let data = { title: 'CursorRemote', body: 'Update from your agent.', tag: 'cursor-agent' };
   try {
@@ -90,10 +100,28 @@ self.addEventListener('push', (event) => {
     } catch (__) { /* ignore */ }
   }
 
+  // Drop a push that sat in a delivery queue past its usefulness. `ts` is
+  // stamped by the relay at send time; missing/invalid ts is treated as fresh
+  // so older clients that don't stamp still deliver.
+  const tag = data.tag || 'cursor-agent';
+  const sentAt = typeof data.ts === 'number' ? data.ts : 0;
+  if (sentAt > 0) {
+    const age = Date.now() - sentAt;
+    const maxAge = (tag === 'cursor-questionnaire' || tag === 'cursor-approval')
+      ? STALE_NEEDS_YOU_MS
+      : STALE_FINISHED_MS;
+    if (age > maxAge) {
+      // Acknowledge the push (so the browser doesn't retry / show a default
+      // notification) without surfacing the stale alert.
+      event.waitUntil(Promise.resolve());
+      return;
+    }
+  }
+
   event.waitUntil(
     self.registration.showNotification(data.title || 'CursorRemote', {
       body: data.body || '',
-      tag: data.tag || 'cursor-agent',
+      tag,
       // `renotify` makes a repeat notification with the same tag alert again
       // (sound / vibration) instead of being silently coalesced into the one
       // already on screen. Without it a second "Agent finished" arrives with
@@ -104,7 +132,7 @@ self.addEventListener('push', (event) => {
       // insistent triple buzz when the agent needs the user, else a single tap.
       vibrate: Array.isArray(data.vibrate)
         ? data.vibrate
-        : (data.tag === 'cursor-questionnaire' || data.tag === 'cursor-approval'
+        : (tag === 'cursor-questionnaire' || tag === 'cursor-approval'
           ? [200, 100, 200, 100, 200]
           : [120]),
       icon: 'favicon.png',

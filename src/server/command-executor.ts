@@ -1006,6 +1006,221 @@ export class CommandExecutor {
     });
   }
 
+  /**
+   * Archive (or unarchive) a single agent row in Cursor's agent overview.
+   *
+   * Cursor mounts an Archive button per row inside `.ui-sidebar-menu-button-actions`,
+   * but only while the row is hovered (`display:none; opacity:0; pointer-events:none`
+   * otherwise). Like the section "+" and the composer queue actions, synthetic
+   * MouseEvents cannot turn on CSS `:hover`, so we must move the real pointer with
+   * native CDP input, re-read the button's live box, then click it natively.
+   *
+   * Archive is reached through the row's own handler, not a workbench command, so
+   * this is the only faithful path. When the agent is still running Cursor first
+   * raises a destructive "Archive running agent?" confirmation; we accept it so the
+   * action is not left half-done (the app itself treats this as one gesture). Rows
+   * listing only archived agents expose "Unarchive" instead, which we honor so the
+   * same button doubles as restore.
+   */
+  async archiveFolderAgent(
+    commandId: string,
+    composerId: string,
+    tabTitle: string,
+    action: 'archive' | 'unarchive' = 'archive'
+  ): Promise<CommandResult> {
+    return this.withRetry(commandId, async (client) => {
+      const wantId = (composerId ?? '').trim();
+      const wantTitle = (tabTitle ?? '').trim();
+      if (!wantId && !wantTitle) throw new Error('Missing composerId/tabTitle for archive');
+
+      const norm = `(s) => (s || '').trim().replace(/\\s+/g, ' ').toLowerCase()`;
+
+      /**
+       * Turn Cursor's "archived" sidebar filter on/off by calling the sidebar's
+       * `onSidebarSettingsChange` prop. Archived rows are otherwise not mounted,
+       * so there is nothing to click for an unarchive without this. Returns the
+       * filter's prior state so the caller can restore it.
+       */
+      const setArchivedFilterJs = (want: boolean) => `
+        (() => {
+          const want = ${want ? 'true' : 'false'};
+          const seeds = [];
+          for (const el of document.querySelectorAll('*')) {
+            for (const k of Object.keys(el)) {
+              if (k.startsWith('__reactContainer$') || k.startsWith('__reactFiber$')) seeds.push(el[k]);
+            }
+          }
+          const seen = new Set(); const stack = [...seeds]; let n = 0;
+          while (stack.length && n < 120000) {
+            const f = stack.pop();
+            if (!f || typeof f !== 'object' || seen.has(f)) continue;
+            seen.add(f); n++;
+            const mp = f.memoizedProps;
+            if (mp && typeof mp === 'object' && mp.sidebarSettings && typeof mp.onSidebarSettingsChange === 'function') {
+              let prev = null;
+              try {
+                prev = Array.isArray(mp.sidebarSettings.filter && mp.sidebarSettings.filter.show)
+                  ? mp.sidebarSettings.filter.show.includes('archived') : false;
+                const next = JSON.parse(JSON.stringify(mp.sidebarSettings));
+                const show = new Set(Array.isArray(next.filter && next.filter.show) ? next.filter.show : []);
+                if (want) show.add('archived'); else show.delete('archived');
+                next.filter = Object.assign({}, next.filter, { show: Array.from(show) });
+                mp.onSidebarSettingsChange(next);
+                return { ok: true, prev };
+              } catch (e) { return { ok: false, error: String(e), prev }; }
+            }
+            if (f.child) stack.push(f.child);
+            if (f.sibling) stack.push(f.sibling);
+          }
+          return { ok: false, error: 'sidebar settings node not found', prev: null };
+        })()
+      `;
+
+      // Locate the row by composer id first, then exact title. Re-evaluated on
+      // every pass since the sidebar re-renders while we hover.
+      const findRowJs = `
+        (() => {
+          const wantId = ${JSON.stringify(wantId)};
+          const wantTitle = ${JSON.stringify(wantTitle.replace(/\s+/g, ' ').toLowerCase())};
+          const norm = ${norm};
+          const agentIdFromRow = (li) => {
+            const attrId = li.getAttribute('data-composer-id')
+              || li.querySelector('[data-composer-id]')?.getAttribute('data-composer-id') || '';
+            if (attrId) return attrId;
+            try {
+              const key = Object.keys(li).find(k => k.startsWith('__reactFiber$'));
+              let fiber = key ? li[key] : null;
+              let depth = 0;
+              while (fiber && depth < 20) {
+                const p = fiber.memoizedProps;
+                if (p && typeof p.agentId === 'string' && p.agentId) return p.agentId;
+                fiber = fiber.return || null;
+                depth++;
+              }
+            } catch {}
+            return '';
+          };
+          const rows = Array.from(document.querySelectorAll('li.ui-sidebar-menu-item'));
+          const label = (li) => norm(li.querySelector('.ui-sidebar-menu-button-label')?.textContent || li.textContent);
+          if (wantId) { for (const li of rows) if (agentIdFromRow(li) === wantId) return li; }
+          if (wantTitle) { for (const li of rows) if (label(li) === wantTitle) return li; }
+          return null;
+        })()
+      `;
+
+      const rowBox = await client.evaluate(`
+        (() => {
+          const row = ${findRowJs};
+          if (!row) return null;
+          row.scrollIntoView({ block: 'center', behavior: 'instant' });
+          const r = row.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) return null;
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        })()
+      `) as { x: number; y: number } | null;
+
+      // For unarchive the row is normally hidden by Cursor's archived filter, so
+      // reveal archived rows first and remember the prior setting to restore.
+      let prevArchivedFilter: boolean | null = null;
+      if (!rowBox && action === 'unarchive') {
+        const applied = await client.evaluate(setArchivedFilterJs(true)) as
+          { ok: boolean; prev: boolean | null; error?: string } | null;
+        if (applied && applied.ok) {
+          prevArchivedFilter = applied.prev;
+          await sleep(500);
+        }
+      }
+
+      const resolvedRowBox = rowBox ?? await client.evaluate(`
+        (() => {
+          const row = ${findRowJs};
+          if (!row) return null;
+          row.scrollIntoView({ block: 'center', behavior: 'instant' });
+          const r = row.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) return null;
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        })()
+      `) as { x: number; y: number } | null;
+
+      if (!resolvedRowBox) {
+        if (prevArchivedFilter !== null) await client.evaluate(setArchivedFilterJs(prevArchivedFilter));
+        throw new Error(`Agent row not found: ${wantTitle || wantId}`);
+      }
+
+      // Reveal the hover-mounted actions with a native pointer move.
+      await client.hoverAtCoords(resolvedRowBox.x, resolvedRowBox.y);
+      await sleep(200);
+
+      const wanted = action === 'unarchive'
+        ? ['unarchive', 'restore']
+        : ['archive'];
+      const btnBox = await client.evaluate(`
+        (() => {
+          const row = ${findRowJs};
+          if (!row) return { error: 'row disappeared' };
+          const wanted = ${JSON.stringify(wanted)};
+          const btns = Array.from(row.querySelectorAll('.ui-sidebar-menu-button-actions button'));
+          for (const b of btns) {
+            const aria = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+            if (!wanted.includes(aria)) continue;
+            const r = b.getBoundingClientRect();
+            if (r.width === 0 && r.height === 0) continue;
+            return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), aria };
+          }
+          return { error: 'action button not revealed', present: btns.map(b => b.getAttribute('aria-label')) };
+        })()
+      `) as { x?: number; y?: number; aria?: string; error?: string; present?: string[] } | null;
+      if (!btnBox || btnBox.x === undefined || btnBox.y === undefined) {
+        const present = btnBox?.present?.length ? ` (found: ${btnBox.present.join(', ')})` : '';
+        throw new Error(`${btnBox?.error ?? 'archive button not found'}${present}`);
+      }
+
+      await client.clickAtCoords(btnBox.x, btnBox.y);
+
+      // Everything past the destructive click is best-effort: a transient CDP
+      // hiccup here must NOT bubble up, because `withRetry` would re-run the
+      // whole action and archive whatever row now occupies that spot.
+      try {
+        // Archiving a still-running agent raises a destructive confirm. Accept it
+        // so the command reports the true outcome instead of a stale row.
+        await sleep(500);
+        const confirmLabel = action === 'unarchive' ? 'Unarchive' : 'Archive';
+        const confirmBox = await client.evaluate(`
+          (() => {
+            const want = ${JSON.stringify(action === 'unarchive' ? 'Unarchive' : 'Archive')};
+            for (const d of document.querySelectorAll('[role="dialog"], [role="alertdialog"]')) {
+              const r = d.getBoundingClientRect();
+              if (r.width === 0 && r.height === 0) continue;
+              for (const b of d.querySelectorAll('button')) {
+                const text = (b.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (!text.toLowerCase().startsWith(want.toLowerCase())) continue;
+                const br = b.getBoundingClientRect();
+                return { x: Math.round(br.left + br.width / 2), y: Math.round(br.top + br.height / 2) };
+              }
+            }
+            return null;
+          })()
+        `) as { x: number; y: number } | null;
+        if (confirmBox) {
+          await client.clickAtCoords(confirmBox.x, confirmBox.y);
+          console.log(`[command-executor] Confirmed ${confirmLabel} for running agent`);
+        }
+
+        // Leave the sidebar filter as we found it: an unarchive only revealed the
+        // archived rows to reach the button, and should not permanently change how
+        // the user's sidebar is filtered.
+        if (prevArchivedFilter !== null) {
+          await sleep(300);
+          await client.evaluate(setArchivedFilterJs(prevArchivedFilter));
+        }
+      } catch (err) {
+        console.warn(`[command-executor] Post-archive cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      console.log(`[command-executor] ${action === 'unarchive' ? 'Unarchived' : 'Archived'} agent "${wantTitle || wantId}"`);
+    });
+  }
+
   async setMode(commandId: string, modeId: string): Promise<CommandResult> {
     return this.withRetry(commandId, async (client) => {
       const strategies = this.selectors.modeDropdown?.strategies ?? [];
@@ -1148,88 +1363,104 @@ export class CommandExecutor {
    * Used to mirror Cursor's slash menu on the phone. The menu stays open in the
    * host composer; the client either picks a row (clickSlashCommand) or cancels
    * (cancelSlashMenu).
+   *
+   * `query` narrows the tray the way typing in Cursor would. Cursor only ever
+   * renders the first ~14 rows and the tray has no scrollbar, so a filter is the
+   * ONLY way to reach the rest of the command set — we type `/<query>` into the
+   * composer and Cursor re-ranks its own matches (label + description).
    */
-  async getSlashMenu(commandId: string): Promise<CommandResult> {
+  async getSlashMenu(commandId: string, query = ''): Promise<CommandResult> {
     const result = await this.withRetryValue(commandId, async (client) => {
-      await this.focusComposer(client);
-
-      const menuAlreadyOpen = await client.evaluate(`
-        (() => document.querySelector('div[role="listbox"][aria-label="Slash commands"]') !== null)()
-      `) as boolean;
-
-      if (!menuAlreadyOpen) {
-        // Cursor pivots the tray on the composer's leading character: a "/" is
-        // required to open it, but if the composer already holds something
-        // (e.g. a stray "/" left from a previous open), typing another "/"
-        // produces "//" and the tray stays shut (or shows nothing). Normalize
-        // to a single leading "/" first.
-        const current = await this.readComposerText(client);
-        if (current.length > 0) {
-          await this.clearComposer(client);
-          await this.focusComposer(client);
-        }
-        await client.typeText('/');
-        await sleep(450);
-      }
-
-      return await client.evaluate(`
-        (() => {
-          const list = document.querySelector('div[role="listbox"][aria-label="Slash commands"]');
-          if (!list) return { open: false, options: [] };
-          const rows = Array.from(list.querySelectorAll('button[role="option"]'));
-          const options = rows.map((el, i) => {
-            const textSpan = el.children.length >= 2 ? el.children[1] : el;
-            const parts = [];
-            for (const node of Array.from(textSpan.querySelectorAll('span, div'))) {
-              const t = (node.textContent || '').trim();
-              if (t && parts[parts.length - 1] !== t) parts.push(t);
-            }
-            const directText = Array.from(textSpan.childNodes)
-              .filter((n) => n.nodeType === Node.TEXT_NODE)
-              .map((n) => (n.textContent || '').trim())
-              .filter(Boolean)
-              .join(' ');
-            const label = (directText || parts[0] || (el.textContent || '').trim()).slice(0, 80);
-            const description = (parts[parts.length - 1] || '').slice(0, 160);
-            return {
-              id: label ? label.toLowerCase().replace(/\\s+/g, '-') : ('slash-' + i),
-              label,
-              description: description === label ? '' : description,
-              selected: el.getAttribute('aria-selected') === 'true',
-              index: i + 1,
-            };
-          });
-          return { open: true, options };
-        })()
-      `);
+      await this.openSlashTray(client, query);
+      return this.readSlashOptions(client);
     });
     if (!result.ok) return result;
     return { commandId, ok: true, data: result.data };
   }
 
+  /** True while Cursor's `/` tray is mounted in the composer. */
+  private async slashTrayOpen(client: CdpClient): Promise<boolean> {
+    const open = await client.evaluate(`
+      (() => document.querySelector('div[role="listbox"][aria-label="Slash commands"]') !== null)()
+    `) as boolean;
+    return !!open;
+  }
+
+  /**
+   * Bring the composer to a single `/<query>` and leave the tray open. Cursor
+   * pivots the tray on the composer's leading character, so a stray "/" or left-
+   * over text would turn our "/" into "//" and keep the tray shut. If the tray
+   * is already open at the exact request we want, this is a no-op (cheap for the
+   * common "user is just scrolling the list" case).
+   */
+  private async openSlashTray(client: CdpClient, query: string): Promise<void> {
+    // Keep the query conservative: Cursor only matches on the command token, so
+    // strip anything that isn't a token character before typing it.
+    const wanted = (query || '').replace(/[^\w-]/g, '').slice(0, 40);
+    const desired = '/' + wanted;
+
+    const alreadyOpen = await this.slashTrayOpen(client);
+    if (alreadyOpen) {
+      const current = await this.readComposerText(client);
+      if (current === desired) return;
+    }
+
+    // Only clear when there is something to clear: an already-empty composer
+    // just receives the "/query" (a needless select-all + Backspace here would
+    // also emit a stray keystroke the tests/replay depend on not seeing).
+    const current = await this.readComposerText(client);
+    if (current.length > 0) {
+      await this.clearComposer(client);
+    }
+    await this.focusComposer(client);
+    await client.typeText(desired);
+    // Cursor debounces its filter; a query needs a beat longer than a bare "/".
+    await sleep(wanted ? 550 : 450);
+  }
+
+  /** Read the rows currently rendered in the `/` tray (empty when closed). */
+  private async readSlashOptions(client: CdpClient): Promise<unknown> {
+    return client.evaluate(`
+      (() => {
+        const list = document.querySelector('div[role="listbox"][aria-label="Slash commands"]');
+        if (!list) return { open: false, options: [] };
+        const rows = Array.from(list.querySelectorAll('button[role="option"]'));
+        const options = rows.map((el, i) => {
+          const textSpan = el.children.length >= 2 ? el.children[1] : el;
+          const parts = [];
+          for (const node of Array.from(textSpan.querySelectorAll('span, div'))) {
+            const t = (node.textContent || '').trim();
+            if (t && parts[parts.length - 1] !== t) parts.push(t);
+          }
+          const directText = Array.from(textSpan.childNodes)
+            .filter((n) => n.nodeType === Node.TEXT_NODE)
+            .map((n) => (n.textContent || '').trim())
+            .filter(Boolean)
+            .join(' ');
+          const label = (directText || parts[0] || (el.textContent || '').trim()).slice(0, 80);
+          const description = (parts[parts.length - 1] || '').slice(0, 160);
+          return {
+            id: label ? label.toLowerCase().replace(/\\s+/g, '-') : ('slash-' + i),
+            label,
+            description: description === label ? '' : description,
+            selected: el.getAttribute('aria-selected') === 'true',
+            index: i + 1,
+          };
+        });
+        return { open: true, options };
+      })()
+    `);
+  }
+
   /**
    * Click a row in the open `/` slash tray. `slashId` matches the synthesized id
    * (lowercased label); `slashIndex` is a 1-based fallback. If the tray is not
-   * open (e.g. a poll cleared it), it is reopened first.
+   * open (e.g. a poll cleared it), it is reopened first — restoring `query` so
+   * the same filtered list the client is looking at is what gets clicked.
    */
-  async clickSlashCommand(commandId: string, slashId?: string, slashIndex?: number): Promise<CommandResult> {
+  async clickSlashCommand(commandId: string, slashId?: string, slashIndex?: number, query = ''): Promise<CommandResult> {
     const result = await this.withRetryValue(commandId, async (client) => {
-      await this.focusComposer(client);
-
-      const menuOpen = await client.evaluate(`
-        (() => document.querySelector('div[role="listbox"][aria-label="Slash commands"]') !== null)()
-      `) as boolean;
-      if (!menuOpen) {
-        // Mirror getSlashMenu: clear any stray text so "/" reliably reopens
-        // the tray rather than turning into "//" (which keeps it closed).
-        const current = await this.readComposerText(client);
-        if (current.length > 0) {
-          await this.clearComposer(client);
-          await this.focusComposer(client);
-        }
-        await client.typeText('/');
-        await sleep(450);
-      }
+      await this.openSlashTray(client, query);
 
       const clicked = await client.evaluate(`
         (() => {

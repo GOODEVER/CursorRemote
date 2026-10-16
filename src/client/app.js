@@ -110,6 +110,10 @@
   let hadQuestionnaire = false;
   let hadApproval = false;
   let notificationsPrimed = false;
+  // Composer the edge state belongs to. Switching chats must re-prime rather
+  // than treat "previous agent was working, new one is idle" as a finish —
+  // that was the false ping when opening another folder.
+  let notifyComposerId = '';
   // Auto-open bookkeeping: when the relay is pointed at Cursor's "Cursor Agents"
   // overview, no chat is mounted, so the transcript is empty until the user
   // taps an agent. We automatically open a chat (the relay's current one, or the
@@ -139,6 +143,63 @@
   // submits in place via send_prompt rather than retyping.
   let composerPrefilledText = '';
   const pendingCommandResults = new Map();
+
+  // Commands sheet: the live local filter, the query the shown list belongs to
+  // (to drop stale responses), and the debounce handle. Cursor's tray only ever
+  // renders ~14 rows and never scrolls, so the filter is what unlocks the rest.
+  let slashSearchQuery = '';
+  let slashRenderedQuery = null;
+  let slashSearchTimer = null;
+  const SLASH_SEARCH_DEBOUNCE_MS = 220;
+
+  // Recently / frequently used commands, kept per device in localStorage. Each
+  // entry is { k (token), n (use count), t (last used, ms) }. Merged into the
+  // unfiltered sheet as a "Recent" section and used to bias ordering.
+  const SLASH_USAGE_KEY = 'cursor-remote-slash-usage';
+  const SLASH_USAGE_MAX = 30;
+  let slashUsage = loadSlashUsage();
+
+  function loadSlashUsage() {
+    try {
+      const raw = localStorage.getItem(SLASH_USAGE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter(e => e && typeof e.k === 'string' && e.k)
+        .map(e => ({ k: e.k, n: Number(e.n) || 1, t: Number(e.t) || 0 }))
+        .slice(0, SLASH_USAGE_MAX);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function recordSlashUsage(token) {
+    if (!token) return;
+    const key = String(token).toLowerCase();
+    const existing = slashUsage.find(e => e.k === key);
+    if (existing) {
+      existing.n += 1;
+      existing.t = Date.now();
+    } else {
+      slashUsage.unshift({ k: key, n: 1, t: Date.now() });
+    }
+    // Most-recent first, then trim; used ordering is computed separately.
+    slashUsage.sort((a, b) => b.t - a.t);
+    slashUsage = slashUsage.slice(0, SLASH_USAGE_MAX);
+    try {
+      localStorage.setItem(SLASH_USAGE_KEY, JSON.stringify(slashUsage));
+    } catch (_) { /* storage full / unavailable — recents are best-effort */ }
+  }
+
+  /** A command's usage rank for sorting: most-used first, tie-broken by recency. */
+  function slashUsageRank(token) {
+    const key = String(token || '').toLowerCase();
+    const entry = slashUsage.find(e => e.k === key);
+    if (!entry) return { used: 0, rank: -1, t: 0 };
+    const index = slashUsage.indexOf(entry);
+    return { used: entry.n, rank: index, t: entry.t };
+  }
 
   /**
    * Per-window status for the agent open in each window, used to render a glyph
@@ -175,6 +236,13 @@
   // (e.g. it lives in another window), stop blocking auto-history after a while.
   let pinnedComposerTimer = null;
   const PINNED_COMPOSER_TIMEOUT_MS = 8000;
+  // While a newly-created folder agent is being adopted, we must NOT render the
+  // old transcript. Two stale sources would otherwise linger: the live DOM tail
+  // (`state.messages`) still describes the previous composer until the relay
+  // switches, and a late `history:full` for the previous composer can arrive
+  // after the switch. While this is set, renderMessages() shows the empty state
+  // unless the messages actually belong to the pinned (new) composer.
+  let suppressTranscriptUntil = '';
 
   function isNearMessagesBottom() {
     const threshold = 80;
@@ -265,6 +333,7 @@
   const $sheetPlanModelHeader = document.getElementById('sheet-plan-model-header');
   const $sheetPlanModelList = document.getElementById('sheet-plan-model-list');
   const $sheetSlash = document.getElementById('sheet-slash');
+  const $sheetSlashSearch = document.getElementById('slash-search');
   const $sheetSlashList = document.getElementById('sheet-slash-list');
   const $sheetFolders = document.getElementById('sheet-folders');
   const $sheetFoldersList = document.getElementById('sheet-folders-list');
@@ -411,8 +480,22 @@
   // transcript virtualization.
   socket.on('history:full', (payload) => {
     if (!payload || !Array.isArray(payload.messages)) return;
-    if (payload.composerId && pendingHistoryComposerId && payload.composerId !== pendingHistoryComposerId) return;
-    fullHistory = { composerId: payload.composerId || '', messages: payload.messages };
+    const targetId = payload.composerId || '';
+    const suppress = suppressTranscriptUntil;
+    // Mid-create: reject every payload until we have pinned the new agent, or a
+    // late read of the PREVIOUS composer would be adopted as current.
+    if (suppress === '__pending__') return;
+    // Mid-switch to a specific agent: only that agent's history is safe to show.
+    if (suppress && targetId !== suppress) return;
+    if (targetId && pendingHistoryComposerId && targetId !== pendingHistoryComposerId) return;
+    // Not switching: drop a transcript for a composer that is not the one on
+    // screen (and not the one we are waiting on) — the relay loads history
+    // asynchronously, so a payload for the previous composer can land late.
+    if (!suppress && targetId
+      && targetId !== state.activeComposerId
+      && targetId !== pinnedComposerId
+      && targetId !== pendingHistoryComposerId) return;
+    fullHistory = { composerId: targetId, messages: payload.messages };
     pendingHistoryComposerId = '';
     // A freshly loaded transcript is (re)rendered from scratch — land on the
     // newest message rather than wherever the previous chat was scrolled.
@@ -535,6 +618,17 @@
   });
 
   $btnSlash.addEventListener('click', () => { void openSlashMenu(); });
+
+  $sheetSlashSearch.addEventListener('input', () => {
+    slashSearchQuery = $sheetSlashSearch.value;
+    if (slashSearchTimer) clearTimeout(slashSearchTimer);
+    // Debounce hard: each keystroke would otherwise drive a full CDP round-trip
+    // (clear composer, type, wait for Cursor's filter).
+    slashSearchTimer = setTimeout(() => {
+      slashSearchTimer = null;
+      if (activeSheet === 'slash') void refreshSlashSheet();
+    }, SLASH_SEARCH_DEBOUNCE_MS);
+  });
 
   $btnApprove.addEventListener('click', () => {
     const approval = state.pendingApprovals[0];
@@ -786,6 +880,12 @@
 
   function noteActiveComposerChange(composerId) {
     const next = composerId || '';
+    // Once the server's active composer reaches the one we are adopting, the
+    // fresh transcript is safe to render again.
+    if (suppressTranscriptUntil && suppressTranscriptUntil !== '__pending__'
+      && next === suppressTranscriptUntil) {
+      suppressTranscriptUntil = '';
+    }
     if (!lastActiveComposerId) { lastActiveComposerId = next; return; }
     if (next !== lastActiveComposerId) {
       lastActiveComposerId = next;
@@ -805,10 +905,16 @@
     if (!composerId) return;
     resetScrollForNewTranscript();
     pinnedComposerId = composerId;
+    // Hide the previous chat's live tail until the server's active composer
+    // catches up to this selection, so the switch never shows the old folder's
+    // messages under the new chat's name.
+    suppressTranscriptUntil = composerId;
     if (pinnedComposerTimer) clearTimeout(pinnedComposerTimer);
     pinnedComposerTimer = setTimeout(() => {
       pinnedComposerTimer = null;
       pinnedComposerId = '';
+      // Never report the "waiting for the switch" state as current.
+      if (suppressTranscriptUntil === composerId) suppressTranscriptUntil = '';
       // Consume whatever the server still reports as active so the next render
       // doesn't immediately re-request the previous (stale) chat and yank the
       // user back. A genuine later change still triggers a fresh load.
@@ -819,6 +925,9 @@
     pendingHistoryComposerId = composerId;
     lastRequestedHistoryComposerId = composerId;
     socket.emit('request:history', { composerId });
+    // Render immediately so the previous chat's messages disappear at once,
+    // instead of lingering until the next state patch arrives.
+    renderAll();
   }
 
   /**
@@ -1106,12 +1215,30 @@
     // for everything but the newest messages; the live DOM tail is merged in so
     // streaming stays live.
     let msgs = state.messages;
+    // Only merge the full-history transcript when it belongs to the composer we
+    // actually have open. Otherwise the leftover history of the PREVIOUS chat
+    // would keep rendering after a switch (e.g. a folder agent was just created
+    // but the relay's active composer hasn't updated yet), which made the new
+    // chat look like it still held the old folder's messages. The permissive
+    // `!fullHistory.composerId || !state.activeComposerId` fallback was the bug:
+    // it treated "active composer unknown" as "history matches anything".
     if (fullHistory.messages.length > 0) {
-      const historyMatchesComposer =
-        !fullHistory.composerId || !state.activeComposerId || fullHistory.composerId === state.activeComposerId;
+      const historyMatchesComposer = !!fullHistory.composerId
+        && !!state.activeComposerId
+        && fullHistory.composerId === state.activeComposerId;
       if (historyMatchesComposer) {
         msgs = mergeHistoryWithLive(fullHistory.messages, state.messages);
       }
+    }
+    // While adopting a newly-created agent the live DOM tail still describes the
+    // OLD composer. Hide it (show the empty state) until the server's active
+    // composer matches, so the new chat never flashes the previous folder's
+    // messages. `'__pending__'` means "not yet pinned to any target": suppress
+    // unconditionally until adoptNewestComposer picks the new agent.
+    if (suppressTranscriptUntil) {
+      const target = suppressTranscriptUntil;
+      const matchesTarget = target !== '__pending__' && state.activeComposerId === target;
+      if (!matchesTarget) msgs = [];
     }
 
     if (msgs.length === 0) {
@@ -2468,19 +2595,49 @@
    *     signal and require the idle reading to settle).
    * Regular messages never trigger a notification (the old behaviour fired
    * one for every tool/command message, which bombarded the user).
+   *
+   * Two false-positive guards:
+   *   - A transport drop (`connected: false`) must not look like a finish —
+   *     `isAgentWorking()` is false while disconnected, which used to schedule
+   *     a chime ~5s after locking the phone even when nothing had finished.
+   *   - Switching the active composer (folder navigation) re-primes so the
+   *     previous chat's "was working" bit is not attributed to the new idle one.
    */
   function maybeNotifyTransitions() {
     const hasQuestionnaire = !!(state.questionnaire && state.questionnaire.questions
       && state.questionnaire.questions.length > 0);
     const hasApproval = (state.pendingApprovals || []).length > 0;
     const working = isAgentWorking();
+    const composerId = state.activeComposerId || '';
 
     // First render after load: adopt the current state without notifying.
     if (!notificationsPrimed) {
       notificationsPrimed = true;
+      notifyComposerId = composerId;
       wasWorking = working;
       hadQuestionnaire = hasQuestionnaire;
       hadApproval = hasApproval;
+      return;
+    }
+
+    // Composer switched (folder/agent open): adopt the new agent's signals.
+    // Without this, opening an idle chat after watching a working one looks
+    // like "working → idle" and pings "Agent finished" for the wrong chat.
+    if (composerId !== notifyComposerId) {
+      if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
+      notifyComposerId = composerId;
+      wasWorking = working;
+      hadQuestionnaire = hasQuestionnaire;
+      hadApproval = hasApproval;
+      return;
+    }
+
+    // Socket/CDP drop: never treat "not connected" as the agent finishing.
+    // Cancel any settle timer started from a flaky reading; keep wasWorking so
+    // a genuine finish that happened while we were offline is still announced
+    // once we reconnect and see a settled idle state for the SAME composer.
+    if (!state.connected) {
+      if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
       return;
     }
 
@@ -2508,8 +2665,15 @@
     } else if (wasWorking && !finishTimer) {
       // Idle after having worked — debounce so transient gaps (idle between
       // tool steps) don't fire a premature "finished" notification.
+      const finishForComposer = composerId;
       finishTimer = setTimeout(() => {
         finishTimer = null;
+        // Composer changed or we lost the link while settling — abort.
+        if (!state.connected) return;
+        if ((state.activeComposerId || '') !== finishForComposer) {
+          wasWorking = isAgentWorking();
+          return;
+        }
         const nowWorking = isAgentWorking();
         if (nowWorking) { wasWorking = true; return; }
         // Only announce a true finish — not a state the agent is blocked on
@@ -2842,6 +3006,10 @@
   // --- Bottom sheet logic ---
 
   let activeSheet = null;
+  // Agent row awaiting archive confirmation in the folders drawer, keyed by
+  // composerId (falling back to title). Survives a state-push re-render so the
+  // armed Cancel/Archive pair stays put instead of snapping back to the icon.
+  let pendingArchiveKey = '';
 
   function openSheet(type) {
     closeSheet();
@@ -2894,6 +3062,14 @@
     // composer's tray (and drop the stray "/") — mirror the app's Escape.
     if (wasSlash && !skipSlashCancel) {
       socket.emit('command:cancel_slash_menu', { commandId: newCommandId(), type: 'cancel_slash_menu' });
+    }
+    if (wasSlash) {
+      // Drop the filter so the next open starts clean and a paused debounce from
+      // a previous session can't fire against the re-opened sheet.
+      slashSearchQuery = '';
+      slashRenderedQuery = null;
+      if (slashSearchTimer) { clearTimeout(slashSearchTimer); slashSearchTimer = null; }
+      if ($sheetSlashSearch) $sheetSlashSearch.value = '';
     }
   }
 
@@ -3011,22 +3187,61 @@
     });
   }
 
-  // --- Slash command menu (mirrors Cursor's `/` tray) ---
+  // --- Commands sheet (mirrors Cursor's `/` tray) ---
+
+  // Cursor's tray only renders ~14 rows and never scrolls, so the search box is
+  // the only way to reach the rest of the commands: it re-opens the tray at
+  // `/<query>` and Cursor filters its own list. Results are cached per query so
+  // backspacing is instant and each distinct query costs at most one CDP trip.
+  const slashOptionsCache = new Map();
 
   async function openSlashMenu() {
+    slashSearchQuery = '';
+    slashRenderedQuery = null;
+    slashOptionsCache.clear();
+    if (slashSearchTimer) { clearTimeout(slashSearchTimer); slashSearchTimer = null; }
+    if ($sheetSlashSearch) $sheetSlashSearch.value = '';
+    // Re-read usage from storage on each open: another tab (or a previous
+    // session) may have updated it, and it keeps a stale in-memory list from
+    // outliving a hidden/restored page.
+    slashUsage = loadSlashUsage();
     openSheet('slash');
     renderSlashSheetLoading();
+    await fetchAndRenderSlash('');
+  }
+
+  /** Re-query for the current search text (debounced by the input handler). */
+  async function refreshSlashSheet() {
+    const query = slashSearchQuery.trim();
+    if (slashOptionsCache.has(query)) {
+      slashRenderedQuery = query;
+      renderSlashSheet(slashOptionsCache.get(query), query);
+      return;
+    }
+    renderSlashSheetLoading();
+    await fetchAndRenderSlash(query);
+  }
+
+  async function fetchAndRenderSlash(query) {
     const result = await sendCommandAwaitResult('command:get_slash_menu', {
       commandId: newCommandId(),
       type: 'get_slash_menu',
+      slashQuery: query,
     });
     if (activeSheet !== 'slash') return;
+    // Stale-response guard: a slower earlier response must not overwrite a newer
+    // query's results (typing "re" then "review" fires two round-trips).
+    if (query !== slashSearchQuery.trim()) return;
     if (result.ok && result.data && result.data.open) {
-      renderSlashSheet(result.data.options || []);
+      const options = result.data.options || [];
+      slashOptionsCache.set(query, options);
+      slashRenderedQuery = query;
+      renderSlashSheet(options, query);
     } else {
-      renderSlashSheet([]);
+      slashRenderedQuery = query;
+      renderSlashSheet([], query);
       if (!result.ok) {
-        showToast(result.error || 'Could not open slash menu', 'error');
+        showToast(result.error || 'Could not open commands', 'error');
       }
     }
   }
@@ -3039,38 +3254,79 @@
     $sheetSlashList.appendChild(loading);
   }
 
-  function renderSlashSheet(options) {
+  function renderSlashSheet(options, query) {
     $sheetSlashList.innerHTML = '';
+    const q = (query || '').trim();
     if (!options || options.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'sheet-empty';
-      empty.textContent = 'No slash commands available';
+      empty.textContent = q ? `No commands match “${q}”` : 'No commands available';
       $sheetSlashList.appendChild(empty);
       return;
     }
-    options.forEach((opt) => {
-      const btn = document.createElement('button');
-      btn.className = 'sheet-item sheet-item-slash' + (opt.selected ? ' selected' : '');
-      const main = document.createElement('div');
-      main.className = 'slash-row-main';
-      const token = document.createElement('span');
-      token.className = 'slash-token';
-      token.textContent = '/' + (opt.id || opt.label);
-      const label = document.createElement('span');
-      label.className = 'sheet-item-label';
-      label.textContent = opt.label || '';
-      main.appendChild(token);
-      main.appendChild(label);
-      btn.appendChild(main);
-      if (opt.description) {
-        const desc = document.createElement('div');
-        desc.className = 'slash-desc';
-        desc.textContent = opt.description;
-        btn.appendChild(desc);
+
+    if (q) {
+      // While searching, keep Cursor's own relevance order — it already ranks
+      // by best match across the token and the description.
+      options.forEach(opt => $sheetSlashList.appendChild(buildSlashRow(opt)));
+      return;
+    }
+
+    // No filter: surface recently/frequently used commands first, then the rest
+    // in Cursor's order. Recents are per-device, from localStorage.
+    const recentIds = slashUsage.map(e => e.k);
+    const recent = options
+      .filter(opt => recentIds.includes(String(opt.id || '').toLowerCase()))
+      .sort((a, b) => {
+        const ra = slashUsageRank(a.id);
+        const rb = slashUsageRank(b.id);
+        if (rb.used !== ra.used) return rb.used - ra.used;
+        return ra.rank - rb.rank;
+      })
+      .slice(0, 5);
+
+    if (recent.length > 0) {
+      $sheetSlashList.appendChild(buildSlashSection('Recent'));
+      recent.forEach(opt => $sheetSlashList.appendChild(buildSlashRow(opt)));
+      const rest = options.filter(opt => !recent.includes(opt));
+      if (rest.length > 0) {
+        $sheetSlashList.appendChild(buildSlashSection('All commands'));
+        rest.forEach(opt => $sheetSlashList.appendChild(buildSlashRow(opt)));
       }
-      btn.addEventListener('click', () => { void chooseSlashCommand(opt); });
-      $sheetSlashList.appendChild(btn);
-    });
+    } else {
+      options.forEach(opt => $sheetSlashList.appendChild(buildSlashRow(opt)));
+    }
+  }
+
+  function buildSlashSection(text) {
+    const header = document.createElement('div');
+    header.className = 'slash-section-header';
+    header.textContent = text;
+    return header;
+  }
+
+  function buildSlashRow(opt) {
+    const btn = document.createElement('button');
+    btn.className = 'sheet-item sheet-item-slash' + (opt.selected ? ' selected' : '');
+    const main = document.createElement('div');
+    main.className = 'slash-row-main';
+    const token = document.createElement('span');
+    token.className = 'slash-token';
+    token.textContent = '/' + (opt.id || opt.label);
+    const label = document.createElement('span');
+    label.className = 'sheet-item-label';
+    label.textContent = opt.label || '';
+    main.appendChild(token);
+    main.appendChild(label);
+    btn.appendChild(main);
+    if (opt.description) {
+      const desc = document.createElement('div');
+      desc.className = 'slash-desc';
+      desc.textContent = opt.description;
+      btn.appendChild(desc);
+    }
+    btn.addEventListener('click', () => { void chooseSlashCommand(opt); });
+    return btn;
   }
 
   // --- Folders drawer ---
@@ -3243,10 +3499,18 @@
         const statusById = composerStatusMap();
         agents.forEach((agent) => {
           const st = folderRowStatus(agent, statusById);
+          const key = agent.composerId || agent.title || '';
           // Waiting on the user outranks "working": a blocked agent is not
           // making progress, so the "needs you" glyph is the useful signal.
           const isWorking = st.working && !st.needsYou;
           const isQuestion = st.needsYou;
+
+          // The row is a flex wrapper holding the tap-to-open button plus the
+          // archive control. Keeping the spinner/status classes on `.folder-agent`
+          // preserves the existing row semantics (and its tests).
+          const row = document.createElement('div');
+          row.className = 'folder-agent-row';
+
           const btn = document.createElement('button');
           btn.className = 'folder-agent'
             + (agent.isActive ? ' active' : '')
@@ -3294,11 +3558,95 @@
             showToast(`Opening ${agent.title}...`, 'success');
             closeSheet();
           });
-          section.appendChild(btn);
+          row.appendChild(btn);
+          row.appendChild(buildArchiveControl(agent, folder, key));
+          section.appendChild(row);
         });
       }
       $sheetFoldersList.appendChild(section);
     });
+  }
+
+  /**
+   * Trailing archive control for an agent row.
+   *
+   * Archiving is destructive and mobile taps are easy to mis-hit, so the first
+   * tap only arms the row ("Cancel"/"Archive" replace the single icon); the
+   * second tap confirms. The armed key lives in `pendingArchiveKey` so a state
+   * push mid-confirm re-renders the same row still armed.
+   */
+  function buildArchiveControl(agent, folder, key) {
+    const wrap = document.createElement('div');
+    wrap.className = 'folder-agent-actions';
+
+    if (pendingArchiveKey === key) {
+      const cancel = document.createElement('button');
+      cancel.type = 'button';
+      cancel.className = 'folder-agent-cancel';
+      cancel.textContent = 'Cancel';
+      cancel.setAttribute('aria-label', `Keep ${agent.title || 'agent'}`);
+      cancel.addEventListener('click', (e) => {
+        e.stopPropagation();
+        pendingArchiveKey = '';
+        renderFoldersSheet();
+      });
+
+      const confirm = document.createElement('button');
+      confirm.type = 'button';
+      confirm.className = 'folder-agent-confirm';
+      confirm.textContent = 'Archive';
+      confirm.setAttribute('aria-label', `Confirm archive ${agent.title || 'agent'}`);
+      confirm.addEventListener('click', (e) => {
+        e.stopPropagation();
+        pendingArchiveKey = '';
+        archiveFolderAgent(agent);
+      });
+
+      wrap.appendChild(cancel);
+      wrap.appendChild(confirm);
+      return wrap;
+    }
+
+    const archive = document.createElement('button');
+    archive.type = 'button';
+    archive.className = 'folder-agent-archive';
+    archive.textContent = '\u{1F5C4}';
+    archive.setAttribute('aria-label', `Archive ${agent.title || 'agent'}`);
+    archive.title = `Archive ${agent.title || 'Untitled'}`;
+    archive.addEventListener('click', (e) => {
+      e.stopPropagation();
+      pendingArchiveKey = key;
+      renderFoldersSheet();
+    });
+    wrap.appendChild(archive);
+    return wrap;
+  }
+
+  /**
+   * Archive an agent row via Cursor's own sidebar Archive button. Cursor hides
+   * the row from the sidebar (and stops it first if it is still running); the
+   * relay re-extracts and pushes a fresh snapshot so the drawer drops the row
+   * immediately.
+   */
+  async function archiveFolderAgent(agent) {
+    showToast(`Archiving ${agent.title || 'agent'}...`, 'success');
+    const result = await sendCommandAwaitResult('command:archive_folder_agent', {
+      commandId: newCommandId(),
+      type: 'archive_folder_agent',
+      composerId: agent.composerId,
+      tabTitle: agent.title,
+      archiveAction: 'archive',
+    });
+    if (!result || !result.ok) {
+      showToast(result?.error || `Could not archive ${agent.title || 'agent'}`, 'error');
+      return;
+    }
+    showToast(`Archived ${agent.title || 'agent'}`, 'success');
+    // If the archived chat was the one open, its transcript no longer applies.
+    if (agent.composerId && agent.composerId === pinnedComposerId) {
+      pinnedComposerId = '';
+    }
+    await requestStateRefresh();
   }
 
   /**
@@ -3324,6 +3672,24 @@
     closeSheet();
     showToast(`Creating new agent in ${folder.name}...`, 'success');
 
+    // Remember the composer ids we already know, so after the click we can tell
+    // which agent Cursor actually opened as new. The old code just called
+    // requestStateRefresh(), then whichever composer happened to be active was
+    // followed — which could still be the PREVIOUS folder's agent, making the
+    // new chat show the wrong transcript.
+    const knownComposerIds = new Set();
+    for (const f of (state.folders || [])) {
+      for (const a of (f.agents || [])) {
+        if (a && a.composerId) knownComposerIds.add(a.composerId);
+      }
+    }
+
+    // The previous chat's live DOM tail keeps arriving until the relay switches
+    // composers; blank the transcript in the meantime so the new agent doesn't
+    // appear to contain the old folder's messages. '__pending__' suppresses
+    // unconditionally until adoptNewestComposer pins the new agent.
+    suppressTranscriptUntil = '__pending__';
+
     const result = await sendCommandAwaitResult('command:create_folder_agent', {
       commandId: newCommandId(),
       type: 'create_folder_agent',
@@ -3332,11 +3698,54 @@
     });
     if (!result || !result.ok) {
       showToast(result?.error || `Could not create agent in ${folder.name}`, 'error');
+      suppressTranscriptUntil = '';
+      renderAll();
       return;
     }
     // Force a re-read so the newly-created composer/agent shows up without
     // waiting for the next poll (and, on the relay side, so its history loads).
-    void requestStateRefresh();
+    await requestStateRefresh();
+    await adoptNewestComposer(knownComposerIds, folder);
+  }
+
+  /**
+   * After creating a folder agent, wait (briefly) for Cursor's extracted state to
+   * list a composer we had not seen before, then open it explicitly. This makes
+   * the switch deterministic instead of racing the relay's "active composer may
+   * or may not have updated yet" behaviour. If nothing new shows up (e.g. Cursor
+   * reused an empty composer instead of creating one), it falls back to opening
+   * the folder's active agent so the user still lands somewhere sensible.
+   */
+  async function adoptNewestComposer(knownIds, folder) {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const fresh = findUnknownComposer(state.folders || [], knownIds);
+      if (fresh) {
+        // selectComposer() clears the suppression via noteActiveComposerChange,
+        // but set the target here so the very next render is already unlocked.
+        suppressTranscriptUntil = '';
+        selectComposer(fresh);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 400));
+      await requestStateRefresh();
+    }
+    // Nothing new showed up. Clear the suppress gate so whatever the server
+    // reports renders (rather than leaving the screen blank), and fall back to
+    // the folder's active agent when one is known.
+    suppressTranscriptUntil = '';
+    const activeAgent = (folder.agents || []).find((a) => a && a.composerId && a.isActive)
+      || (folder.agents || []).find((a) => a && a.composerId);
+    if (activeAgent && activeAgent.composerId) selectComposer(activeAgent.composerId);
+    renderAll();
+  }
+
+  function findUnknownComposer(folders, knownIds) {
+    for (const f of folders) {
+      for (const a of (f.agents || [])) {
+        if (a && a.composerId && !knownIds.has(a.composerId)) return a.composerId;
+      }
+    }
+    return '';
   }
 
 
@@ -3346,11 +3755,15 @@
       type: 'click_slash_command',
       slashId: opt.id,
       slashIndex: opt.index,
+      // Pass the active filter so the server re-opens the SAME filtered list if
+      // the tray was lost between the read and the click.
+      slashQuery: (slashRenderedQuery || '').trim(),
     });
     if (!result.ok) {
       showToast(result.error || 'Could not run command', 'error');
       return;
     }
+    recordSlashUsage(opt.id || opt.label);
     closeSheet({ keepSlashMenu: true });
     const composerText = (result.data && result.data.composerText) || '';
     // Mirror the host composer: prefill what the slash command left behind so

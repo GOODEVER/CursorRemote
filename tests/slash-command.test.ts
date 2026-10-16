@@ -18,19 +18,33 @@ function createFakeComposer(initialText: string) {
     text: initialText,
     trayOpen: false,
     pressedKeys: [] as string[],
+    /** Every Input.insertText payload, so query typing can be asserted. */
+    typed: [] as string[],
   };
 
-  const OPTIONS = [
+  const ALL_OPTIONS = [
     { id: 'commit', label: 'commit', description: '', selected: false, index: 1 },
     { id: 'summarize', label: 'summarize', description: '', selected: false, index: 2 },
+    { id: 'review-security', label: 'review-security', description: 'security review', selected: false, index: 1 },
+    { id: 'review-bugbot', label: 'review-bugbot', description: 'bug review', selected: false, index: 2 },
   ];
+
+  // Cursor renders ~14 rows and filters by the token typed after "/".
+  const visibleOptions = () => {
+    if (!state.trayOpen) return [] as typeof ALL_OPTIONS;
+    const query = state.text.startsWith('/') ? state.text.slice(1).toLowerCase() : '';
+    const matches = ALL_OPTIONS.filter(o => o.id.includes(query));
+    return matches.map((o, i) => ({ ...o, index: i + 1, selected: i === 0 }));
+  };
 
   const client = {
     isConnected: () => true,
     typeText: async (text: string) => {
       // Input.insertText inserts at the cursor (end, in this model).
+      state.typed.push(text);
       state.text = state.text + text;
-      state.trayOpen = state.text === '/';
+      // A single leading "/" (plus an optional token) opens the tray.
+      state.trayOpen = /^\/\w*$/.test(state.text);
     },
     pressKey: async (key: string) => {
       state.pressedKeys.push(key);
@@ -45,16 +59,21 @@ function createFakeComposer(initialText: string) {
       // clickSlashCommand's row-finding expression
       if (expr.includes('const wantId')) {
         if (!state.trayOpen) return { ok: false, error: 'slash menu not open' };
-        state.text = '/summarize';
-        return { ok: true, label: 'summarize' };
+        const rows = visibleOptions();
+        const wantId = (expr.match(/const wantId = "([^"]*)"/) ?? [])[1] ?? '';
+        const wantIndex = Number((expr.match(/const wantIndex = (\d+)/) ?? [])[1] ?? NaN);
+        const target = rows.find(r => r.id === wantId)
+          ?? (Number.isFinite(wantIndex) ? rows[wantIndex - 1] : undefined)
+          ?? rows[0];
+        if (!target) return { ok: false, error: 'slash menu empty' };
+        state.text = '/' + target.id;
+        return { ok: true, label: target.label };
       }
       // tray read (getSlashMenu's final evaluate)
       if (expr.includes('const rows = Array.from')) {
-        return state.trayOpen
-          ? { open: true, options: OPTIONS }
-          : { open: false, options: [] };
+        return { open: state.trayOpen, options: state.trayOpen ? visibleOptions() : [] };
       }
-      // menuAlreadyOpen probe
+      // slashTrayOpen / menuAlreadyOpen probe
       if (expr.includes('aria-label="Slash commands"]')) {
         return state.trayOpen;
       }
@@ -67,7 +86,7 @@ function createFakeComposer(initialText: string) {
     },
   } as unknown as CdpClient;
 
-  return { client, state, OPTIONS };
+  return { client, state };
 }
 
 const SELECTORS = {
@@ -130,5 +149,60 @@ describe('slash menu composes a clean "/" before opening', () => {
       'the picked command should be inserted'
     );
     assert.ok(!state.text.startsWith('//'), 'composer must not accumulate a second slash');
+  });
+});
+
+describe('slash menu filtering (search unlocks the full command set)', () => {
+  it('types the query into the composer so Cursor filters its own list', async () => {
+    const { client, state } = createFakeComposer('');
+    const executor = new CommandExecutor(SELECTORS);
+    executor.setClient(client);
+
+    const result = await executor.getSlashMenu('q-1', 'review');
+    const options = (result.data as { options?: Array<{ id: string }> } | undefined)?.options ?? [];
+
+    assert.equal(result.ok, true);
+    assert.equal(state.text, '/review', 'the query must be typed after the slash');
+    assert.deepEqual(
+      options.map(o => o.id),
+      ['review-security', 'review-bugbot'],
+      'only the matching commands are returned'
+    );
+  });
+
+  it('strips characters Cursor cannot match on so the token stays valid', async () => {
+    const { client, state } = createFakeComposer('');
+    const executor = new CommandExecutor(SELECTORS);
+    executor.setClient(client);
+
+    await executor.getSlashMenu('q-2', '  re/vi ew!  ');
+    assert.equal(state.text, '/review', 'spaces and punctuation are removed from the token');
+  });
+
+  it('reuses the open tray when the composer already holds the same query', async () => {
+    const { client, state } = createFakeComposer('/review');
+    const executor = new CommandExecutor(SELECTORS);
+    executor.setClient(client);
+
+    // Prime the fake as if the tray is already open at that exact query.
+    await client.typeText('');
+    await executor.getSlashMenu('q-3', 'review');
+
+    assert.equal(state.typed.filter(t => t === '/review').length, 0, 'no redundant retype');
+    assert.ok(!state.pressedKeys.includes('Backspace'), 'nothing to clear for a matching query');
+  });
+
+  it('re-opens the SAME filtered list when clicking a searched command', async () => {
+    const { client, state } = createFakeComposer('');
+    const executor = new CommandExecutor(SELECTORS);
+    executor.setClient(client);
+
+    const result = await executor.clickSlashCommand('q-4', 'review-bugbot', 2, 'review');
+    assert.equal(result.ok, true);
+    assert.equal(state.text, '/review-bugbot', 'the filtered command is inserted');
+    assert.equal(
+      (result.data as { composerText?: string } | undefined)?.composerText,
+      '/review-bugbot'
+    );
   });
 });

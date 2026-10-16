@@ -102,6 +102,11 @@ function getDefaultSelectors(): SelectorConfig {
         "[class*='composer-bar']",
         "[class*='composer-panel']",
         "[class*='chat-widget']",
+        // Cursor's standalone "Cursor Agents" window mounts its chat pane in
+        // `.agent-panel`, not the legacy auxiliary bar. Without this fallback
+        // every extraction there returned null and the whole remote went stale.
+        ".agent-panel",
+        "[class*='agent-panel']",
       ],
     },
     approveButton: {

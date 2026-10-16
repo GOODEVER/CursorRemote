@@ -481,7 +481,12 @@ export class WindowMonitor extends EventEmitter {
         5000
       );
 
-      const state = result as CursorState | null;
+      const state = result as (CursorState & { __extractionError?: string }) | null;
+      // The in-page function tags an internal throw with `__extractionError`
+      // instead of returning a bare null, so a broken selector is not mistaken
+      // for "this window has no chat". Treat it as no snapshot here (a monitor
+      // poll that cannot read the DOM must not emit a bogus state).
+      if (state?.__extractionError) return null;
       return state ? applyDerivedActivityToState(state) : null;
     } catch {
       return null;

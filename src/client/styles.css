@@ -2032,6 +2032,43 @@ header {
 
 /* --- Slash command sheet rows --- */
 
+.slash-search-row {
+  padding: 8px 12px 4px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-surface);
+}
+
+.slash-search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 12px;
+  font-size: 14px;
+  font-family: var(--font-sans);
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.slash-search:focus {
+  border-color: var(--accent-blue);
+}
+
+.slash-section-header {
+  padding: 10px 16px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  opacity: 0.8;
+}
+
 .sheet-item-slash {
   flex-direction: column;
   align-items: stretch;
@@ -2267,15 +2304,26 @@ header {
   padding: 1px 6px;
 }
 
+/* Row wrapper: the tap-to-open button plus the trailing archive control.
+   The button keeps flex:1 so the title still truncates and the status glyph
+   stays pinned without overlapping the archive affordance. */
+.folder-agent-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 8px;
+}
+
 .folder-agent {
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   text-align: left;
   background: none;
   border: none;
-  padding: 8px 16px 8px 34px;
+  padding: 8px 4px 8px 34px;
   font-size: 13px;
   color: var(--text-secondary);
   cursor: pointer;
@@ -2291,6 +2339,67 @@ header {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* --- Archive control on agent rows --- */
+
+.folder-agent-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.folder-agent-archive {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0.6;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  padding: 0;
+}
+
+.folder-agent-archive:active {
+  background: var(--bg-hover);
+  opacity: 1;
+}
+
+/* Armed row: replace the single icon with an explicit Cancel/Archive pair so a
+   destructive action is never one stray tap away. */
+.folder-agent-cancel,
+.folder-agent-confirm {
+  flex: none;
+  border: none;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 8px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.folder-agent-cancel {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.folder-agent-confirm {
+  background: var(--accent-red);
+  color: #fff;
+}
+
+.folder-agent-cancel:active,
+.folder-agent-confirm:active {
+  opacity: 0.75;
 }
 
 .folder-agent:active { background: var(--bg-hover); }

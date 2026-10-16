@@ -402,6 +402,63 @@ describe('web: finished notification', () => {
       'question alert and finished chime are different sounds'
     );
   });
+
+  it('does not ping finished when the socket drops (phone lock / sleep)', async () => {
+    // Regression: isAgentWorking() is false while disconnected, so a transport
+    // drop used to look like "working → idle" and fire a finish chime ~5s after
+    // locking the phone — even when nothing had finished.
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    fireFullState(env.mockSocket, {
+      ...fixture[1].state!,
+      canAbort: true,
+      activeComposerId: 'c-working',
+    });
+    env.mockSocket.fire('connection:status', { connected: false });
+    await new Promise((r) => setTimeout(r, 5200));
+    assert.equal(
+      notifications().filter((n) => n.tag === 'cursor-finished').length,
+      0,
+      'disconnect must not look like a finish'
+    );
+    const overlay = env.document.getElementById('finished-overlay')!;
+    assert.ok(overlay.classList.contains('hidden'), 'no finished banner on disconnect');
+  });
+
+  it('does not ping finished when switching to another (idle) composer', async () => {
+    // Regression: opening a folder/agent after watching a working one used to
+    // attribute the previous "was working" bit to the new idle chat and ping.
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    fireFullState(env.mockSocket, {
+      ...fixture[1].state!,
+      canAbort: true,
+      activeComposerId: 'c-working',
+      chatTabs: [
+        { composerId: 'c-working', title: 'Busy agent', isActive: true, status: 'active', selectorPath: '' },
+        { composerId: 'c-idle', title: 'Idle agent', isActive: false, status: 'idle', selectorPath: '' },
+      ],
+    } as CursorState);
+
+    // Switch to a different, idle composer (folder navigation).
+    fireFullState(env.mockSocket, {
+      ...fixture[1].state!,
+      agentStatus: 'idle',
+      canAbort: false,
+      agentActivityLive: false,
+      agentActivityText: null,
+      activeComposerId: 'c-idle',
+      chatTabs: [
+        { composerId: 'c-working', title: 'Busy agent', isActive: false, status: 'idle', selectorPath: '' },
+        { composerId: 'c-idle', title: 'Idle agent', isActive: true, status: 'idle', selectorPath: '' },
+      ],
+    } as CursorState);
+
+    await new Promise((r) => setTimeout(r, 5200));
+    assert.equal(
+      notifications().filter((n) => n.tag === 'cursor-finished').length,
+      0,
+      'composer switch must re-prime, not fire a finish'
+    );
+  });
 });
 
 // ─── Stall nudge / forced refresh ───
@@ -772,6 +829,38 @@ describe('web: folders drawer', () => {
     assert.ok(later, 'a later composer change should still load');
     assert.equal(later!.payload.composerId, 'composer-other');
   });
+
+  it('does not show the previous chat under the new agent while it switches', () => {
+    // Regression: opening a different agent pinned the selection, but the live
+    // DOM tail still described the OLD composer until the server caught up, so
+    // the previous folder's messages rendered under the new agent's name.
+    const state = stateWithFolders();
+    state.activeComposerId = 'composer-old';
+    state.messages = [
+      { type: 'human', id: 'old-h', flatIndex: 0, text: 'old question', mentions: [] },
+    ] as CursorState['messages'];
+    state.folders[0].agents[0].composerId = 'composer-new';
+    fireFullState(env.mockSocket, state);
+    assert.equal(env.document.querySelectorAll('#messages .chat-el').length, 1, 'old chat visible first');
+
+    env.document.getElementById('btn-folders')!.click();
+    const agentBtn = env.document.getElementById('sheet-folders-list')!.querySelector('.folder-agent') as HTMLButtonElement;
+    agentBtn.click();
+
+    // The server has not switched yet; the old tail must NOT be shown.
+    assert.equal(env.document.querySelectorAll('#messages .chat-el').length, 0,
+      'previous chat hidden while switching');
+
+    // Once the server agrees (active composer AND its tail move together, as
+    // they do in a real extraction patch), the new chat renders and nothing of
+    // the old chat remains.
+    const newTail = [{ type: 'assistant', id: 'new-a', flatIndex: 0, text: 'new answer', html: '<p>new answer</p>', codeBlocks: [] }];
+    fireHistory(env.mockSocket, { composerId: 'composer-new', messages: newTail });
+    firePatch(env.mockSocket, { activeComposerId: 'composer-new', messages: newTail as CursorState['messages'] });
+    const els = env.document.querySelectorAll('#messages .chat-el');
+    assert.equal(els.length, 1);
+    assert.equal(els[0].getAttribute('data-id'), 'new-a');
+  });
 });
 
 // ─── Folders drawer: working indicator ───
@@ -924,6 +1013,244 @@ describe('web: folders working indicator', () => {
     fireFullState(env.mockSocket, state);
     const btn = env.document.getElementById('btn-folders')!;
     assert.ok(btn.classList.contains('needs-input'), 'header button flagged for needs-attention');
+  });
+});
+
+// ─── Creating a folder agent ───
+
+describe('web: create folder agent', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  function foldersState(activeComposerId: string, agents: Array<Partial<CursorState['folders'][number]['agents'][number]>>): CursorState {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    return {
+      ...fixture[0].state!,
+      connected: true,
+      activeComposerId,
+      chatTabs: [],
+      folders: [
+        {
+          name: 'FactoryTycoonGame',
+          sectionId: 'workspace:abc',
+          kind: 'workspace',
+          isCurrent: true,
+          agents: agents.map((a) => ({
+            title: a.title ?? 'Agent',
+            composerId: a.composerId ?? '',
+            sectionId: 'workspace:abc',
+            isActive: a.isActive ?? false,
+            selectorPath: '',
+          })),
+        },
+      ],
+    };
+  }
+
+  function human(id: string, text: string) {
+    return { type: 'human', id, flatIndex: 0, text, mentions: [] };
+  }
+  function assistant(id: string, text: string) {
+    return { type: 'assistant', id, flatIndex: 0, text, html: `<p>${text}</p>`, codeBlocks: [] };
+  }
+
+  function openFolderAndCreate() {
+    const list = env.document.getElementById('sheet-folders-list')!;
+    const header = list.querySelector('.folder-header') as HTMLElement;
+    header.click();
+  }
+
+  it('does not render the previous chat when a new agent has no history yet', () => {
+    // Regression: creating a folder agent cleared history, but the next state
+    // patch still carried the PREVIOUS composer's live DOM tail, so the previous
+    // folder's messages stayed on screen. The transcript must go empty until the
+    // new agent is actually adopted.
+    const state = foldersState('composer-old', [{ title: 'Old chat', composerId: 'composer-old', isActive: true }]);
+    fireFullState(env.mockSocket, state);
+    fireHistory(env.mockSocket, {
+      composerId: 'composer-old',
+      messages: [human('h1', 'old question'), assistant('a1', 'old answer')],
+    });
+    assert.equal(env.document.querySelectorAll('#messages .chat-el').length, 2, 'old chat rendered');
+
+    env.document.getElementById('btn-folders')!.click();
+    openFolderAndCreate();
+
+    // The server still reports the OLD composer's live tail while it switches.
+    firePatch(env.mockSocket, {
+      activeComposerId: 'composer-old',
+      messages: [human('h1', 'old question'), assistant('a1', 'old answer')] as CursorState['messages'],
+    });
+
+    const els = env.document.querySelectorAll('#messages .chat-el');
+    assert.equal(els.length, 0, `previous transcript must be cleared, got ${els.length}`);
+  });
+
+  it('ignores a late history payload for the previous composer after creating', () => {
+    const state = foldersState('composer-old', [{ title: 'Old chat', composerId: 'composer-old', isActive: true }]);
+    fireFullState(env.mockSocket, state);
+    env.document.getElementById('btn-folders')!.click();
+    openFolderAndCreate();
+
+    // The new agent appears and the server switches to it.
+    firePatch(env.mockSocket, {
+      activeComposerId: 'composer-new',
+      folders: foldersState('composer-new', [
+        { title: 'Old chat', composerId: 'composer-old', isActive: false },
+        { title: 'New chat', composerId: 'composer-new', isActive: true },
+      ]).folders,
+    });
+
+    // A late payload for the OLD composer arrives — it must be dropped.
+    fireHistory(env.mockSocket, {
+      composerId: 'composer-old',
+      messages: [human('h1', 'old question'), assistant('a1', 'old answer')],
+    });
+    assert.equal(env.document.querySelectorAll('#messages .chat-el').length, 0, 'stale history not rendered');
+  });
+
+  it('pins the newly created agent so it switches deterministically', async () => {
+    const state = foldersState('composer-old', [{ title: 'Old chat', composerId: 'composer-old', isActive: true }]);
+    fireFullState(env.mockSocket, state);
+    env.document.getElementById('btn-folders')!.click();
+    openFolderAndCreate();
+
+    // Resolve the create command, then reveal the new composer via state before
+    // the post-create refresh resolves.
+    const create = env.mockSocket.sent.filter(s => s.event === 'command:create_folder_agent').pop()!;
+    env.mockSocket.sent.length = 0;
+    env.mockSocket.fire('command:result', { commandId: create.payload.commandId, ok: true });
+    firePatch(env.mockSocket, {
+      activeComposerId: 'composer-new',
+      folders: foldersState('composer-new', [
+        { title: 'Old chat', composerId: 'composer-old', isActive: false },
+        { title: 'New chat', composerId: 'composer-new', isActive: true },
+      ]).folders,
+    });
+
+    // Complete the refresh the create flow awaited before it snoops for the new
+    // composer.
+    const refresh = env.mockSocket.sent.filter(s => s.event === 'command:refresh_state').pop();
+    if (refresh) env.mockSocket.fire('command:result', { commandId: refresh.payload.commandId, ok: true });
+    await new Promise((r) => setTimeout(r, 60));
+
+    const requested = env.mockSocket.sent
+      .filter(s => s.event === 'request:history')
+      .map(s => s.payload.composerId);
+    assert.ok(requested.includes('composer-new'), 'new agent history requested');
+    assert.ok(!requested.includes('composer-old'), 'previous agent must not be re-requested');
+  });
+});
+
+// ─── Archive a folder agent ───
+
+describe('web: archive folder agent', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  function stateWithFolders(): CursorState {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    return {
+      ...fixture[0].state!,
+      activeComposerId: '',
+      folders: [
+        {
+          name: 'FactoryTycoonGame',
+          sectionId: 'workspace:abc',
+          kind: 'workspace',
+          isCurrent: true,
+          agents: [
+            { title: 'Roblox factory game design', composerId: 'composer-abc', sectionId: 'workspace:abc', isActive: false, selectorPath: '' },
+          ],
+        },
+      ],
+    };
+  }
+
+  function openFolders() {
+    env.document.getElementById('btn-folders')!.click();
+    return env.document.getElementById('sheet-folders-list')!;
+  }
+
+  it('renders an archive control on every agent row', () => {
+    fireFullState(env.mockSocket, stateWithFolders());
+    const list = openFolders();
+    const row = list.querySelector('.folder-agent-row')!;
+    assert.ok(row, 'agent row wrapper rendered');
+    const archive = row.querySelector('.folder-agent-archive') as HTMLButtonElement;
+    assert.ok(archive, 'archive button rendered');
+    assert.match(archive.getAttribute('aria-label')!, /Archive Roblox factory game design/);
+    // The tap-to-open button is still inside the row (regression guard: the
+    // archive wrapper must not swallow it).
+    assert.ok(row.querySelector('.folder-agent'), 'open button still present');
+  });
+
+  it('arms the row on first tap instead of archiving immediately', () => {
+    fireFullState(env.mockSocket, stateWithFolders());
+    const list = openFolders();
+    (list.querySelector('.folder-agent-archive') as HTMLButtonElement).click();
+
+    // Destructive action is two-step: nothing emitted, Cancel/Archive shown.
+    assert.equal(env.mockSocket.sent.filter(s => s.event === 'command:archive_folder_agent').length, 0,
+      'no archive command on the arming tap');
+    const rearmed = env.document.getElementById('sheet-folders-list')!;
+    assert.ok(rearmed.querySelector('.folder-agent-cancel'), 'cancel button shown');
+    assert.ok(rearmed.querySelector('.folder-agent-confirm'), 'confirm button shown');
+  });
+
+  it('cancel disarms the row without archiving', () => {
+    fireFullState(env.mockSocket, stateWithFolders());
+    openFolders();
+    (env.document.getElementById('sheet-folders-list')!.querySelector('.folder-agent-archive') as HTMLButtonElement).click();
+    (env.document.getElementById('sheet-folders-list')!.querySelector('.folder-agent-cancel') as HTMLButtonElement).click();
+
+    assert.equal(env.mockSocket.sent.filter(s => s.event === 'command:archive_folder_agent').length, 0,
+      'cancel must not emit an archive command');
+    const list = env.document.getElementById('sheet-folders-list')!;
+    assert.ok(list.querySelector('.folder-agent-archive'), 'row returns to the single archive icon');
+    assert.ok(!list.querySelector('.folder-agent-confirm'), 'confirm pair removed');
+  });
+
+  it('emits command:archive_folder_agent with the agent target on confirm', () => {
+    fireFullState(env.mockSocket, stateWithFolders());
+    openFolders();
+    (env.document.getElementById('sheet-folders-list')!.querySelector('.folder-agent-archive') as HTMLButtonElement).click();
+    (env.document.getElementById('sheet-folders-list')!.querySelector('.folder-agent-confirm') as HTMLButtonElement).click();
+
+    const evt = env.mockSocket.sent.filter(s => s.event === 'command:archive_folder_agent').pop();
+    assert.ok(evt, 'archive command emitted');
+    assert.equal(evt!.payload.type, 'archive_folder_agent');
+    assert.equal(evt!.payload.composerId, 'composer-abc');
+    assert.equal(evt!.payload.tabTitle, 'Roblox factory game design');
+    assert.equal(evt!.payload.archiveAction, 'archive');
+  });
+
+  it('does not open the agent when tapping the archive control', () => {
+    fireFullState(env.mockSocket, stateWithFolders());
+    openFolders();
+    env.mockSocket.sent.length = 0;
+    (env.document.getElementById('sheet-folders-list')!.querySelector('.folder-agent-archive') as HTMLButtonElement).click();
+
+    assert.equal(env.mockSocket.sent.filter(s => s.event === 'command:open_folder_agent').length, 0,
+      'archive tap must not trigger the row open handler');
+  });
+
+  it('keeps the row armed across a state push', () => {
+    // A push arriving mid-confirm re-renders the drawer; the armed pair must
+    // survive so the user's second tap still lands.
+    fireFullState(env.mockSocket, stateWithFolders());
+    openFolders();
+    (env.document.getElementById('sheet-folders-list')!.querySelector('.folder-agent-archive') as HTMLButtonElement).click();
+
+    firePatch(env.mockSocket, { folders: stateWithFolders().folders });
+    const list = env.document.getElementById('sheet-folders-list')!;
+    assert.ok(list.querySelector('.folder-agent-confirm'), 'confirm still armed after a push');
   });
 });
 
@@ -1844,5 +2171,193 @@ describe('web: session persistence', () => {
     await new Promise((r) => setTimeout(r, 5));
 
     assert.equal(env.window.localStorage.getItem('cursor-remote-token'), 'valid-token');
+  });
+});
+
+// ─── Commands (slash) sheet: search + recents ───
+
+describe('web: commands sheet', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  const OPTIONS = [
+    { id: 'commit', label: 'commit', description: 'Commit the current changes', selected: false, index: 1 },
+    { id: 'summarize', label: 'summarize', description: 'Summarize this conversation', selected: false, index: 2 },
+    { id: 'review-bugbot', label: 'review-bugbot', description: 'Review with Bugbot', selected: false, index: 3 },
+    { id: 'review-security', label: 'review-security', description: 'Security review', selected: false, index: 4 },
+  ];
+
+  /** Resolve the pending command result matching a get_slash_menu emit. */
+  function resolveLastSlashMenu(payload: Record<string, unknown>, ok = true) {
+    const sent = env.mockSocket.sent.filter(s => s.event === 'command:get_slash_menu').pop();
+    assert.ok(sent, 'get_slash_menu should have been emitted');
+    env.mockSocket.fire('command:result', {
+      commandId: sent!.payload.commandId,
+      ok,
+      data: ok ? { open: true, options: payload.options } : undefined,
+      error: ok ? undefined : 'boom',
+    });
+    return sent!;
+  }
+
+  it('renders the search box in the Commands sheet', () => {
+    env.document.getElementById('btn-slash')!.click();
+    const box = env.document.getElementById('slash-search') as HTMLInputElement;
+    assert.ok(box, 'search box present');
+    assert.equal(box.value, '', 'starts empty');
+  });
+
+  it('sends the typed query to the server and renders the filtered list', async () => {
+    env.document.getElementById('btn-slash')!.click();
+    resolveLastSlashMenu({ options: OPTIONS });
+    await new Promise(r => setTimeout(r, 0));
+
+    const box = env.document.getElementById('slash-search') as HTMLInputElement;
+    box.value = 'review';
+    box.dispatchEvent(new (env.window as any).Event('input', { bubbles: true }));
+
+    // Debounced — wait past the debounce window.
+    await new Promise(r => setTimeout(r, 300));
+
+    const queryEvt = env.mockSocket.sent.filter(s => s.event === 'command:get_slash_menu').pop()!;
+    assert.equal(queryEvt.payload.slashQuery, 'review', 'query forwarded to the server');
+
+    resolveLastSlashMenu({ options: [OPTIONS[2], OPTIONS[3]] });
+    await new Promise(r => setTimeout(r, 0));
+
+    const list = env.document.getElementById('sheet-slash-list')!;
+    const tokens = Array.from(list.querySelectorAll('.slash-token')).map(t => t.textContent);
+    assert.deepEqual(tokens, ['/review-bugbot', '/review-security'], 'only filtered rows shown');
+  });
+
+  it('shows a clear empty state when nothing matches', async () => {
+    env.document.getElementById('btn-slash')!.click();
+    resolveLastSlashMenu({ options: OPTIONS });
+    await new Promise(r => setTimeout(r, 0));
+
+    const box = env.document.getElementById('slash-search') as HTMLInputElement;
+    box.value = 'zzzz';
+    box.dispatchEvent(new (env.window as any).Event('input', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 300));
+
+    resolveLastSlashMenu({ options: [] });
+    await new Promise(r => setTimeout(r, 0));
+
+    const list = env.document.getElementById('sheet-slash-list')!;
+    assert.match(list.textContent!, /No commands match/i);
+  });
+
+  it('drops a stale response that arrives after a newer query', async () => {
+    env.document.getElementById('btn-slash')!.click();
+    resolveLastSlashMenu({ options: OPTIONS });
+    await new Promise(r => setTimeout(r, 0));
+
+    const box = env.document.getElementById('slash-search') as HTMLInputElement;
+    // First query ("re"), then a newer one ("review") before it resolves.
+    box.value = 're';
+    box.dispatchEvent(new (env.window as any).Event('input', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 300));
+    const firstEvt = env.mockSocket.sent.filter(s => s.event === 'command:get_slash_menu').pop()!;
+    assert.equal(firstEvt.payload.slashQuery, 're');
+
+    box.value = 'review';
+    box.dispatchEvent(new (env.window as any).Event('input', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 300));
+    const secondEvt = env.mockSocket.sent.filter(s => s.event === 'command:get_slash_menu').pop()!;
+    assert.equal(secondEvt.payload.slashQuery, 'review');
+
+    // The newer query resolves first, then the stale "re" response lands late.
+    env.mockSocket.fire('command:result', { commandId: secondEvt.payload.commandId, ok: true, data: { open: true, options: [OPTIONS[2]] } });
+    await new Promise(r => setTimeout(r, 0));
+    env.mockSocket.fire('command:result', { commandId: firstEvt.payload.commandId, ok: true, data: { open: true, options: OPTIONS } });
+    await new Promise(r => setTimeout(r, 0));
+
+    const list = env.document.getElementById('sheet-slash-list')!;
+    const tokens = Array.from(list.querySelectorAll('.slash-token')).map(t => t.textContent);
+    assert.deepEqual(tokens, ['/review-bugbot'], 'stale "re" results must not overwrite "review"');
+  });
+
+  it('surfaces recently used commands in a Recent section', async () => {
+    // Seed a per-device usage history with "review-security".
+    env.window.localStorage.setItem(
+      'cursor-remote-slash-usage',
+      JSON.stringify([{ k: 'review-security', n: 3, t: Date.now() }]),
+    );
+
+    env.document.getElementById('btn-slash')!.click();
+    resolveLastSlashMenu({ options: OPTIONS });
+    await new Promise(r => setTimeout(r, 0));
+
+    const list = env.document.getElementById('sheet-slash-list')!;
+    const sections = Array.from(list.querySelectorAll('.slash-section-header')).map(s => s.textContent);
+    assert.deepEqual(sections, ['Recent', 'All commands'], 'recents are grouped first');
+    // The most-used command leads the list.
+    const firstRow = list.querySelector('.sheet-item-slash');
+    assert.match(firstRow!.textContent!, /review-security/);
+  });
+
+  it('records usage when a command is picked, feeding the next Recent list', async () => {
+    env.document.getElementById('btn-slash')!.click();
+    resolveLastSlashMenu({ options: OPTIONS });
+    await new Promise(r => setTimeout(r, 0));
+
+    const firstRow = env.document.getElementById('sheet-slash-list')!.querySelector('.sheet-item-slash') as HTMLButtonElement;
+    firstRow.click();
+
+    const pick = env.mockSocket.sent.filter(s => s.event === 'command:click_slash_command').pop()!;
+    assert.equal(pick.payload.type, 'click_slash_command');
+    // Usage is recorded once the pick succeeds.
+    env.mockSocket.fire('command:result', { commandId: pick.payload.commandId, ok: true, data: { composerText: '' } });
+    await new Promise(r => setTimeout(r, 0));
+
+    const usage = JSON.parse(env.window.localStorage.getItem('cursor-remote-slash-usage') || '[]');
+    assert.equal(usage[0].k, 'commit', 'picked command recorded as most recent');
+
+    // The pick command must also carry the active filter (empty here).
+    assert.equal(pick.payload.slashQuery, '');
+  });
+
+  it('passes the active search filter along with the picked command', async () => {
+    env.document.getElementById('btn-slash')!.click();
+    resolveLastSlashMenu({ options: OPTIONS });
+    await new Promise(r => setTimeout(r, 0));
+
+    const box = env.document.getElementById('slash-search') as HTMLInputElement;
+    box.value = 'review';
+    box.dispatchEvent(new (env.window as any).Event('input', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 300));
+    resolveLastSlashMenu({ options: [OPTIONS[2], OPTIONS[3]] });
+    await new Promise(r => setTimeout(r, 0));
+
+    const row = env.document.getElementById('sheet-slash-list')!.querySelector('.sheet-item-slash') as HTMLButtonElement;
+    row.click();
+
+    const pick = env.mockSocket.sent.filter(s => s.event === 'command:click_slash_command').pop()!;
+    assert.equal(pick.payload.slashQuery, 'review', 'filter travels with the click');
+    assert.equal(pick.payload.slashId, 'review-bugbot');
+  });
+
+  it('clears the filter when the sheet is closed', async () => {
+    env.document.getElementById('btn-slash')!.click();
+    resolveLastSlashMenu({ options: OPTIONS });
+    await new Promise(r => setTimeout(r, 0));
+
+    const box = env.document.getElementById('slash-search') as HTMLInputElement;
+    box.value = 'review';
+    box.dispatchEvent(new (env.window as any).Event('input', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 300));
+
+    // Close by tapping the overlay.
+    env.document.getElementById('sheet-overlay')!.click();
+    // Reopen: must start from a clean slate.
+    env.document.getElementById('btn-slash')!.click();
+    const reopened = env.document.getElementById('slash-search') as HTMLInputElement;
+    assert.equal(reopened.value, '', 'search box cleared on reopen');
+
+    const last = env.mockSocket.sent.filter(s => s.event === 'command:get_slash_menu').pop()!;
+    assert.equal(last.payload.slashQuery, '', 'reopen queries the unfiltered list');
   });
 });
