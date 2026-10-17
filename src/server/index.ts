@@ -154,6 +154,14 @@ async function main(): Promise<void> {
     extractor.wake();
   });
 
+  // While any composer has an outstanding finish edge, keep home polling at
+  // full speed and poll non-home windows on the urgent cadence so "finished"
+  // / "needs you" are not stuck behind idle backoff or the 10s window cycle.
+  relay.setHoldFastHandler((hold) => {
+    extractor.setHoldFastPolling(hold);
+    windowMonitor.setUrgent(hold);
+  });
+
   // Self-heal: when the DOM has frozen for AGENT_STALL_MS while still claiming
   // work, quietly re-read Cursor once. If the agent really finished (or the
   // renderer unblocked), the next extraction resolves the mismatch on its own

@@ -53,7 +53,13 @@ export interface WindowSnapshot {
   activeComposerId: string;
 }
 
+/** Default cadence for non-home window CDP polls. */
 const CYCLE_INTERVAL_MS = 10000;
+/**
+ * Faster cadence while any agent finish edge is outstanding (or was recently
+ * working). Needs-you / finish on non-home windows otherwise wait a full 10s.
+ */
+const CYCLE_INTERVAL_URGENT_MS = 3000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -155,6 +161,8 @@ export class WindowMonitor extends EventEmitter {
   private _cycling = false;
   private _firstCycleLogged = false;
   private switchGeneration = -1;
+  /** When true, non-home windows are polled on the urgent interval. */
+  private urgent = false;
 
   get isCycling(): boolean {
     return this._cycling;
@@ -182,8 +190,8 @@ export class WindowMonitor extends EventEmitter {
   start(): void {
     this.stateManager.on('state:patch', this.onPatch);
     this.cdpBridge.on('connected', this.onConnected);
-
-    this.cycleTimer = setInterval(() => this.cycle(), CYCLE_INTERVAL_MS);
+    this.urgent = false;
+    this.armCycleTimer();
     console.log(`[window-monitor] Started (parallel mode, cycle every ${CYCLE_INTERVAL_MS / 1000}s)`);
   }
 
@@ -194,6 +202,27 @@ export class WindowMonitor extends EventEmitter {
       clearInterval(this.cycleTimer);
       this.cycleTimer = null;
     }
+    this.urgent = false;
+  }
+
+  /**
+   * Speed up non-home window polls while a finish / needs-you edge may be
+   * in flight. Wired from the relay's hold-fast signal.
+   */
+  setUrgent(urgent: boolean): void {
+    if (this.urgent === urgent) return;
+    this.urgent = urgent;
+    this.armCycleTimer();
+    if (urgent) this.forceCycle();
+  }
+
+  private armCycleTimer(): void {
+    if (this.cycleTimer) {
+      clearInterval(this.cycleTimer);
+      this.cycleTimer = null;
+    }
+    const ms = this.urgent ? CYCLE_INTERVAL_URGENT_MS : CYCLE_INTERVAL_MS;
+    this.cycleTimer = setInterval(() => this.cycle(), ms);
   }
 
   setHomeWindow(windowId: string): void {

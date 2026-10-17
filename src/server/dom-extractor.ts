@@ -2267,6 +2267,13 @@ export class DOMExtractor {
   private skipsSinceFullExtract = 0;
   /** Force the next poll to run a full extract (wake / refresh / reconnect). */
   private forceFullExtract = true;
+  /**
+   * While a finish edge is outstanding (was working / settle timer), never use
+   * the idle poll cadence — finish detection must not wait up to idlePollIntervalMs.
+   */
+  private holdFastPolling = false;
+  /** Last fingerprint `working` bit — used to force a full extract on working→idle. */
+  private lastFingerprintWorking: boolean | null = null;
 
   constructor(
     selectors: SelectorConfig,
@@ -2288,6 +2295,19 @@ export class DOMExtractor {
     this.onSkip = onSkip;
   }
 
+  /**
+   * Pin full-speed polling while the relay has an outstanding finish edge.
+   * Does not itself schedule a poll; the next tick uses baseInterval.
+   */
+  setHoldFastPolling(hold: boolean): void {
+    if (this.holdFastPolling === hold) return;
+    this.holdFastPolling = hold;
+    if (hold) {
+      this.currentPollIntervalMs = this.basePollIntervalMs;
+      this.pollPacing = createPollPacing();
+    }
+  }
+
   start(client: CdpClient, intervalMs: number, idleIntervalMs = intervalMs): void {
     this.client = client;
     this.stop();
@@ -2298,6 +2318,8 @@ export class DOMExtractor {
     this.pollPacing = createPollPacing();
     this.lastContentKey = '';
     this.failureStreak = 0;
+    this.holdFastPolling = false;
+    this.lastFingerprintWorking = null;
     const idleNote = idleIntervalMs > intervalMs
       ? `, idle ${idleIntervalMs}ms`
       : ' (idle backoff disabled)';
@@ -2315,6 +2337,8 @@ export class DOMExtractor {
     this.pollPacing = createPollPacing();
     this.lastContentKey = '';
     this.failureStreak = 0;
+    this.holdFastPolling = false;
+    this.lastFingerprintWorking = null;
   }
 
   /**
@@ -2423,6 +2447,7 @@ export class DOMExtractor {
       // Still force a full read periodically, on wake/refresh, and whenever the
       // fingerprint itself moves (streaming grows lastLen, etc.).
       let fingerprintWorking = false;
+      const idleCap = this.holdFastPolling ? this.basePollIntervalMs : this.idlePollIntervalMs;
       if (!this.forceFullExtract && this.lastFingerprintKey) {
         try {
           const fp = await this.client.callFunctionWithTimeout(
@@ -2433,14 +2458,18 @@ export class DOMExtractor {
 
           const fpMs = Date.now() - extractStarted;
           if (fp && typeof fp.key === 'string' && fp.key === this.lastFingerprintKey) {
+            fingerprintWorking = !!fp.working;
+            // working→idle must never skip: re-read so finish edges see the drop.
+            const workingWentIdle =
+              this.lastFingerprintWorking === true && !fingerprintWorking;
             this.skipsSinceFullExtract += 1;
-            if (this.skipsSinceFullExtract < FULL_EXTRACT_EVERY_N_SKIPS) {
-              fingerprintWorking = !!fp.working;
+            if (!workingWentIdle && this.skipsSinceFullExtract < FULL_EXTRACT_EVERY_N_SKIPS) {
+              this.lastFingerprintWorking = fingerprintWorking;
               this.currentPollIntervalMs = nextPollInterval(
                 this.pollPacing,
-                { unchanged: true, working: fingerprintWorking },
+                { unchanged: true, working: fingerprintWorking || this.holdFastPolling },
                 this.basePollIntervalMs,
-                this.idlePollIntervalMs
+                idleCap
               );
               this.onSkip?.();
               if (this.timing) {
@@ -2451,6 +2480,9 @@ export class DOMExtractor {
           } else if (fp && typeof fp.key === 'string') {
             this.lastFingerprintKey = fp.key;
             fingerprintWorking = !!fp.working;
+            if (this.lastFingerprintWorking === true && !fingerprintWorking) {
+              // Key moved because work stopped — full extract below.
+            }
           }
         } catch {
           // Fingerprint failed — fall through to a full extract.
@@ -2509,24 +2541,33 @@ export class DOMExtractor {
           extractionFingerprintFunction as (...args: never[]) => unknown,
           [containerSelectors],
           FINGERPRINT_TIMEOUT_MS
-        ) as { key?: string } | null;
+        ) as { key?: string; working?: boolean } | null;
         this.lastFingerprintKey = fp && typeof fp.key === 'string' ? fp.key : '';
+        if (fp && typeof fp.working === 'boolean') {
+          this.lastFingerprintWorking = fp.working;
+          fingerprintWorking = fp.working;
+        } else {
+          this.lastFingerprintWorking =
+            (derivedState ? claimsWork(derivedState) : false) || fingerprintWorking;
+        }
       } catch {
         this.lastFingerprintKey = '';
       }
 
       // Idle-aware pacing: only slow down once the content signature has been
       // stable for several quiet, non-working polls. Any change, or an agent
-      // that still claims work, keeps full-speed polling.
+      // that still claims work, keeps full-speed polling. Hold-fast (outstanding
+      // finish edge) disables the idle cadence entirely.
       if (derivedState) {
         const contentKey = pollContentKey(derivedState);
         const unchanged = contentKey === this.lastContentKey;
         this.lastContentKey = contentKey;
+        const busy = claimsWork(derivedState) || fingerprintWorking || this.holdFastPolling;
         this.currentPollIntervalMs = nextPollInterval(
           this.pollPacing,
-          { unchanged, working: claimsWork(derivedState) || fingerprintWorking },
+          { unchanged, working: busy },
           this.basePollIntervalMs,
-          this.idlePollIntervalMs
+          idleCap
         );
       } else {
         this.currentPollIntervalMs = this.basePollIntervalMs;

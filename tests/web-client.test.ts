@@ -233,11 +233,13 @@ describe('web: finished notification', () => {
     fireFullState(env.mockSocket, { ...fixture[1].state!, canAbort: true });
     assert.equal(notifications().length, 0, 'no notification while working');
     firePatch(env.mockSocket, { agentStatus: 'idle', canAbort: false, agentActivityLive: false, agentActivityText: null });
-    // Debounced: nothing until the settle window elapses.
+    // Strong idle settles in 1.5s — nothing before that.
     assert.equal(notifications().length, 0, 'no premature notification on idle');
-    await new Promise((r) => setTimeout(r, 5200));
+    await new Promise((r) => setTimeout(r, 800));
+    assert.equal(notifications().filter((n) => n.tag === 'cursor-finished').length, 0, 'still settling');
+    await new Promise((r) => setTimeout(r, 1000));
     const finished = notifications().filter((n) => n.tag === 'cursor-finished');
-    assert.equal(finished.length, 1, 'exactly one finished notification');
+    assert.equal(finished.length, 1, 'exactly one finished notification after strong settle');
   });
 
   it('does not notify a finish while waiting for approval', async () => {
@@ -257,7 +259,7 @@ describe('web: finished notification', () => {
     assert.ok(overlay().classList.contains('hidden'), 'no banner while working');
 
     firePatch(env.mockSocket, { agentStatus: 'idle', canAbort: false, agentActivityLive: false, agentActivityText: null });
-    await new Promise((r) => setTimeout(r, 5200));
+    await new Promise((r) => setTimeout(r, 1800));
 
     assert.ok(!overlay().classList.contains('hidden'), 'banner shown on genuine finish');
 
@@ -272,7 +274,7 @@ describe('web: finished notification', () => {
 
     fireFullState(env.mockSocket, { ...fixture[1].state!, canAbort: true });
     firePatch(env.mockSocket, { agentStatus: 'idle', canAbort: false, agentActivityLive: false, agentActivityText: null });
-    await new Promise((r) => setTimeout(r, 5200));
+    await new Promise((r) => setTimeout(r, 1800));
     assert.ok(!overlay().classList.contains('hidden'), 'banner shown on finish');
 
     firePatch(env.mockSocket, { agentStatus: 'thinking', canAbort: true, agentActivityLive: true });
@@ -304,7 +306,7 @@ describe('web: finished notification', () => {
     } as CursorState);
 
     firePatch(env.mockSocket, { agentStatus: 'idle', canAbort: false, agentActivityLive: false, agentActivityText: null });
-    await new Promise((r) => setTimeout(r, 5200));
+    await new Promise((r) => setTimeout(r, 1800));
 
     const what = env.document.getElementById('finished-what')!;
     const where = env.document.getElementById('finished-where')!;
@@ -347,7 +349,7 @@ describe('web: finished notification', () => {
     } as CursorState);
 
     firePatch(env.mockSocket, { agentStatus: 'idle', canAbort: false, agentActivityLive: false, agentActivityText: null });
-    await new Promise((r) => setTimeout(r, 5200));
+    await new Promise((r) => setTimeout(r, 1800));
 
     const where = env.document.getElementById('finished-where')!;
     assert.match(where.textContent!, /FactoryTycoonGame/, 'banner names the finished agent\'s folder');
@@ -391,7 +393,7 @@ describe('web: finished notification', () => {
       questionnaire: null,
       agentStatus: 'idle', canAbort: false, agentActivityLive: false, agentActivityText: null,
     });
-    await new Promise((r) => setTimeout(r, 5200));
+    await new Promise((r) => setTimeout(r, 1800));
     const finished = tones().slice();
     assert.ok(finished.length >= 1, 'finished chime played');
     assert.ok(finished.every((t) => t.type === 'sine'), 'finished uses the sine chime');
@@ -414,7 +416,7 @@ describe('web: finished notification', () => {
       activeComposerId: 'c-working',
     });
     env.mockSocket.fire('connection:status', { connected: false });
-    await new Promise((r) => setTimeout(r, 5200));
+    await new Promise((r) => setTimeout(r, 2000));
     assert.equal(
       notifications().filter((n) => n.tag === 'cursor-finished').length,
       0,
@@ -452,7 +454,7 @@ describe('web: finished notification', () => {
       ],
     } as CursorState);
 
-    await new Promise((r) => setTimeout(r, 5200));
+    await new Promise((r) => setTimeout(r, 2000));
     assert.equal(
       notifications().filter((n) => n.tag === 'cursor-finished').length,
       0,
@@ -1921,7 +1923,7 @@ describe('web: full history', () => {
     assert.equal(els[2].getAttribute('data-id'), 'a-tail');
   });
 
-  it('requests older pages and prepends them when hasMore is true', () => {
+  it('does not eager-backfill older pages when hasMore is true', () => {
     fireFullState(env.mockSocket, stateWith([assistant('a-tail', 'newest')], 'comp-1'));
     env.mockSocket.sent.length = 0;
 
@@ -1932,8 +1934,37 @@ describe('web: full history', () => {
       messages: [human('h80', 'page 2 start'), assistant('a-tail', 'newest')],
     });
 
+    const olderReqs = env.mockSocket.sent.filter(s => s.event === 'request:history');
+    assert.equal(olderReqs.length, 0, 'must not auto-fetch older pages on open');
+  });
+
+  it('requests older pages when scrolled near the top and prepends them', () => {
+    fireFullState(env.mockSocket, stateWith([assistant('a-tail', 'newest')], 'comp-1'));
+    fireHistory(env.mockSocket, {
+      composerId: 'comp-1',
+      oldestIndex: 80,
+      hasMore: true,
+      messages: [human('h80', 'page 2 start'), assistant('a-tail', 'newest')],
+    });
+    env.mockSocket.sent.length = 0;
+
+    const msgs = env.document.getElementById('messages')! as HTMLElement & {
+      scrollHeight: number; clientHeight: number; scrollTop: number;
+    };
+    // Make the transcript scrollable and put the viewport at the top.
+    Object.defineProperty(msgs, 'scrollHeight', { get: () => 4000, configurable: true });
+    Object.defineProperty(msgs, 'clientHeight', { get: () => 800, configurable: true });
+    let top = 0;
+    Object.defineProperty(msgs, 'scrollTop', {
+      get: () => top,
+      set: (v: number) => { top = Math.max(0, Math.min(Number(v), 4000 - 800)); },
+      configurable: true,
+    });
+    msgs.scrollTop = 0;
+    msgs.dispatchEvent(new (env.window as any).Event('scroll'));
+
     const olderReq = env.mockSocket.sent.filter(s => s.event === 'request:history').pop();
-    assert.ok(olderReq, 'should request the previous page');
+    assert.ok(olderReq, 'scroll-near-top should request the previous page');
     assert.equal(olderReq!.payload.composerId, 'comp-1');
     assert.equal(olderReq!.payload.limit, 80);
     assert.equal(olderReq!.payload.beforeIndex, 80);

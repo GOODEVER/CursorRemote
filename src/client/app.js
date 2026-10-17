@@ -105,15 +105,39 @@
   let userScrolledUp = false;
   let autoScrollJob = 0;
   let notificationPermission = 'default';
-  // Edge-triggered notification bookkeeping. We notify only when the agent
-  // newly asks a question / needs approval, or when it has genuinely finished.
-  let hadQuestionnaire = false;
-  let hadApproval = false;
-  let notificationsPrimed = false;
-  // Composer the edge state belongs to. Switching chats must re-prime rather
-  // than treat "previous agent was working, new one is idle" as a finish —
-  // that was the false ping when opening another folder.
-  let notifyComposerId = '';
+  // Edge-triggered notification bookkeeping, per composerId. Switching chats
+  // must not attribute agent A's "was working" to agent B (false finish ping).
+  // Keep settle constants in sync with src/server/finish-notify.ts.
+  const FINISH_SETTLE_WEAK_MS = 5000;
+  const FINISH_SETTLE_STRONG_MS = 1500;
+  /** @type {Map<string, { primed: boolean, wasWorking: boolean, hadQuestionnaire: boolean, hadApproval: boolean, finishTimer: any }>} */
+  const notifyEdges = new Map();
+  function notifyEdge(composerId) {
+    const id = composerId || '__none__';
+    let e = notifyEdges.get(id);
+    if (!e) {
+      e = {
+        primed: false,
+        wasWorking: false,
+        hadQuestionnaire: false,
+        hadApproval: false,
+        finishTimer: null,
+      };
+      notifyEdges.set(id, e);
+    }
+    return e;
+  }
+  function isStronglyIdleNotify(working, hasQuestionnaire, hasApproval) {
+    if (working || state.canAbort || state.agentActivityLive) return false;
+    if (hasQuestionnaire || hasApproval) return false;
+    if (state.agentStatus !== 'idle') return false;
+    return true;
+  }
+  function finishSettleMsFor(working, hasQuestionnaire, hasApproval) {
+    return isStronglyIdleNotify(working, hasQuestionnaire, hasApproval)
+      ? FINISH_SETTLE_STRONG_MS
+      : FINISH_SETTLE_WEAK_MS;
+  }
   // Auto-open bookkeeping: when the relay is pointed at Cursor's "Cursor Agents"
   // overview, no chat is mounted, so the transcript is empty until the user
   // taps an agent. We automatically open a chat (the relay's current one, or the
@@ -124,11 +148,6 @@
   let autoOpenDone = false;
   let autoOpenPending = false;
   let autoOpenTimer = null;
-  // "Finished" detection: the agent's status flaps between working and idle
-  // mid-run, so we track whether it was working and debounce the idle reading.
-  let wasWorking = false;
-  let finishTimer = null;
-  const FINISH_SETTLE_MS = 5000;
   let activePlanModal = null;
   let activePlanModelContext = null;
   // Questionnaire routing. `homeQuestionnaire` mirrors the home window's
@@ -251,6 +270,11 @@
   function isNearMessagesBottom() {
     const threshold = 80;
     return $messages.scrollTop + $messages.clientHeight >= $messages.scrollHeight - threshold;
+  }
+
+  /** True when the user has scrolled near the top — trigger for older history pages. */
+  function isNearMessagesTop() {
+    return $messages.scrollTop <= 120;
   }
 
   // Scroll the transcript to the bottom, and keep it there while content grows.
@@ -517,6 +541,10 @@
       && oldestIndex < fullHistory.oldestIndex) {
       const seen = new Set(fullHistory.messages.map((m) => m && m.id).filter(Boolean));
       const older = payload.messages.filter((m) => m && m.id && !seen.has(m.id));
+      // Preserve viewport: prepending grows scrollHeight upward; keep the same
+      // messages under the user's eyes instead of jumping to the new top.
+      const prevHeight = $messages.scrollHeight;
+      const prevTop = $messages.scrollTop;
       fullHistory = {
         composerId: targetId,
         messages: older.concat(fullHistory.messages),
@@ -524,11 +552,15 @@
         hasMore,
       };
       renderAll();
-      maybeRequestOlderHistory();
+      const delta = $messages.scrollHeight - prevHeight;
+      if (delta > 0) $messages.scrollTop = prevTop + delta;
+      // Still near the top with more pages? Fetch the next older page once.
+      if (hasMore && isNearMessagesTop()) maybeRequestOlderHistory();
       return;
     }
 
-    // Newest page (or first load): replace.
+    // Newest page (or first load): replace. Do NOT auto-backfill older pages —
+    // those load when the user scrolls toward the top.
     fullHistory = {
       composerId: targetId,
       messages: payload.messages,
@@ -540,7 +572,6 @@
     // newest message rather than wherever the previous chat was scrolled.
     resetScrollForNewTranscript();
     renderAll();
-    maybeRequestOlderHistory();
   });
 
   // Per-window snapshots from the relay's window monitor. A question raised in
@@ -609,8 +640,11 @@
   // near the bottom. Programmatic auto-scrolls also emit scroll events, so we
   // must NOT bump the job counter here — doing so cancelled our own async
   // re-pins and stranded the view part-way up a freshly grown transcript.
+  // Near the top with hasMore: request the previous history page (no eager
+  // backfill of the whole chat on open).
   $messages.addEventListener('scroll', () => {
     userScrolledUp = !isNearMessagesBottom();
+    if (userScrolledUp && isNearMessagesTop()) maybeRequestOlderHistory();
   });
 
   // Returning to the tab: rAF was suspended while hidden, so re-pin to the
@@ -899,11 +933,11 @@
     pendingHistoryComposerId = composerId;
     lastRequestedHistoryComposerId = composerId;
     historyPageInFlight = true;
-    // Newest page first — older pages follow via maybeRequestOlderHistory().
+    // Newest page only — older pages load when the user scrolls near the top.
     socket.emit('request:history', { composerId, limit: HISTORY_PAGE_LIMIT });
   }
 
-  /** Background-fetch older history pages until the server reports hasMore=false. */
+  /** Fetch the previous history page (one at a time). Triggered by scroll-near-top. */
   function maybeRequestOlderHistory() {
     if (historyPageInFlight) return;
     if (!fullHistory.composerId || !fullHistory.hasMore) return;
@@ -2692,20 +2726,13 @@
   }
 
   /**
-   * Edge-triggered notifications. Fires only when:
-   *   - the agent NEWLY asks a question / needs approval, or
-   *   - the agent has genuinely finished (was working, then stayed idle —
-   *     status alone flaps mid-run, so we key off the ground-truth working
-   *     signal and require the idle reading to settle).
-   * Regular messages never trigger a notification (the old behaviour fired
-   * one for every tool/command message, which bombarded the user).
+   * Edge-triggered notifications, per composer. Fires only when that composer
+   * NEWLY asks a question / needs approval, or genuinely finishes (was working,
+   * then stayed idle). Strong idle (clean idle + no abort/activity/Q/A) settles
+   * in 1.5s; softer idle cues keep the 5s debounce.
    *
-   * Two false-positive guards:
-   *   - A transport drop (`connected: false`) must not look like a finish —
-   *     `isAgentWorking()` is false while disconnected, which used to schedule
-   *     a chime ~5s after locking the phone even when nothing had finished.
-   *   - Switching the active composer (folder navigation) re-primes so the
-   *     previous chat's "was working" bit is not attributed to the new idle one.
+   * Disconnect cancels settle timers without clearing wasWorking. Switching
+   * composers uses a separate edge record so idle B never inherits A's work bit.
    */
   function maybeNotifyTransitions() {
     const hasQuestionnaire = !!(state.questionnaire && state.questionnaire.questions
@@ -2713,47 +2740,32 @@
     const hasApproval = (state.pendingApprovals || []).length > 0;
     const working = isAgentWorking();
     const composerId = state.activeComposerId || '';
-
-    // First render after load: adopt the current state without notifying.
-    if (!notificationsPrimed) {
-      notificationsPrimed = true;
-      notifyComposerId = composerId;
-      wasWorking = working;
-      hadQuestionnaire = hasQuestionnaire;
-      hadApproval = hasApproval;
-      return;
-    }
-
-    // Composer switched (folder/agent open): adopt the new agent's signals.
-    // Without this, opening an idle chat after watching a working one looks
-    // like "working → idle" and pings "Agent finished" for the wrong chat.
-    if (composerId !== notifyComposerId) {
-      if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
-      notifyComposerId = composerId;
-      wasWorking = working;
-      hadQuestionnaire = hasQuestionnaire;
-      hadApproval = hasApproval;
-      return;
-    }
+    const edge = notifyEdge(composerId);
 
     // Socket/CDP drop: never treat "not connected" as the agent finishing.
-    // Cancel any settle timer started from a flaky reading; keep wasWorking so
-    // a genuine finish that happened while we were offline is still announced
-    // once we reconnect and see a settled idle state for the SAME composer.
     if (!state.connected) {
-      if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
+      for (const e of notifyEdges.values()) {
+        if (e.finishTimer) { clearTimeout(e.finishTimer); e.finishTimer = null; }
+      }
       return;
     }
 
-    if (hasQuestionnaire && !hadQuestionnaire) {
+    if (!edge.primed) {
+      edge.primed = true;
+      edge.wasWorking = working;
+      edge.hadQuestionnaire = hasQuestionnaire;
+      edge.hadApproval = hasApproval;
+      return;
+    }
+
+    if (hasQuestionnaire && !edge.hadQuestionnaire) {
       hideFinishedBanner();
       showQuestionAlert();
       playAlertChime();
       fireNotification('Agent has a question for you', 'cursor-questionnaire');
-    } else if (!hasQuestionnaire && hadQuestionnaire) {
-      // Question answered/skipped: drop the alert (leave a real finish banner alone).
+    } else if (!hasQuestionnaire && edge.hadQuestionnaire) {
       hideQuestionAlert();
-    } else if (hasApproval && !hadApproval) {
+    } else if (hasApproval && !edge.hadApproval) {
       hideFinishedBanner();
       playAlertChime();
       const approval = state.pendingApprovals[0];
@@ -2761,46 +2773,45 @@
     }
 
     if (working) {
-      // Agent picked work back up (or is still going): cancel any pending
-      // "finished" notification and remember we were working.
       hideFinishedBanner();
-      wasWorking = true;
-      if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
-    } else if (wasWorking && !finishTimer) {
-      // Idle after having worked — debounce so transient gaps (idle between
-      // tool steps) don't fire a premature "finished" notification.
+      edge.wasWorking = true;
+      if (edge.finishTimer) { clearTimeout(edge.finishTimer); edge.finishTimer = null; }
+    } else if (edge.wasWorking && !edge.finishTimer) {
       const finishForComposer = composerId;
-      finishTimer = setTimeout(() => {
-        finishTimer = null;
-        // Composer changed or we lost the link while settling — abort.
+      const settleMs = finishSettleMsFor(working, hasQuestionnaire, hasApproval);
+      edge.finishTimer = setTimeout(() => {
+        edge.finishTimer = null;
         if (!state.connected) return;
-        if ((state.activeComposerId || '') !== finishForComposer) {
-          wasWorking = isAgentWorking();
-          return;
-        }
-        const nowWorking = isAgentWorking();
-        if (nowWorking) { wasWorking = true; return; }
-        // Only announce a true finish — not a state the agent is blocked on
-        // (waiting for approval, erroring, or asking a question).
+        // Re-check against this composer's current home reading when still active;
+        // if the user switched away, still allow finish if home is no longer that
+        // composer and we are not working (composer-scoped wasWorking).
+        const nowWorking = (state.activeComposerId || '') === finishForComposer
+          ? isAgentWorking()
+          : false;
+        if (nowWorking) { edge.wasWorking = true; return; }
         const blocked = state.agentStatus === 'waiting_approval'
           || state.agentStatus === 'error'
           || !!(state.questionnaire && state.questionnaire.questions
                 && state.questionnaire.questions.length > 0);
-        wasWorking = false;
-        if (blocked) return;
+        // Only treat blocked as blocking when we are still viewing this composer.
+        if (blocked && (state.activeComposerId || '') === finishForComposer) {
+          edge.wasWorking = false;
+          return;
+        }
+        edge.wasWorking = false;
         playChime();
-        const finCtx = finishedContext();
+        const finCtx = finishedContextFor(finishForComposer);
         fireNotification(
           'Agent finished' + (finCtx.what ? ': ' + finCtx.what : '')
             + (finCtx.where ? ' (' + finCtx.where + ')' : ''),
           'cursor-finished'
         );
         showFinishedBanner();
-      }, FINISH_SETTLE_MS);
+      }, settleMs);
     }
 
-    hadQuestionnaire = hasQuestionnaire;
-    hadApproval = hasApproval;
+    edge.hadQuestionnaire = hasQuestionnaire;
+    edge.hadApproval = hasApproval;
   }
 
   /** Ground-truth view of whether the agent is actively working right now. */
@@ -2829,25 +2840,32 @@
    * each other so the banner always names something, and either may be '' when
    * nothing is known.
    */
-  function finishedContext() {
+  function finishedContextFor(composerIdPrefer) {
+    return finishedContext(composerIdPrefer);
+  }
+
+  function finishedContext(composerIdPrefer) {
     const windows = state.windows || [];
     const activeWin = windows.find((w) => w.id === state.activeWindowId);
     const winTitle = (activeWin && activeWin.title) || '';
 
     const tabs = state.chatTabs || [];
-    const activeTab = tabs.find((t) => t.isActive)
+    const prefer = composerIdPrefer || state.activeComposerId || '';
+    const activeTab = (prefer && tabs.find((t) => t.composerId && t.composerId === prefer))
+      || tabs.find((t) => t.isActive)
       || tabs.find((t) => t.composerId && t.composerId === state.activeComposerId);
 
     const folders = state.folders || [];
     const currentFolder = folders.find((f) => f.isCurrent);
 
-    // Which agent most likely just finished: the active tab's composer, then the
-    // relay's active composer. Resolve its FOLDER by scanning every folder's
-    // agents — when the relay is homed on the "Cursor Agents" overview window,
-    // Cursor marks no folder `isCurrent` (its title is the generic "Cursor
-    // Agents"), so relying on isCurrent alone would leave the banner unable to
-    // name the folder that finished.
-    const targetComposerId = (activeTab && activeTab.composerId) || state.activeComposerId || '';
+    // Which agent most likely just finished: preferred composer (the one that
+    // actually went idle), then active tab / relay active. Resolve its FOLDER
+    // by scanning every folder's agents — when the relay is homed on the
+    // "Cursor Agents" overview, no folder is `isCurrent`.
+    const targetComposerId = prefer
+      || (activeTab && activeTab.composerId)
+      || state.activeComposerId
+      || '';
     let ownerFolder = null;
     let ownerAgent = null;
     if (targetComposerId) {

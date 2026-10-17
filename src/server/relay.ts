@@ -24,6 +24,7 @@ import {
   parseSessionCookie,
   type WebappSessionStore,
 } from './webapp-sessions.js';
+import { finishSettleMs, type FinishIdleSignals } from './finish-notify.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -149,16 +150,22 @@ export class Relay {
     questionText: string;
     approvalDesc: string;
     title: string;
+    composerId: string;
+    canAbort: boolean;
+    agentActivityLive: boolean;
+    agentStatus: string;
   }>();
-  /** Edge bookkeeping for push transitions (mirrors the client's logic). */
-  private pushHadQuestionnaire = false;
-  private pushHadApproval = false;
-  private pushWasWorking = false;
-  private pushFinishTimer: ReturnType<typeof setTimeout> | null = null;
-  private pushPrimed = false;
-  /** Composer the push edge-state belongs to — switch re-primes (see evaluatePushTransition). */
-  private pushComposerId = '';
-  private static readonly PUSH_FINISH_SETTLE_MS = 5000;
+  /**
+   * Per-composer push edge state. Avoids attributing agent A's "was working"
+   * to agent B when the user switches folders mid-run.
+   */
+  private pushEdges = new Map<string, {
+    primed: boolean;
+    wasWorking: boolean;
+    hadQuestionnaire: boolean;
+    hadApproval: boolean;
+    finishTimer: ReturnType<typeof setTimeout> | null;
+  }>();
   /**
    * How long a push may sit in the delivery queue. The web-push library
    * defaults to four weeks, which is why locking the phone and unlocking
@@ -190,6 +197,8 @@ export class Relay {
    * was idle shows up immediately instead of waiting out the slow idle interval.
    */
   private wakeHandler: (() => void) | null = null;
+  /** Hold extractor + window monitor on a fast cadence during finish edges. */
+  private holdFastHandler: ((hold: boolean) => void) | null = null;
   private timing: import('./poll-timing.js').PollTiming | null = null;
 
   /** Max-Age for session cookie (30 days), aligned with typical “stay signed in” expectation. */
@@ -331,6 +340,14 @@ export class Relay {
     this.wakeHandler = handler;
   }
 
+  /**
+   * Hold full-speed home polling (and urgent window-monitor cycles) while any
+   * composer has an outstanding finish edge.
+   */
+  setHoldFastHandler(handler: ((hold: boolean) => void) | null): void {
+    this.holdFastHandler = handler;
+  }
+
   /** Wire the window monitor so the web client can be fed the state of the
    *  window it is viewing, not just the relay's CDP home window. */
   setWindowMonitor(windowMonitor: WindowMonitor): void {
@@ -357,21 +374,32 @@ export class Relay {
     // transition evaluator sees questions/approvals raised anywhere.
     const hasQ = !!(snapshot.questionnaire && snapshot.questionnaire.questions?.length);
     const hasA = (snapshot.pendingApprovals?.length ?? 0) > 0;
+    const working = snapshot.canAbort || snapshot.agentActivityLive
+      || (snapshot.agentStatus !== 'idle'
+        && snapshot.agentStatus !== 'waiting_approval'
+        && snapshot.agentStatus !== 'error');
+    const prev = this.pushWindowSignals.get(windowId);
     const sig = {
       questionnaire: hasQ,
       approval: hasA,
-      working: snapshot.canAbort || snapshot.agentActivityLive
-        || (snapshot.agentStatus !== 'idle'
-          && snapshot.agentStatus !== 'waiting_approval'
-          && snapshot.agentStatus !== 'error'),
+      working,
       questionText: hasQ
         ? ((snapshot.questionnaire!.questions[snapshot.questionnaire!.activeIndex]
             ?? snapshot.questionnaire!.questions[0])?.text || '').slice(0, 160)
         : '',
       approvalDesc: hasA ? (snapshot.pendingApprovals[0]?.description || '') : '',
       title: snapshot.windowTitle,
+      composerId: snapshot.activeComposerId || '',
+      canAbort: !!snapshot.canAbort,
+      agentActivityLive: !!snapshot.agentActivityLive,
+      agentStatus: snapshot.agentStatus || 'idle',
     };
     this.pushWindowSignals.set(windowId, sig);
+    // Needs-you rising on a non-home window: cycle again soon so follow-up
+    // state (continue enabled, etc.) is not stuck behind the slow interval.
+    if ((hasQ && !prev?.questionnaire) || (hasA && !prev?.approval)) {
+      this.windowMonitor?.forceCycle();
+    }
 
     // Forward non-home window state to web clients so a question/approval
     // raised in a window other than the relay's CDP home window is still
@@ -1306,133 +1334,215 @@ export class Relay {
     return (active?.text || '').slice(0, 160);
   }
 
-  /** Merge the home window's live state with other windows' latest signals. */
-  private aggregatePushSignals(): {
-    hasQ: boolean; hasA: boolean; working: boolean;
-    questionText: string; approvalDesc: string;
+  private pushEdge(composerId: string): {
+    primed: boolean;
+    wasWorking: boolean;
+    hadQuestionnaire: boolean;
+    hadApproval: boolean;
+    finishTimer: ReturnType<typeof setTimeout> | null;
   } {
-    const state = this.stateManager.getCurrentState();
-    const homeId = this.windowMonitor?.getHomeWindowId() ?? state.activeWindowId;
-    const homeQ = !!(state.questionnaire && state.questionnaire.questions?.length);
-    const homeA = (state.pendingApprovals?.length ?? 0) > 0;
-    let hasQ = homeQ;
-    let hasA = homeA;
-    let working = this.isWorkingState(state);
-    let questionText = homeQ ? this.questionText(state.questionnaire) : '';
-    let approvalDesc = homeA ? (state.pendingApprovals[0]?.description || '') : '';
-    for (const [wid, sig] of this.pushWindowSignals) {
-      if (wid === homeId) continue;
-      hasQ = hasQ || sig.questionnaire;
-      hasA = hasA || sig.approval;
-      working = working || sig.working;
-      if (!questionText && sig.questionnaire) questionText = sig.questionText;
-      if (!approvalDesc && sig.approval) approvalDesc = sig.approvalDesc;
+    const id = composerId || '__none__';
+    let edge = this.pushEdges.get(id);
+    if (!edge) {
+      edge = {
+        primed: false,
+        wasWorking: false,
+        hadQuestionnaire: false,
+        hadApproval: false,
+        finishTimer: null,
+      };
+      this.pushEdges.set(id, edge);
     }
-    return { hasQ, hasA, working, questionText, approvalDesc };
+    return edge;
+  }
+
+  private syncHoldFast(): void {
+    let hold = false;
+    for (const e of this.pushEdges.values()) {
+      if (e.wasWorking || e.finishTimer) {
+        hold = true;
+        break;
+      }
+    }
+    this.holdFastHandler?.(hold);
   }
 
   /**
-   * Edge-triggered web push. Mirrors the client's notification logic: push only
-   * when the agent NEWLY asks a question / needs approval, or when it has
-   * genuinely finished (working -> idle, debounced so mid-run gaps don't fire).
-   *
-   * Guards against two false positives the phone was seeing:
-   *   - CDP/home disconnect looks idle (`isWorkingState` is false) — must not
-   *     schedule a finish alert; cancel any in-flight settle timer instead.
-   *   - Switching the home composer (folder navigation) re-primes so the
-   *     previous agent's "was working" bit is not attributed to the new one.
+   * Build per-composer signal snapshots from the home state plus every window
+   * monitor reading. Working/Q/A for the same composerId are OR'd.
+   */
+  private collectComposerPushSignals(): Map<string, {
+    working: boolean;
+    hasQ: boolean;
+    hasA: boolean;
+    questionText: string;
+    approvalDesc: string;
+    canAbort: boolean;
+    agentActivityLive: boolean;
+    agentStatus: string;
+  }> {
+    const out = new Map<string, {
+      working: boolean;
+      hasQ: boolean;
+      hasA: boolean;
+      questionText: string;
+      approvalDesc: string;
+      canAbort: boolean;
+      agentActivityLive: boolean;
+      agentStatus: string;
+    }>();
+    const merge = (
+      composerId: string,
+      patch: {
+        working: boolean;
+        hasQ: boolean;
+        hasA: boolean;
+        questionText: string;
+        approvalDesc: string;
+        canAbort: boolean;
+        agentActivityLive: boolean;
+        agentStatus: string;
+      }
+    ) => {
+      const id = composerId || '__none__';
+      const prev = out.get(id);
+      if (!prev) {
+        out.set(id, { ...patch });
+        return;
+      }
+      prev.working = prev.working || patch.working;
+      prev.hasQ = prev.hasQ || patch.hasQ;
+      prev.hasA = prev.hasA || patch.hasA;
+      prev.canAbort = prev.canAbort || patch.canAbort;
+      prev.agentActivityLive = prev.agentActivityLive || patch.agentActivityLive;
+      if (patch.agentStatus === 'idle' && prev.agentStatus !== 'idle') {
+        /* keep busier status */
+      } else if (patch.agentStatus !== 'idle') {
+        prev.agentStatus = patch.agentStatus;
+      }
+      if (!prev.questionText && patch.questionText) prev.questionText = patch.questionText;
+      if (!prev.approvalDesc && patch.approvalDesc) prev.approvalDesc = patch.approvalDesc;
+    };
+
+    const state = this.stateManager.getCurrentState();
+    const homeQ = !!(state.questionnaire && state.questionnaire.questions?.length);
+    const homeA = (state.pendingApprovals?.length ?? 0) > 0;
+    merge(state.activeComposerId || '', {
+      working: this.isWorkingState(state),
+      hasQ: homeQ,
+      hasA: homeA,
+      questionText: homeQ ? this.questionText(state.questionnaire) : '',
+      approvalDesc: homeA ? (state.pendingApprovals[0]?.description || '') : '',
+      canAbort: !!state.canAbort,
+      agentActivityLive: !!state.agentActivityLive,
+      agentStatus: state.agentStatus || 'idle',
+    });
+
+    const homeWin = this.windowMonitor?.getHomeWindowId() ?? state.activeWindowId;
+    for (const [wid, sig] of this.pushWindowSignals) {
+      if (wid === homeWin && sig.composerId === (state.activeComposerId || '')) continue;
+      merge(sig.composerId || `__win:${wid}`, {
+        working: sig.working,
+        hasQ: sig.questionnaire,
+        hasA: sig.approval,
+        questionText: sig.questionText,
+        approvalDesc: sig.approvalDesc,
+        canAbort: sig.canAbort,
+        agentActivityLive: sig.agentActivityLive,
+        agentStatus: sig.agentStatus,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Edge-triggered web push, per composer. Push only when that composer NEWLY
+   * asks a question / needs approval, or when it genuinely finishes (working →
+   * idle, debounced). Disconnect cancels settle timers without clearing
+   * wasWorking so a real finish is still announced after reconnect.
    */
   private evaluatePushTransition(): void {
     if (!this.webPush.enabled) return;
     const state = this.stateManager.getCurrentState();
-    const composerId = state.activeComposerId || '';
-    const { hasQ, hasA, working, questionText, approvalDesc } = this.aggregatePushSignals();
 
-    if (!this.pushPrimed) {
-      this.pushPrimed = true;
-      this.pushComposerId = composerId;
-      this.pushHadQuestionnaire = hasQ;
-      this.pushHadApproval = hasA;
-      this.pushWasWorking = working;
-      return;
-    }
-
-    if (composerId !== this.pushComposerId) {
-      if (this.pushFinishTimer) {
-        clearTimeout(this.pushFinishTimer);
-        this.pushFinishTimer = null;
-      }
-      this.pushComposerId = composerId;
-      this.pushHadQuestionnaire = hasQ;
-      this.pushHadApproval = hasA;
-      this.pushWasWorking = working;
-      return;
-    }
-
-    // Home CDP drop: don't treat "not connected" as a finish. Keep the
-    // was-working bit so a real finish that landed while CDP was down is still
-    // announced once we reconnect to a settled idle state for this composer.
     if (!state.connected) {
-      if (this.pushFinishTimer) {
-        clearTimeout(this.pushFinishTimer);
-        this.pushFinishTimer = null;
+      for (const e of this.pushEdges.values()) {
+        if (e.finishTimer) {
+          clearTimeout(e.finishTimer);
+          e.finishTimer = null;
+        }
       }
+      this.syncHoldFast();
       return;
     }
 
-    if (hasQ && !this.pushHadQuestionnaire) {
-      void this.push(
-        'Agent has a question',
-        questionText || 'The agent is asking you something.',
-        'cursor-questionnaire',
-        Relay.PUSH_VIBRATE_NEEDS_YOU,
-        Relay.PUSH_TTL_NEEDS_YOU_SEC
-      );
-    } else if (hasA && !this.pushHadApproval) {
-      void this.push(
-        'Agent needs approval',
-        approvalDesc || 'The agent is waiting for your approval.',
-        'cursor-approval',
-        Relay.PUSH_VIBRATE_NEEDS_YOU,
-        Relay.PUSH_TTL_NEEDS_YOU_SEC
-      );
-    }
-
-    if (working) {
-      this.pushWasWorking = true;
-      if (this.pushFinishTimer) {
-        clearTimeout(this.pushFinishTimer);
-        this.pushFinishTimer = null;
+    const byComposer = this.collectComposerPushSignals();
+    for (const [composerId, sig] of byComposer) {
+      const edge = this.pushEdge(composerId);
+      if (!edge.primed) {
+        edge.primed = true;
+        edge.wasWorking = sig.working;
+        edge.hadQuestionnaire = sig.hasQ;
+        edge.hadApproval = sig.hasA;
+        continue;
       }
-    } else if (this.pushWasWorking) {
-      this.scheduleFinishCheck();
-    }
 
-    this.pushHadQuestionnaire = hasQ;
-    this.pushHadApproval = hasA;
+      if (sig.hasQ && !edge.hadQuestionnaire) {
+        void this.push(
+          'Agent has a question',
+          sig.questionText || 'The agent is asking you something.',
+          'cursor-questionnaire',
+          Relay.PUSH_VIBRATE_NEEDS_YOU,
+          Relay.PUSH_TTL_NEEDS_YOU_SEC
+        );
+      } else if (sig.hasA && !edge.hadApproval) {
+        void this.push(
+          'Agent needs approval',
+          sig.approvalDesc || 'The agent is waiting for your approval.',
+          'cursor-approval',
+          Relay.PUSH_VIBRATE_NEEDS_YOU,
+          Relay.PUSH_TTL_NEEDS_YOU_SEC
+        );
+      }
+
+      if (sig.working) {
+        edge.wasWorking = true;
+        if (edge.finishTimer) {
+          clearTimeout(edge.finishTimer);
+          edge.finishTimer = null;
+        }
+      } else if (edge.wasWorking) {
+        this.scheduleFinishCheck(composerId, {
+          working: sig.working,
+          canAbort: sig.canAbort,
+          agentActivityLive: sig.agentActivityLive,
+          agentStatus: sig.agentStatus,
+          hasQuestionnaire: sig.hasQ,
+          hasApproval: sig.hasA,
+        });
+      }
+
+      edge.hadQuestionnaire = sig.hasQ;
+      edge.hadApproval = sig.hasA;
+    }
+    this.syncHoldFast();
   }
 
   /**
-   * Name the agent/chat that most likely just finished, for the background push
-   * body. Prefers the home window's active chat tab, then the active agent of
-   * the finished agent's workspace folder, then the window title (ignoring the
-   * generic "Cursor Agents" overview), and appends the workspace it ran in.
-   * Returns '' when nothing is known, so the caller keeps its generic wording.
+   * Name the agent/chat that finished, keyed by the composer that actually
+   * went idle (not whatever is currently active on the home window).
    */
-  private finishedPushLabel(): string {
+  private finishedPushLabel(composerId: string): string {
     const state = this.stateManager.getCurrentState();
     const tabs = state.chatTabs ?? [];
-    const activeTab = tabs.find((t) => t.isActive)
-      || tabs.find((t) => t.composerId && t.composerId === state.activeComposerId);
+    const activeTab = tabs.find((t) => t.composerId && t.composerId === composerId)
+      || tabs.find((t) => t.isActive);
 
     const folders = state.folders ?? [];
-    // Identify the folder by the finished agent's composer id rather than
-    // `isCurrent`: when the relay is homed on the "Cursor Agents" overview no
-    // folder is marked current, so the push would otherwise omit the folder.
-    const targetComposerId = (activeTab && activeTab.composerId) || state.activeComposerId || '';
+    const targetComposerId = composerId || (activeTab && activeTab.composerId) || state.activeComposerId || '';
     let owner: CursorState['folders'][number] | undefined;
     let ownerAgent: FolderAgent | undefined;
-    if (targetComposerId) {
+    if (targetComposerId && targetComposerId !== '__none__') {
       for (const f of folders) {
         const a = (f.agents ?? []).find((x) => x.composerId && x.composerId === targetComposerId);
         if (a) { owner = f; ownerAgent = a; break; }
@@ -1441,8 +1551,17 @@ export class Relay {
     if (!owner) owner = folders.find((f) => f.isCurrent);
     const folderAgent = ownerAgent || (owner ? (owner.agents ?? []).find((a) => a.isActive) : undefined);
 
-    const win = (state.windows ?? []).find((w) => w.id === state.activeWindowId);
-    const winTitle = win && win.title && !/^cursor\s*agents$/i.test(win.title) ? win.title : '';
+    let winTitle = '';
+    for (const sig of this.pushWindowSignals.values()) {
+      if (sig.composerId === composerId && sig.title && !/^cursor\s*agents$/i.test(sig.title)) {
+        winTitle = sig.title;
+        break;
+      }
+    }
+    if (!winTitle) {
+      const win = (state.windows ?? []).find((w) => w.id === state.activeWindowId);
+      winTitle = win && win.title && !/^cursor\s*agents$/i.test(win.title) ? win.title : '';
+    }
 
     const what = (activeTab && activeTab.title) || (folderAgent && folderAgent.title) || winTitle
       || (owner && owner.name) || '';
@@ -1451,29 +1570,33 @@ export class Relay {
     return where && where !== what ? `${what} in ${where}` : what;
   }
 
-  private scheduleFinishCheck(): void {
-    if (this.pushFinishTimer) return;
-    const finishForComposer = this.pushComposerId;
-    this.pushFinishTimer = setTimeout(() => {
-      this.pushFinishTimer = null;
+  private scheduleFinishCheck(composerId: string, idle: FinishIdleSignals): void {
+    const edge = this.pushEdge(composerId);
+    if (edge.finishTimer) return;
+    const settleMs = finishSettleMs(idle);
+    edge.finishTimer = setTimeout(() => {
+      edge.finishTimer = null;
       const state = this.stateManager.getCurrentState();
-      if (!state.connected) return;
-      if ((state.activeComposerId || '') !== finishForComposer) {
-        this.pushWasWorking = this.aggregatePushSignals().working;
+      if (!state.connected) {
+        this.syncHoldFast();
         return;
       }
-      const { hasQ, hasA, working } = this.aggregatePushSignals();
+      const latest = this.collectComposerPushSignals().get(composerId || '__none__');
+      const working = latest?.working ?? false;
+      const hasQ = latest?.hasQ ?? false;
+      const hasA = latest?.hasA ?? false;
       if (working) {
-        this.pushWasWorking = true;
+        edge.wasWorking = true;
+        this.syncHoldFast();
         return;
       }
-      // Blocked on a question/approval is not a "finished" state.
       if (hasQ || hasA) {
-        this.pushWasWorking = false;
+        edge.wasWorking = false;
+        this.syncHoldFast();
         return;
       }
-      this.pushWasWorking = false;
-      const label = this.finishedPushLabel();
+      edge.wasWorking = false;
+      const label = this.finishedPushLabel(composerId);
       void this.push(
         'Agent finished',
         label ? `${label} finished.` : 'The agent has finished working.',
@@ -1481,7 +1604,9 @@ export class Relay {
         Relay.PUSH_VIBRATE_FINISHED,
         Relay.PUSH_TTL_FINISHED_SEC
       );
-    }, Relay.PUSH_FINISH_SETTLE_MS);
+      this.syncHoldFast();
+    }, settleMs);
+    this.syncHoldFast();
   }
 
   private async push(
