@@ -3,6 +3,9 @@ import type { CursorState, CursorWindow } from './types.js';
 import { AGENT_ACTIVITY_STALE_MS } from './activity-stale.js';
 import { detectStall, type StallTracker } from './stall-detector.js';
 import { SignatureCache } from './signature-cache.js';
+import { applyMessageDelta, computeMessagePatch } from './message-delta.js';
+import type { PollTiming } from './poll-timing.js';
+import type { MessageDelta } from './types.js';
 
 function emptyState(): CursorState {
   return {
@@ -57,18 +60,38 @@ export class StateManager extends EventEmitter {
   /** Memoizes serialized state values so the diff never re-serializes the same
    *  transcript/sub-object twice (see SignatureCache). */
   private signatures = new SignatureCache();
+  /** Optional rolling timers for the extract → diff → emit path. */
+  private timing: PollTiming | null = null;
 
   get generation(): number {
     return this._generation;
   }
 
-  constructor(debounceMs: number) {
+  constructor(debounceMs: number, timing?: PollTiming | null) {
     super();
     this.debounceMs = debounceMs;
+    this.timing = timing ?? null;
   }
 
   getCurrentState(): CursorState {
     return this.currentState;
+  }
+
+  /**
+   * Record a successful poll that did not need a full re-extract (fingerprint
+   * matched). Refreshes extractor health locally without emitting a patch —
+   * clients do not need `lastExtractionAt` every 300ms.
+   */
+  touchSuccessfulExtraction(): void {
+    this.consecutiveNulls = 0;
+    const connected = this.currentState.connected;
+    this.currentState = {
+      ...this.currentState,
+      extractorStatus: connected ? 'ok' : 'idle',
+      lastExtractionAt: Date.now(),
+      consecutiveExtractionFailures: 0,
+      lastExtractionError: null,
+    };
   }
 
   /**
@@ -114,9 +137,15 @@ export class StateManager extends EventEmitter {
       agentStalledSince: this.stallTracker.stalled ? this.stallTracker.changedAt : null,
     };
 
+    const diffStarted = this.timing ? Date.now() : 0;
     const patch = this.diff(this.currentState, stalledState);
+    if (this.timing) {
+      this.timing.record({ diffMs: Date.now() - diffStarted });
+    }
     if (!patch) return;
 
+    // Canonical state always holds the full transcript; messageDelta is
+    // wire-only (added in diff) and is never copied onto currentState.
     this.currentState = stalledState;
     this.schedulePatch(patch);
   }
@@ -374,8 +403,18 @@ export class StateManager extends EventEmitter {
     }
 
     if (this.signatures.differs(prev.messages, next.messages)) {
-      patch.messages = next.messages;
-      hasChange = true;
+      const msgPatch = computeMessagePatch(
+        prev.messages,
+        next.messages,
+        (a, b) => this.signatures.differs(a, b)
+      );
+      if (msgPatch.kind === 'full') {
+        patch.messages = msgPatch.messages;
+        hasChange = true;
+      } else if (msgPatch.kind === 'delta') {
+        patch.messageDelta = msgPatch.messageDelta;
+        hasChange = true;
+      }
     }
 
     if (this.signatures.differs(prev.pendingApprovals, next.pendingApprovals)) {
@@ -433,7 +472,7 @@ export class StateManager extends EventEmitter {
 
   private schedulePatch(patch: Partial<CursorState>): void {
     this.pendingPatch = this.pendingPatch
-      ? { ...this.pendingPatch, ...patch }
+      ? this.mergePatches(this.pendingPatch, patch)
       : patch;
 
     if (!this.debounceTimer) {
@@ -446,4 +485,61 @@ export class StateManager extends EventEmitter {
       }, this.debounceMs);
     }
   }
+
+  /**
+   * Coalesce two patches in the debounce window. Message deltas must merge by
+   * id — a naive `{ ...a, ...b }` would drop earlier upserts when two streaming
+   * ticks land inside DEBOUNCE_MS.
+   */
+  private mergePatches(
+    a: Partial<CursorState>,
+    b: Partial<CursorState>
+  ): Partial<CursorState> {
+    const merged: Partial<CursorState> = { ...a, ...b };
+
+    const aMsg = 'messages' in a || 'messageDelta' in a;
+    const bMsg = 'messages' in b || 'messageDelta' in b;
+    if (!aMsg && !bMsg) return merged;
+
+    // Latest full replace wins and clears any delta.
+    if (b.messages) {
+      delete merged.messageDelta;
+      merged.messages = b.messages;
+      return merged;
+    }
+
+    // Apply a delta onto a pending full snapshot.
+    if (a.messages && b.messageDelta) {
+      merged.messages = applyMessageDelta(a.messages, b.messageDelta);
+      delete merged.messageDelta;
+      return merged;
+    }
+
+    // Two deltas: union upserts/removes; prefer the newer order when present.
+    if (a.messageDelta && b.messageDelta) {
+      merged.messageDelta = mergeMessageDeltas(a.messageDelta, b.messageDelta);
+      delete merged.messages;
+      return merged;
+    }
+
+    if (b.messageDelta) {
+      merged.messageDelta = b.messageDelta;
+      delete merged.messages;
+    }
+    return merged;
+  }
+}
+
+function mergeMessageDeltas(a: MessageDelta, b: MessageDelta): MessageDelta {
+  const removeIds = [...new Set([...(a.removeIds ?? []), ...(b.removeIds ?? [])])];
+  const byId = new Map<string, CursorState['messages'][number]>();
+  for (const m of a.upsert ?? []) byId.set(m.id, m);
+  for (const m of b.upsert ?? []) byId.set(m.id, m);
+  for (const id of removeIds) byId.delete(id);
+  const order = b.order ?? a.order;
+  return {
+    upsert: [...byId.values()],
+    removeIds,
+    ...(order ? { order } : {}),
+  };
 }

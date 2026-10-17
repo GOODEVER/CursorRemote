@@ -19,9 +19,19 @@ import {
   type PollPacingState,
 } from './idle-poll.js';
 import { claimsWork } from './stall-detector.js';
+import { extractionFingerprintFunction } from './extract-fingerprint.js';
+import { stripNonTailAssistantHtml } from './lean-messages.js';
 
 const EVALUATE_TIMEOUT_MS = 5000;
+/** Fingerprint evaluate should be far cheaper than a full extract. */
+const FINGERPRINT_TIMEOUT_MS = 1500;
 const MAX_POLL_BACKOFF_MS = 5000;
+/**
+ * Even when the fingerprint matches, force a full extract every N polls so a
+ * missed signal (e.g. a questionnaire selector we don't fingerprint) cannot
+ * stick forever. Busy agents still full-extract whenever the fingerprint moves.
+ */
+const FULL_EXTRACT_EVERY_N_SKIPS = 20;
 
 export interface MessageWrapperSelection {
   element: Element;
@@ -2251,6 +2261,12 @@ export class DOMExtractor {
   private pollInFlight = false;
   private failureStreak = 0;
   private running = false;
+  private timing: import('./poll-timing.js').PollTiming | null = null;
+  private onSkip: (() => void) | null = null;
+  private lastFingerprintKey = '';
+  private skipsSinceFullExtract = 0;
+  /** Force the next poll to run a full extract (wake / refresh / reconnect). */
+  private forceFullExtract = true;
 
   constructor(
     selectors: SelectorConfig,
@@ -2260,6 +2276,16 @@ export class DOMExtractor {
     this.selectors = selectors;
     this.onExtract = onExtract;
     this.getWindowTitle = getWindowTitle;
+  }
+
+  /** Attach rolling extract timers (wired from index.ts). */
+  setTiming(timing: import('./poll-timing.js').PollTiming | null): void {
+    this.timing = timing;
+  }
+
+  /** Called when a fingerprint match skips the full extract (health touch). */
+  setOnSkip(onSkip: (() => void) | null): void {
+    this.onSkip = onSkip;
   }
 
   start(client: CdpClient, intervalMs: number, idleIntervalMs = intervalMs): void {
@@ -2303,6 +2329,8 @@ export class DOMExtractor {
     if (!this.running) return;
     this.currentPollIntervalMs = this.basePollIntervalMs;
     this.pollPacing = createPollPacing();
+    this.forceFullExtract = true;
+    this.lastFingerprintKey = '';
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
@@ -2331,6 +2359,8 @@ export class DOMExtractor {
     // A manual/self-heal refresh means "read it now" — clear the idle backoff so
     // the fresh reading is measured at full speed rather than the slow cadence.
     this.pollPacing = createPollPacing();
+    this.forceFullExtract = true;
+    this.lastFingerprintKey = '';
     this.pollInFlight = false;
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
@@ -2385,10 +2415,55 @@ export class DOMExtractor {
     }
 
     try {
+      const extractStarted = this.timing ? Date.now() : 0;
+      const containerSelectors = this.selectors.chatContainer.strategies;
+
+      // --- Cheap fingerprint gate -------------------------------------------
+      // Skip the full extract when the compact key matches the previous poll.
+      // Still force a full read periodically, on wake/refresh, and whenever the
+      // fingerprint itself moves (streaming grows lastLen, etc.).
+      let fingerprintWorking = false;
+      if (!this.forceFullExtract && this.lastFingerprintKey) {
+        try {
+          const fp = await this.client.callFunctionWithTimeout(
+            extractionFingerprintFunction as (...args: never[]) => unknown,
+            [containerSelectors],
+            FINGERPRINT_TIMEOUT_MS
+          ) as { key?: string; working?: boolean } | null;
+
+          const fpMs = Date.now() - extractStarted;
+          if (fp && typeof fp.key === 'string' && fp.key === this.lastFingerprintKey) {
+            this.skipsSinceFullExtract += 1;
+            if (this.skipsSinceFullExtract < FULL_EXTRACT_EVERY_N_SKIPS) {
+              fingerprintWorking = !!fp.working;
+              this.currentPollIntervalMs = nextPollInterval(
+                this.pollPacing,
+                { unchanged: true, working: fingerprintWorking },
+                this.basePollIntervalMs,
+                this.idlePollIntervalMs
+              );
+              this.onSkip?.();
+              if (this.timing) {
+                this.timing.record({ extractMs: fpMs, skippedFull: true });
+              }
+              return;
+            }
+          } else if (fp && typeof fp.key === 'string') {
+            this.lastFingerprintKey = fp.key;
+            fingerprintWorking = !!fp.working;
+          }
+        } catch {
+          // Fingerprint failed — fall through to a full extract.
+        }
+      }
+
+      this.forceFullExtract = false;
+      this.skipsSinceFullExtract = 0;
+
       const state = await this.client.callFunctionWithTimeout(
         extractionFunction as (...args: never[]) => unknown,
         [
-          this.selectors.chatContainer.strategies,
+          containerSelectors,
           this.selectors.approveButton.strategies,
           this.selectors.approveButton.textMatch ?? [],
           this.selectors.rejectButton.strategies,
@@ -2402,6 +2477,9 @@ export class DOMExtractor {
         ],
         EVALUATE_TIMEOUT_MS
       ) as (CursorState & { __extractionError?: string }) | null;
+      if (this.timing) {
+        this.timing.record({ extractMs: Date.now() - extractStarted, skippedFull: false });
+      }
 
       // The in-page function catches its own throws and tags the reason so we
       // can report a real error here instead of mistaking it for "no chat open".
@@ -2412,8 +2490,30 @@ export class DOMExtractor {
         return;
       }
 
-      const derivedState = state ? applyDerivedActivityToState(state) : null;
+      let derivedState = state ? applyDerivedActivityToState(state) : null;
+      // Lean live payloads: older assistants keep text/codeBlocks; only the
+      // newest assistant retains rendered HTML for streaming.
+      if (derivedState && derivedState.messages.length > 0) {
+        const lean = stripNonTailAssistantHtml(derivedState.messages);
+        if (lean !== derivedState.messages) {
+          derivedState = { ...derivedState, messages: lean };
+        }
+      }
       this.failureStreak = 0;
+
+      // Sync the fingerprint key with the same in-page function the skip-path
+      // uses, so the next poll can match exactly (derived-state approximations
+      // diverge on shimmer/approval selectors).
+      try {
+        const fp = await this.client.callFunctionWithTimeout(
+          extractionFingerprintFunction as (...args: never[]) => unknown,
+          [containerSelectors],
+          FINGERPRINT_TIMEOUT_MS
+        ) as { key?: string } | null;
+        this.lastFingerprintKey = fp && typeof fp.key === 'string' ? fp.key : '';
+      } catch {
+        this.lastFingerprintKey = '';
+      }
 
       // Idle-aware pacing: only slow down once the content signature has been
       // stable for several quiet, non-working polls. Any change, or an agent
@@ -2424,7 +2524,7 @@ export class DOMExtractor {
         this.lastContentKey = contentKey;
         this.currentPollIntervalMs = nextPollInterval(
           this.pollPacing,
-          { unchanged, working: claimsWork(derivedState) },
+          { unchanged, working: claimsWork(derivedState) || fingerprintWorking },
           this.basePollIntervalMs,
           this.idlePollIntervalMs
         );

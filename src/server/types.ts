@@ -204,7 +204,14 @@ export interface CursorState {
   /** Timestamp of the last content change (ms since epoch); drives agentStalled. */
   agentStalledSince: number | null;
   messages: ChatElement[];
+  /**
+   * Incremental transcript update on `state:patch` only — never stored on the
+   * canonical state. When present, clients merge into `messages` instead of
+   * replacing the whole array (see `message-delta.ts`).
+   */
+  messageDelta?: MessageDelta;
   pendingApprovals: Approval[];
+
   inputAvailable: boolean;
   chatTabs: ChatTab[];
   /** data-composer-id of the active composer in the extracted DOM. Stable
@@ -278,6 +285,16 @@ export type ChatElement =
   | TodoListBlock
   | RunCommand
   | LoadingIndicator;
+
+/**
+ * Compact transcript update for `state:patch` (not persisted on canonical state).
+ * See `computeMessagePatch` in `message-delta.ts`.
+ */
+export interface MessageDelta {
+  upsert: ChatElement[];
+  removeIds: string[];
+  order?: string[];
+}
 export interface HumanMessage {
   type: 'human';
   id: string;

@@ -589,6 +589,60 @@ describe('web: message rendering', () => {
     const updatedCount = msgs.querySelectorAll('[data-id]').length;
     assert.ok(updatedCount > initialCount, `Expected more messages after patch, got ${initialCount} -> ${updatedCount}`);
   });
+
+  it('merges messageDelta upserts without a full messages replace', () => {
+    fireFullState(env.mockSocket, {
+      connected: true,
+      extractorStatus: 'ok',
+      lastExtractionAt: Date.now(),
+      consecutiveExtractionFailures: 0,
+      lastExtractionError: null,
+      agentStatus: 'thinking',
+      agentActivityText: 'Thinking',
+      agentActivityLive: true,
+      agentActivitySource: 'shimmer',
+      canAbort: true,
+      agentStalled: false,
+      agentStalledSince: null,
+      messages: [
+        { type: 'human', id: 'h1', flatIndex: 0, text: 'Hello', mentions: [] },
+        { type: 'assistant', id: 'a1', flatIndex: 1, text: 'Hi', html: '<p>Hi</p>', codeBlocks: [] },
+      ],
+      pendingApprovals: [],
+      inputAvailable: true,
+      chatTabs: [],
+      activeComposerId: 'c1',
+      mode: { current: 'agent', available: [] },
+      model: { current: 'Auto', currentId: '' },
+      windows: [],
+      activeWindowId: '',
+      composerQueue: { items: [] },
+      questionnaire: null,
+      slashCommands: [],
+      folders: [],
+    } as CursorState);
+
+    firePatch(env.mockSocket, {
+      messageDelta: {
+        upsert: [
+          {
+            type: 'assistant',
+            id: 'a1',
+            flatIndex: 1,
+            text: 'Hi there',
+            html: '<p>Hi there</p>',
+            codeBlocks: [],
+          },
+        ],
+        removeIds: [],
+      },
+    } as Partial<CursorState>);
+
+    const msgs = env.document.getElementById('messages')!;
+    const assistant = msgs.querySelector('.el-assistant');
+    assert.ok(assistant, 'assistant still rendered after delta');
+    assert.match(assistant!.textContent || '', /Hi there/);
+  });
 });
 
 // ─── Run command / approval rendering ───
@@ -1831,11 +1885,13 @@ describe('web: full history', () => {
     return { type: 'assistant', id, flatIndex: 0, text, html: `<p>${text}</p>`, codeBlocks: [] };
   }
 
-  it('requests the full transcript once the active composer is known', () => {
+  it('requests the newest history page once the active composer is known', () => {
     fireFullState(env.mockSocket, stateWith([assistant('a-tail', 'newest')], 'comp-1'));
     const req = env.mockSocket.sent.filter(s => s.event === 'request:history');
     assert.equal(req.length, 1);
     assert.equal(req[0].payload.composerId, 'comp-1');
+    assert.equal(req[0].payload.limit, 80);
+    assert.equal(req[0].payload.beforeIndex, undefined);
   });
 
   it('does not re-request the same composer on subsequent patches', () => {
@@ -1854,6 +1910,8 @@ describe('web: full history', () => {
       name: 'Long chat',
       total: 40,
       truncated: false,
+      oldestIndex: 0,
+      hasMore: false,
       messages: [human('h1', 'first'), assistant('a1', 'middle'), assistant('a-tail', 'newest')],
     });
 
@@ -1861,6 +1919,35 @@ describe('web: full history', () => {
     assert.equal(els.length, 3, 'all history messages rendered');
     assert.equal(els[0].getAttribute('data-id'), 'h1');
     assert.equal(els[2].getAttribute('data-id'), 'a-tail');
+  });
+
+  it('requests older pages and prepends them when hasMore is true', () => {
+    fireFullState(env.mockSocket, stateWith([assistant('a-tail', 'newest')], 'comp-1'));
+    env.mockSocket.sent.length = 0;
+
+    fireHistory(env.mockSocket, {
+      composerId: 'comp-1',
+      oldestIndex: 80,
+      hasMore: true,
+      messages: [human('h80', 'page 2 start'), assistant('a-tail', 'newest')],
+    });
+
+    const olderReq = env.mockSocket.sent.filter(s => s.event === 'request:history').pop();
+    assert.ok(olderReq, 'should request the previous page');
+    assert.equal(olderReq!.payload.composerId, 'comp-1');
+    assert.equal(olderReq!.payload.limit, 80);
+    assert.equal(olderReq!.payload.beforeIndex, 80);
+
+    fireHistory(env.mockSocket, {
+      composerId: 'comp-1',
+      oldestIndex: 0,
+      hasMore: false,
+      messages: [human('h1', 'oldest'), assistant('a1', 'older page')],
+    });
+
+    const ids = [...env.document.querySelectorAll('#messages .chat-el')]
+      .map((el) => el.getAttribute('data-id'));
+    assert.deepEqual(ids, ['h1', 'a1', 'h80', 'a-tail']);
   });
 
   it('prefers the live version of a message present in both history and DOM', () => {
@@ -1871,6 +1958,36 @@ describe('web: full history', () => {
     });
     const last = env.document.querySelectorAll('#messages .chat-el')[1];
     assert.match(last.textContent!, /streaming now/);
+  });
+
+  it('keeps history HTML when live lean payload strips non-tail assistant html', () => {
+    const leanLive = {
+      type: 'assistant',
+      id: 'a-old',
+      flatIndex: 0,
+      text: 'older assistant',
+      html: '',
+      codeBlocks: [],
+    };
+    const liveTail = assistant('a-tail', 'streaming now');
+    fireFullState(env.mockSocket, stateWith([leanLive, liveTail], 'comp-1'));
+    fireHistory(env.mockSocket, {
+      composerId: 'comp-1',
+      oldestIndex: 0,
+      hasMore: false,
+      messages: [
+        human('h1', 'first'),
+        assistant('a-old', 'older assistant with rich html'),
+        assistant('a-tail', 'stale db copy'),
+      ],
+    });
+
+    const els = env.document.querySelectorAll('#messages .chat-el');
+    assert.equal(els.length, 3);
+    // Non-tail: history HTML must win over the lean empty live html.
+    assert.match(els[1].innerHTML, /older assistant with rich html/);
+    // Tail: live streaming text still wins.
+    assert.match(els[2].textContent!, /streaming now/);
   });
 
   it('appends live messages that history does not yet contain', () => {

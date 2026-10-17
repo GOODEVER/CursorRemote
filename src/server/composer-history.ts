@@ -56,7 +56,28 @@ export interface ComposerHistoryResult {
   total: number;
   /** True when older messages were dropped to honor `maxMessages`. */
   truncated: boolean;
+  /**
+   * Absolute header index (0-based in Cursor's fullConversationHeadersOnly)
+   * of the first message in `messages`. Used by clients to request older pages
+   * with `beforeIndex`.
+   */
+  oldestIndex: number;
+  /** True when messages older than this page still exist. */
+  hasMore: boolean;
 }
+
+export interface ComposerHistoryPageOptions {
+  /** Max messages in this page (newest-first window). Default 80. */
+  limit?: number;
+  /**
+   * Exclusive upper bound on header index: return messages with
+   * index in [beforeIndex - limit, beforeIndex). Omit for the newest page.
+   */
+  beforeIndex?: number;
+}
+
+/** Default page size for first-paint history loads. */
+export const HISTORY_PAGE_DEFAULT_LIMIT = 80;
 
 export interface ComposerHistoryOptions {
   /** Path to Cursor's `state.vscdb`. Empty disables history loading. */
@@ -156,28 +177,33 @@ export class ComposerHistory {
     else this.cache.clear();
   }
 
-  async getHistory(composerId: string): Promise<ComposerHistoryResult | null> {
+  async getHistory(
+    composerId: string,
+    page: ComposerHistoryPageOptions = {}
+  ): Promise<ComposerHistoryResult | null> {
     if (!this.enabled || !COMPOSER_ID_RE.test(composerId)) return null;
 
+    const limit = Math.max(1, page.limit ?? HISTORY_PAGE_DEFAULT_LIMIT);
+    // Cache key includes the page window so newest-page and older pages don't collide.
+    const cacheKey = `${composerId}#${page.beforeIndex ?? 'newest'}#${limit}`;
     const now = Date.now();
-    const cached = this.cache.get(composerId);
+    const cached = this.cache.get(cacheKey);
     if (cached && now - cached.at < this.cacheTtlMs) {
-      // LRU touch: re-insert so the entry counts as most-recent.
-      this.cache.delete(composerId);
-      this.cache.set(composerId, cached);
+      this.cache.delete(cacheKey);
+      this.cache.set(cacheKey, cached);
       return cached.result;
     }
 
     let result: ComposerHistoryResult | null = null;
     try {
-      result = await this.readComposer(composerId);
+      result = await this.readComposer(composerId, { limit, beforeIndex: page.beforeIndex });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[composer-history] Failed to read ${composerId.substring(0, 8)}: ${msg}`);
       result = null;
     }
-    this.cache.set(composerId, { at: now, result });
-    this.evictOverLimit(composerId);
+    this.cache.set(cacheKey, { at: now, result });
+    this.evictOverLimit(cacheKey);
     return result;
   }
 
@@ -191,7 +217,10 @@ export class ComposerHistory {
     }
   }
 
-  private async readComposer(composerId: string): Promise<ComposerHistoryResult | null> {
+  private async readComposer(
+    composerId: string,
+    page: { limit: number; beforeIndex?: number }
+  ): Promise<ComposerHistoryResult | null> {
     const Ctor = await getDatabaseCtor();
     if (!Ctor) return null;
 
@@ -212,11 +241,25 @@ export class ComposerHistory {
         : [];
       const total = headers.length;
 
-      const startIndex =
+      // Global cap from config (maxMessages) still applies as the oldest we ever
+      // expose; paging then walks inside that window newest-first.
+      const hardStart =
         this.maxMessages > 0 && total > this.maxMessages ? total - this.maxMessages : 0;
-      const window = headers.slice(startIndex);
+      const endExclusive = typeof page.beforeIndex === 'number'
+        ? Math.min(Math.max(page.beforeIndex, hardStart), total)
+        : total;
+      const startIndex = Math.max(hardStart, endExclusive - page.limit);
+      const window = headers.slice(startIndex, endExclusive);
       if (window.length === 0) {
-        return { composerId, name: composer.name ?? '', messages: [], total, truncated: false };
+        return {
+          composerId,
+          name: composer.name ?? '',
+          messages: [],
+          total,
+          truncated: hardStart > 0,
+          oldestIndex: startIndex,
+          hasMore: startIndex > hardStart,
+        };
       }
 
       // Fetch each bubble body individually with a prepared statement instead
@@ -228,6 +271,8 @@ export class ComposerHistory {
       const prefix = `bubbleId:${composerId}:`;
       const messages: ChatElement[] = [];
       let totalChars = 0;
+      // Per-page char budget (smaller than the old whole-history cap).
+      const pageCharBudget = Math.min(MAX_TOTAL_HISTORY_CHARS, 200_000);
       for (let i = 0; i < window.length; i++) {
         const header = window[i];
         if (!header || typeof header.bubbleId !== 'string' || !header.bubbleId) continue;
@@ -256,8 +301,7 @@ export class ComposerHistory {
         }
         totalChars += mapped.type === 'assistant' ? mapped.text.length : (mapped as { detail?: string }).detail?.length ?? 0;
         messages.push(mapped);
-        // Hard stop if the mapped transcript would exceed the byte budget.
-        if (totalChars > MAX_TOTAL_HISTORY_CHARS) break;
+        if (totalChars > pageCharBudget) break;
       }
 
       return {
@@ -265,7 +309,9 @@ export class ComposerHistory {
         name: composer.name ?? '',
         messages,
         total,
-        truncated: startIndex > 0,
+        truncated: hardStart > 0 || startIndex > hardStart,
+        oldestIndex: startIndex,
+        hasMore: startIndex > hardStart,
       };
     } finally {
       try {

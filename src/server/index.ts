@@ -7,6 +7,7 @@ import { CommandExecutor } from './command-executor.js';
 import { StateManager } from './state-manager.js';
 import { WindowMonitor } from './window-monitor.js';
 import { Relay } from './relay.js';
+import { createPollTiming } from './poll-timing.js';
 import type { Transport } from './transports/types.js';
 import { TelegramTransport } from './transports/telegram/index.js';
 import { RawTelegramTransport } from './transports/telegram-raw/index.js';
@@ -87,7 +88,9 @@ async function main(): Promise<void> {
   console.log(`[main] Telegram: ${config.telegram.enabled ? 'enabled' : 'disabled'}`);
   console.log();
 
-  const stateManager = new StateManager(config.debounceMs);
+  const pollTiming = createPollTiming();
+
+  const stateManager = new StateManager(config.debounceMs, pollTiming);
   const commandExecutor = new CommandExecutor(selectors);
 
   const cdpBridge = new CDPBridge(config);
@@ -100,6 +103,8 @@ async function main(): Promise<void> {
     },
     () => cdpBridge.windows.find(w => w.id === cdpBridge.activeTargetId)?.title ?? ''
   );
+  extractor.setTiming(pollTiming);
+  extractor.setOnSkip(() => stateManager.touchSuccessfulExtraction());
 
   const windowMonitor = new WindowMonitor(cdpBridge, stateManager, extractor, config, selectors);
 
@@ -126,6 +131,7 @@ async function main(): Promise<void> {
   const transports: Transport[] = [];
 
   const relay = new Relay(config, stateManager, commandExecutor, cdpBridge);
+  relay.setTiming(pollTiming);
   await relay.start();
 
   // Feed per-window snapshots to web clients so questions/approvals raised in a

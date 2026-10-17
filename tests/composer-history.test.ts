@@ -182,6 +182,25 @@ describe('ComposerHistory', () => {
     assert.deepEqual(res!.messages.map((m) => m.id), ['tool:call-shell-1']);
   });
 
+  it('pages newest-first with limit / beforeIndex', async () => {
+    const h = new ComposerHistory({ dbPath, cacheTtlMs: 0 });
+    // Newest 3 headers: todo1, hidden, running — hidden is dropped.
+    const newest = await h.getHistory(COMPOSER_ID, { limit: 3 });
+    assert.ok(newest);
+    assert.deepEqual(newest!.messages.map((m) => m.id), ['todo1', 'tool:call-shell-1']);
+    assert.equal(newest!.oldestIndex, 3);
+    assert.equal(newest!.hasMore, true);
+
+    const older = await h.getHistory(COMPOSER_ID, {
+      limit: 3,
+      beforeIndex: newest!.oldestIndex,
+    });
+    assert.ok(older);
+    assert.deepEqual(older!.messages.map((m) => m.id), ['h1', 'a1', 'tool:call-edit-1']);
+    assert.equal(older!.oldestIndex, 0);
+    assert.equal(older!.hasMore, false);
+  });
+
   it('caches results until invalidated', async () => {
     const h = new ComposerHistory({ dbPath, cacheTtlMs: 60000 });
     const first = await h.getHistory(COMPOSER_ID);

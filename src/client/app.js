@@ -221,7 +221,11 @@
   // only mounts the messages nearest its scroll position, so the live state
   // stream is clipped to a handful of items; we merge this history ahead of the
   // live tail in renderMessages() so switching folders shows the whole chat.
-  let fullHistory = { composerId: '', messages: [] };
+  // Paged history: first request is the newest page; older pages prepend while
+  // hasMore. `oldestIndex` is the server header index of messages[0].
+  let fullHistory = { composerId: '', messages: [], oldestIndex: 0, hasMore: false };
+  const HISTORY_PAGE_LIMIT = 80;
+  let historyPageInFlight = false;
   // Composer we are expecting a history payload for / last asked the server for.
   let pendingHistoryComposerId = '';
   let lastRequestedHistoryComposerId = '';
@@ -468,7 +472,13 @@
   });
 
   socket.on('state:patch', (patch) => {
-    Object.assign(state, patch);
+    // Incremental transcript updates: merge before Object.assign so a full
+    // `messages` replace (legacy / chat switch) still wins when present.
+    if (patch && patch.messageDelta && !patch.messages) {
+      state.messages = applyMessageDelta(state.messages || [], patch.messageDelta);
+    }
+    const { messageDelta: _ignoredDelta, ...rest } = patch || {};
+    Object.assign(state, rest);
     if ('questionnaire' in patch) homeQuestionnaire = patch.questionnaire || null;
     if ('activeComposerId' in patch) noteActiveComposerChange(patch.activeComposerId);
     recomputeQuestionnaire();
@@ -495,12 +505,42 @@
       && targetId !== state.activeComposerId
       && targetId !== pinnedComposerId
       && targetId !== pendingHistoryComposerId) return;
-    fullHistory = { composerId: targetId, messages: payload.messages };
+
+    const oldestIndex = typeof payload.oldestIndex === 'number' ? payload.oldestIndex : 0;
+    const hasMore = !!payload.hasMore;
+    historyPageInFlight = false;
+
+    // Older page for the same composer: prepend (server pages are oldest-first
+    // within each page; an older page's messages sit before the ones we have).
+    if (fullHistory.composerId && fullHistory.composerId === targetId
+      && fullHistory.messages.length > 0
+      && oldestIndex < fullHistory.oldestIndex) {
+      const seen = new Set(fullHistory.messages.map((m) => m && m.id).filter(Boolean));
+      const older = payload.messages.filter((m) => m && m.id && !seen.has(m.id));
+      fullHistory = {
+        composerId: targetId,
+        messages: older.concat(fullHistory.messages),
+        oldestIndex,
+        hasMore,
+      };
+      renderAll();
+      maybeRequestOlderHistory();
+      return;
+    }
+
+    // Newest page (or first load): replace.
+    fullHistory = {
+      composerId: targetId,
+      messages: payload.messages,
+      oldestIndex,
+      hasMore,
+    };
     pendingHistoryComposerId = '';
     // A freshly loaded transcript is (re)rendered from scratch — land on the
     // newest message rather than wherever the previous chat was scrolled.
     resetScrollForNewTranscript();
     renderAll();
+    maybeRequestOlderHistory();
   });
 
   // Per-window snapshots from the relay's window monitor. A question raised in
@@ -855,10 +895,25 @@
     if (fullHistory.composerId === composerId) return; // already loaded
     // Clear any previous composer's transcript so we never show the wrong chat
     // while the new one loads.
-    fullHistory = { composerId: '', messages: [] };
+    fullHistory = { composerId: '', messages: [], oldestIndex: 0, hasMore: false };
     pendingHistoryComposerId = composerId;
     lastRequestedHistoryComposerId = composerId;
-    socket.emit('request:history', { composerId });
+    historyPageInFlight = true;
+    // Newest page first — older pages follow via maybeRequestOlderHistory().
+    socket.emit('request:history', { composerId, limit: HISTORY_PAGE_LIMIT });
+  }
+
+  /** Background-fetch older history pages until the server reports hasMore=false. */
+  function maybeRequestOlderHistory() {
+    if (historyPageInFlight) return;
+    if (!fullHistory.composerId || !fullHistory.hasMore) return;
+    if (typeof fullHistory.oldestIndex !== 'number' || fullHistory.oldestIndex <= 0) return;
+    historyPageInFlight = true;
+    socket.emit('request:history', {
+      composerId: fullHistory.composerId,
+      limit: HISTORY_PAGE_LIMIT,
+      beforeIndex: fullHistory.oldestIndex,
+    });
   }
 
   /**
@@ -921,13 +976,53 @@
       lastRequestedHistoryComposerId = state.activeComposerId || '';
     }, PINNED_COMPOSER_TIMEOUT_MS);
     // Bypass the "already loaded" guard: the user may re-pick the same chat.
-    fullHistory = { composerId: '', messages: [] };
+    fullHistory = { composerId: '', messages: [], oldestIndex: 0, hasMore: false };
     pendingHistoryComposerId = composerId;
     lastRequestedHistoryComposerId = composerId;
-    socket.emit('request:history', { composerId });
+    historyPageInFlight = true;
+    socket.emit('request:history', { composerId, limit: HISTORY_PAGE_LIMIT });
     // Render immediately so the previous chat's messages disappear at once,
     // instead of lingering until the next state patch arrives.
     renderAll();
+  }
+
+  /**
+   * Apply a server messageDelta to the local live transcript. Mirrors
+   * `applyMessageDelta` in src/server/message-delta.ts — keep them in sync.
+   * When `order` is omitted the update is append-only (streaming path).
+   */
+  function applyMessageDelta(messages, delta) {
+    if (!delta) return messages || [];
+    const remove = new Set(delta.removeIds || []);
+    let msgs = remove.size > 0
+      ? (messages || []).filter((m) => m && !remove.has(m.id))
+      : (messages || []).slice();
+
+    const byId = new Map();
+    for (const m of msgs) if (m && m.id) byId.set(m.id, m);
+    for (const m of (delta.upsert || [])) if (m && m.id) byId.set(m.id, m);
+
+    if (delta.order && delta.order.length > 0) {
+      const ordered = [];
+      const seen = new Set();
+      for (const id of delta.order) {
+        const m = byId.get(id);
+        if (m) { ordered.push(m); seen.add(id); }
+      }
+      for (const m of (delta.upsert || [])) {
+        if (m && m.id && !seen.has(m.id)) ordered.push(m);
+      }
+      return ordered;
+    }
+
+    msgs = msgs.slice();
+    for (const m of (delta.upsert || [])) {
+      if (!m || !m.id) continue;
+      const idx = msgs.findIndex((x) => x && x.id === m.id);
+      if (idx >= 0) msgs[idx] = m;
+      else msgs.push(m);
+    }
+    return msgs;
   }
 
   /**
@@ -948,7 +1043,16 @@
     const historyIds = new Set();
     for (const m of historyMsgs) if (m && m.id) historyIds.add(m.id);
 
-    const merged = historyMsgs.map((h) => (h && h.id && liveById.has(h.id) ? liveById.get(h.id) : h));
+    // Live wins for streaming content, but when the relay strips HTML from
+    // non-tail assistants (lean live payloads), keep history's rendered HTML.
+    const merged = historyMsgs.map((h) => {
+      if (!h || !h.id || !liveById.has(h.id)) return h;
+      const live = liveById.get(h.id);
+      if (live.type === 'assistant' && h.type === 'assistant' && !live.html && h.html) {
+        return { ...live, html: h.html };
+      }
+      return live;
+    });
 
     const extra = [];
     for (const m of liveMsgs) {
@@ -3662,8 +3766,9 @@
     // Drop the previous chat's full history so the populated transcript does
     // not linger. The new agent has no history yet, so the merged render falls
     // back to the live (empty) DOM tail until history arrives.
-    fullHistory = { composerId: '', messages: [] };
+    fullHistory = { composerId: '', messages: [], oldestIndex: 0, hasMore: false };
     pendingHistoryComposerId = '';
+    historyPageInFlight = false;
     pinnedComposerId = '';
     if (pinnedComposerTimer) clearTimeout(pinnedComposerTimer);
     resetScrollForNewTranscript();

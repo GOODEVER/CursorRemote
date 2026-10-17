@@ -190,9 +190,15 @@ export class Relay {
    * was idle shows up immediately instead of waiting out the slow idle interval.
    */
   private wakeHandler: (() => void) | null = null;
+  private timing: import('./poll-timing.js').PollTiming | null = null;
 
   /** Max-Age for session cookie (30 days), aligned with typical “stay signed in” expectation. */
   private static readonly SESSION_COOKIE_MAX_AGE_SEC = 30 * 24 * 60 * 60;
+
+  /** Attach rolling emit timers (wired from index.ts). */
+  setTiming(timing: import('./poll-timing.js').PollTiming | null): void {
+    this.timing = timing;
+  }
 
   private get authEnabled(): boolean {
     return this.config.webappPassword.length > 0;
@@ -828,11 +834,18 @@ export class Relay {
         }
       });
 
-      socket.on('request:history', async (payload?: { composerId?: string }) => {
+      socket.on('request:history', async (payload?: {
+        composerId?: string;
+        limit?: number;
+        beforeIndex?: number;
+      }) => {
         const composerId = (payload?.composerId || this.stateManager.getCurrentState().activeComposerId || '').trim();
         if (!composerId) return;
         this.historyComposerId = composerId;
-        await this.loadComposerHistory(composerId, socket);
+        await this.loadComposerHistory(composerId, socket, {
+          limit: payload?.limit,
+          beforeIndex: payload?.beforeIndex,
+        });
       });
 
       socket.on('command:create_folder_agent', async (payload: CommandPayload) => {
@@ -1214,7 +1227,21 @@ export class Relay {
 
   private setupStateForwarding(): void {
     this.stateManager.on('state:patch', (patch: Partial<CursorState>) => {
+      const emitStarted = this.timing ? Date.now() : 0;
       this.io.emit('state:patch', patch);
+      if (this.timing) {
+        let patchBytes: number | undefined;
+        try {
+          patchBytes = JSON.stringify(patch).length;
+        } catch {
+          patchBytes = undefined;
+        }
+        this.timing.record({
+          emitMs: Date.now() - emitStarted,
+          patchBytes,
+          usedMessageDelta: !!patch.messageDelta && !patch.messages,
+        });
+      }
       this.evaluatePushTransition();
     });
 
@@ -1231,9 +1258,13 @@ export class Relay {
    * folders doesn't load the full history" bug. The client merges this with the
    * live DOM tail (deduped by message id) so streaming keeps updating it.
    */
-  private async loadComposerHistory(composerId: string, target?: Socket): Promise<void> {
+  private async loadComposerHistory(
+    composerId: string,
+    target?: Socket,
+    page?: { limit?: number; beforeIndex?: number }
+  ): Promise<void> {
     if (!composerId) return;
-    const history = await this.composerHistory.getHistory(composerId);
+    const history = await this.composerHistory.getHistory(composerId, page);
     if (!history || history.messages.length === 0) return;
     if (this.historyComposerId !== composerId) return; // Composer switched mid-read.
 
@@ -1243,18 +1274,21 @@ export class Relay {
       total: history.total,
       truncated: history.truncated,
       messages: history.messages,
+      oldestIndex: history.oldestIndex,
+      hasMore: history.hasMore,
     };
     // Unicast to the requesting client when known. These payloads can be
-    // several MB (2000 mapped messages incl. HTML); broadcasting to every
-    // socket makes each connected client hold its own copy and lets a
-    // slow/stalled client buffer unboundedly.
+    // several MB; broadcasting to every socket makes each connected client
+    // hold its own copy and lets a slow/stalled client buffer unboundedly.
     if (target && target.connected) {
       target.emit('history:full', payload);
     } else {
       this.io.emit('history:full', payload);
     }
     console.log(
-      `[relay] History loaded for ${composerId.substring(0, 8)} "${history.name}": ${history.messages.length}/${history.total} messages`
+      `[relay] History page for ${composerId.substring(0, 8)} "${history.name}": ` +
+        `${history.messages.length} msgs (oldestIndex=${history.oldestIndex}, ` +
+        `total=${history.total}, hasMore=${history.hasMore})`
     );
   }
 
